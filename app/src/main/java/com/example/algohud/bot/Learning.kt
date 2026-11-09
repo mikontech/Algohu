@@ -250,6 +250,7 @@ class ShadowTrader(
     }
 
     fun describeWait(bars: List<Bar>): String? = runCatching { strategy.describeWait(bars) }.getOrNull()
+    fun note(): String? = runCatching { strategy.lastNote() }.getOrNull()
 
     /** @param cost koszt transakcji w jednostkach ceny (spread). Zwraca sygnał, jeśli otworzył pozycję. */
     fun onBar(bars: List<Bar>, sentiment: Double, cost: Double): Signal? {
@@ -355,6 +356,9 @@ class Learner(
         champion = best?.first
         championStats = best?.second
     }
+
+    /** Dlaczego zwycięzca pominął ostatnią okazję (null = nie pominął). */
+    fun championNote(): String? = champion?.note()
 
     fun describeWait(barsFor: (Long) -> List<Bar>?): String? {
         val c = champion ?: return null

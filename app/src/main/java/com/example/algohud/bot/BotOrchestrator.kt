@@ -32,6 +32,8 @@ interface Strategy {
     fun onBar(bars: List<Bar>, sentiment: Double): Signal?
     /** Na co strategia teraz czeka (do HUD). */
     fun describeWait(bars: List<Bar>): String? = null
+    /** Dlaczego ostatnio pominęła okazję (np. "RSI 82 ≥ 75") – do HUD; null = brak. */
+    fun lastNote(): String? = null
 }
 
 /**
@@ -50,11 +52,13 @@ class TrendBreakoutStrategy(
     private val barMs: Long = 5 * 60_000L
 ) : Strategy {
     private var lastSignalBar = 0L
+    private var note: String? = null
+
+    override fun lastNote(): String? = note
 
     override fun onBar(bars: List<Bar>, sentiment: Double): Signal? {
         if (bars.size < maxOf(slow, donchian, atrPeriod) + 2) return null // BŁĄD BYŁ TU: Wybicie 55 przy 52 świecach
         val last = bars.last()
-        if (last.start - lastSignalBar < cooldownBars * barMs) return null
         val closes = bars.map { it.close }
         val emaFast = Indicators.ema(closes, fast) ?: return null
         val emaSlow = Indicators.ema(closes, slow) ?: return null
@@ -63,11 +67,27 @@ class TrendBreakoutStrategy(
         val channel = bars.subList(bars.size - 1 - donchian, bars.size - 1)
         val hi = channel.maxOf { it.high }
         val lo = channel.minOf { it.low }
-        val side = when {
-            last.close > hi && emaFast > emaSlow && rsi < 75 && sentiment > -newsVeto -> Side.BUY
-            last.close < lo && emaFast < emaSlow && rsi > 25 && sentiment < newsVeto -> Side.SELL
-            else -> return null
+        val brokeUp = last.close > hi
+        val brokeDown = last.close < lo
+        if (!brokeUp && !brokeDown) return null
+        val dir = if (brokeUp) "w górę" else "w dół"
+        // Wybicie było – sprawdzamy filtry i zapisujemy, dlaczego ewentualnie pomijamy.
+        val skip = when {
+            last.start - lastSignalBar < cooldownBars * barMs -> "przerwa po poprzednim sygnale"
+            brokeUp && emaFast <= emaSlow -> "trend ↓ (EMA$fast < EMA$slow) – nie kupuję przeciw trendowi"
+            brokeDown && emaFast >= emaSlow -> "trend ↑ (EMA$fast > EMA$slow) – nie sprzedaję przeciw trendowi"
+            brokeUp && rsi >= 75 -> "RSI %.0f ≥ 75 – rynek przegrzany, nie gonię szczytu".format(rsi)
+            brokeDown && rsi <= 25 -> "RSI %.0f ≤ 25 – rynek wyprzedany, nie gonię dołka".format(rsi)
+            brokeUp && sentiment <= -newsVeto -> "newsy negatywne (%+.2f)".format(sentiment)
+            brokeDown && sentiment >= newsVeto -> "newsy pozytywne (%+.2f)".format(sentiment)
+            else -> null
         }
+        if (skip != null) {
+            note = "wybicie $dir na ${tfLabel(barMs)} pominięte: $skip"
+            return null
+        }
+        note = null
+        val side = if (brokeUp) Side.BUY else Side.SELL
         lastSignalBar = last.start
         val dist = stopAtr * atr
         val long = side == Side.BUY
@@ -86,8 +106,9 @@ class TrendBreakoutStrategy(
         val up = (Indicators.ema(closes, fast) ?: return null) > (Indicators.ema(closes, slow) ?: return null)
         val channel = bars.takeLast(donchian)
         val tf = tfLabel(barMs)
-        return if (up) "LONG, gdy świeca $tf zamknie się > %.2f (trend ↑ – shorty dopiero po odwróceniu trendu)".format(channel.maxOf { it.high })
-        else "SHORT, gdy świeca $tf zamknie się < %.2f (trend ↓ – longi dopiero po odwróceniu trendu)".format(channel.minOf { it.low })
+        val rsi = Indicators.rsi(closes)?.let { " • RSI %.0f (limit %s)".format(it, if (up) "< 75" else "> 25") } ?: ""
+        return if (up) "LONG, gdy świeca $tf zamknie się > %.2f$rsi • trend ↑, shorty po odwróceniu".format(channel.maxOf { it.high })
+        else "SHORT, gdy świeca $tf zamknie się < %.2f$rsi • trend ↓, longi po odwróceniu".format(channel.minOf { it.low })
     }
 }
 
@@ -278,7 +299,9 @@ class BotOrchestrator(
             // Instrumenty bez cen w tle: zapisujemy świece, żeby nauka rosła z każdym dniem i przetrwała restart.
             if (!hasBackground(inst)) runCatching { barStore.append(inst, tf, closed) }
             val (sent, _) = news.sentimentFor(aliasesFor(inst))
-            val sig = learner(inst).onBar(tf, a.closed(), sent, spreadOf(inst))
+            val l = learner(inst)
+            val sig = l.onBar(tf, a.closed(), sent, spreadOf(inst))
+            if (l.championBarMs == tf) l.championNote()?.let { msg("ℹ️ $inst: $it") }
             updateLearningHud()
             if (sig != null) handleSignal(inst, sig, px)
         }
@@ -365,7 +388,14 @@ class BotOrchestrator(
             }
             return
         }
-        val wait = l.describeWait { tf -> aggregators["$inst@$tf"]?.closed() }
+        // Poziomy liczone z feedu w tle przeliczamy na ceny XTB (np. PAXG → złoto XTB), żeby zgadzały się z wykresem.
+        val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
+        val shift = q?.let { basis(inst, it) } ?: 0.0
+        val wait = l.describeWait { tf ->
+            aggregators["$inst@$tf"]?.closed()?.map { b ->
+                b.copy(open = b.open + shift, high = b.high + shift, low = b.low + shift, close = b.close + shift)
+            }
+        }
         _hud.update { it.copy(learning = l.summary() + (wait?.let { "\n⏳ $it" } ?: "")) }
     }
 
