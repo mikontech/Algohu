@@ -345,6 +345,11 @@ class BotOrchestrator(
             if (warned.add("pv:$symbol")) msg("Otwórz raz bilet $symbol w XTB – bot musi poznać wartość kontraktu")
             return null
         }
+        val minDist = price * risk.config.minStopDistancePct
+        if (abs(price - stop) < minDist) {
+            msg("✋ $symbol: stop %.2f od ceny – za blisko (min. %.2f)".format(abs(price - stop), minDist))
+            return null
+        }
         val qty = risk.sizeFor(price, stop, pv)
         if (qty <= 0.0) {
             val step = risk.config.lotStep
@@ -374,7 +379,8 @@ class BotOrchestrator(
 
     private fun agg(inst: String, tf: Long) = aggregators.getOrPut("$inst@$tf") { BarAggregator(tf) }
     private fun learner(inst: String) = learners.getOrPut(inst) {
-        Learner(inst, Learner.defaultVariants()).also { l ->
+        // Nauka używa tego samego minimalnego stopu co RiskManager – uczy się tylko transakcji, które wolno zawrzeć.
+        Learner(inst, Learner.defaultVariants(), minStopPct = risk.config.minStopDistancePct).also { l ->
             if (!hasBackground(inst)) {
                 // Wczytaj świece zebrane wcześniej z ekranu XTB i naucz się na nich od razu.
                 for (tf in Learner.TIMEFRAMES) {

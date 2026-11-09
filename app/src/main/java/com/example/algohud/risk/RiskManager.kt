@@ -38,7 +38,7 @@ class RiskManager(
         val maxNotionalToEquity: Double = 5.0,       // wartość kontraktu maks. 5× kapitał (dźwignia CFD)
         val maxOpenPositions: Int = 1,
         val maxOrdersPerMinute: Int = 3,
-        val minStopDistancePct: Double = 0.002,      // stop bliżej niż 0,2% = szum, odrzucamy
+        val minStopDistancePct: Double = 0.001,      // stop bliżej niż 0,1% = szum (TA SAMA wartość trafia do nauki)
         val cooldownAfterLossMs: Long = 10 * 60_000L,
         val allowShort: Boolean = true,              // CFD: krótka sprzedaż dozwolona
         val allowPyramiding: Boolean = false,
