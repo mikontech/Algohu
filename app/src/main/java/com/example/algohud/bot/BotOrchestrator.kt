@@ -3,6 +3,7 @@ package com.example.algohud.bot
 import android.content.SharedPreferences
 import com.example.algohud.core.Bar
 import com.example.algohud.core.ExecutionMode
+import com.example.algohud.core.ExecutionResult
 import com.example.algohud.core.HudState
 import com.example.algohud.core.OrderRequest
 import com.example.algohud.core.ScreenQuote
@@ -90,7 +91,6 @@ class BotOrchestrator(
     private val prefs: SharedPreferences,
     /** (kapitał, źródło) – np. (631.27, "XTB:PLN"); null = brak danych. */
     private val equityProvider: suspend () -> Pair<Double, String>?,
-    private val strategyFactory: () -> Strategy = { TrendBreakoutStrategy() },
     private val manualStopPct: Double = 0.005,
     private val barMs: Long = 5 * 60_000L
 ) {
@@ -99,7 +99,7 @@ class BotOrchestrator(
 
     private val lock = Mutex()
     private val aggregators = HashMap<String, BarAggregator>()
-    private val strategies = HashMap<String, Strategy>()
+    private val learners = HashMap<String, Learner>()
     private val lastPx = HashMap<String, Pair<Double, Long>>()
     private val warned = HashSet<String>()
     @Volatile private var lastTick: Tick? = null
@@ -114,8 +114,14 @@ class BotOrchestrator(
         // Rozgrzewka strategii historią świec.
         for ((inst, feed) in FEEDS) {
             scope.launch {
-                runCatching { news.history(feed, "5m", 200) }
-                    .onSuccess { h -> lock.withLock { agg(inst).seed(h) } }
+                runCatching { news.history(feed, "5m", 1000) } // ~3,5 dnia świec 5-min do nauki
+                    .onSuccess { h ->
+                        lock.withLock {
+                            agg(inst).seed(h)
+                            learner(inst).backtest(h, spreadOf(inst))
+                        }
+                        updateLearningHud()
+                    }
                     .onFailure { msg("Historia $inst: ${it.message}") }
             }
         }
@@ -213,6 +219,7 @@ class BotOrchestrator(
         val inst = q.instrument
         val (s, n) = if (inst != null) news.sentimentFor(aliasesFor(inst)) else 0.0 to 0
         _hud.update { it.copy(screen = q, screenSentiment = s, screenNews = n) }
+        if (inst != null && inst != hudLearningInstrument) { hudLearningInstrument = inst; updateLearningHud() }
         if (inst == null) return
         q.pointValuePerLot?.let { rememberPointValue(inst, it) }
         if (q.bid != null && q.ask != null && q.ask >= q.bid) rememberSpread(inst, q.ask - q.bid)
@@ -231,12 +238,15 @@ class BotOrchestrator(
         agg(inst).onTick(px, ts) ?: return
         val bars = agg(inst).closed()
         val (sent, _) = news.sentimentFor(aliasesFor(inst))
-        val sig = strategy(inst).onBar(bars, sent) ?: return
-        msg("📈 $inst ${sig.side}: ${sig.reason}")
-        // Sygnał przeciwny do otwartej pozycji = wyjście (bez natychmiastowego odwracania).
+        val learner = learner(inst)
+        val sig = learner.onBar(bars, sent, spreadOf(inst))
+        updateLearningHud()
+        sig ?: return
+        msg("📈 $inst ${sig.side} [${learner.champion?.name}]: ${sig.reason}")
+        // Sygnał przeciwny do otwartej pozycji = zamknięcie i odwrócenie (long → short i odwrotnie).
         risk.closingOrder(inst, sig.side, px)?.let { close ->
-            engine.submit(withSpread(close.copy(reason = "SYGNAŁ PRZECIWNY"), inst), bypassConfirmation = true)
-            return
+            val r = engine.submit(withSpread(close.copy(reason = "ODWRÓCENIE"), inst), bypassConfirmation = true)
+            if (r !is ExecutionResult.Filled && r !is ExecutionResult.Submitted) return
         }
         val entry = px + spreadOf(inst) / 2 * sig.side.sign
         buildOrder(inst, sig.side, entry, sig.stopPrice, sig.takeProfit, "STRAT ${sig.reason}", pointValue(inst))
@@ -277,7 +287,14 @@ class BotOrchestrator(
     }
 
     private fun agg(inst: String) = aggregators.getOrPut(inst) { BarAggregator(barMs) }
-    private fun strategy(inst: String) = strategies.getOrPut(inst) { strategyFactory() }
+    private fun learner(inst: String) = learners.getOrPut(inst) { Learner(inst, Learner.defaultVariants(barMs)) }
+
+    @Volatile private var hudLearningInstrument: String = "GOLD"
+
+    private fun updateLearningHud() {
+        val l = learners[hudLearningInstrument] ?: return
+        _hud.update { it.copy(learning = l.summary()) }
+    }
 
     private fun pointValue(inst: String): Double? = prefs.getString("pv_$inst", null)?.toDoubleOrNull()
     private fun spreadOf(inst: String): Double = prefs.getString("sp_$inst", null)?.toDoubleOrNull() ?: 0.0

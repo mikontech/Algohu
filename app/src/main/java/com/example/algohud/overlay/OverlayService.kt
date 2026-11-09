@@ -200,7 +200,7 @@ class OverlayService : LifecycleService() {
             setTextColor(0xFFAAAAAA.toInt()); textSize = 11f
             maxLines = 2; maxWidth = dp(260); ellipsize = TextUtils.TruncateAt.END
         }
-        tvStats = TextView(this).apply { setTextColor(0xFF90CAF9.toInt()); textSize = 11f; maxWidth = dp(280) }
+        tvStats = TextView(this).apply { setTextColor(0xFF90CAF9.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 4 }
         tvScreen = TextView(this).apply { setTextColor(0xFFFFE082.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 3 }
         // Dotknięcie: DRY_RUN ⇄ CONFIRM. Przytrzymanie: AUTO. Oba wymagają gotowego wykonawcy.
         btnMode = actionButton("Tryb", 0xFF455A64.toInt()) {
@@ -422,7 +422,7 @@ class OverlayService : LifecycleService() {
         tvStatus.text = "${s.symbol} • ${if (s.feedConnected) "● LIVE" else "○ offline"} • PnL dnia: %+.2f"
             .format(s.dailyPnl)
         tvMessage.text = s.lastMessage
-        tvStats.text = s.paperStats
+        tvStats.text = listOf(s.learning, s.paperStats).filter { it.isNotBlank() }.joinToString("\n")
         btnMode.text = "Tryb: ${s.mode.name}"
 
         val key = "${s.mode}|${s.killSwitch}|${s.feedConnected}"

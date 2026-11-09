@@ -114,5 +114,6 @@ data class HudState(
     val screenSentiment: Double = 0.0,
     val screenNews: Int = 0,
     val paperStats: String = "",
+    val learning: String = "",
     val lastMessage: String = "Uruchamianie…"
 )
