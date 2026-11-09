@@ -5,6 +5,8 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -47,6 +49,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
+import java.math.BigDecimal
 import java.util.concurrent.TimeUnit
 import kotlin.math.hypot
 
@@ -80,6 +83,7 @@ class OverlayService : LifecycleService() {
     private lateinit var panel: LinearLayout
     private lateinit var tvStatus: TextView
     private lateinit var tvMessage: TextView
+    private lateinit var tvScreen: TextView
     private lateinit var btnMode: Button
     private lateinit var btnConfirm: Button
 
@@ -171,7 +175,18 @@ class OverlayService : LifecycleService() {
             setTextColor(0xFFAAAAAA.toInt()); textSize = 11f
             maxLines = 2; maxWidth = dp(260); ellipsize = TextUtils.TruncateAt.END
         }
-        btnMode = actionButton("Tryb", 0xFF455A64.toInt()) { engine.cycleMode() }
+        tvScreen = TextView(this).apply { setTextColor(0xFFFFE082.toInt()); textSize = 11f; maxWidth = dp(280) }
+        // Dotknięcie: DRY_RUN ⇄ CONFIRM. Przytrzymanie: AUTO. Oba wymagają gotowego wykonawcy.
+        btnMode = actionButton("Tryb", 0xFF455A64.toInt()) {
+            val target = if (engine.mode.value == ExecutionMode.DRY_RUN) ExecutionMode.CONFIRM else ExecutionMode.DRY_RUN
+            engine.setMode(target)?.let { toast("🔒 $target zablokowany: $it") }
+        }.apply {
+            setOnLongClickListener {
+                val blocked = engine.setMode(ExecutionMode.AUTO)
+                toast(if (blocked != null) "🔒 AUTO zablokowane: $blocked" else "⚠️ AUTO włączone – bot sam składa zlecenia")
+                true
+            }
+        }
         btnConfirm = actionButton("✔ Potwierdź", 0xFF1565C0.toInt()) {
             botScope.launch { engine.confirmPending() }
         }.apply { visibility = View.GONE }
@@ -200,15 +215,21 @@ class OverlayService : LifecycleService() {
                 }
             })
         }
+        val toolsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(actionButton("📋 Zrzut ekranu", 0xFF5D4037.toInt()) { dumpScreen() })
+        }
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = roundedBg(0xE0121212.toInt(), 14)
             setPadding(dp(10), dp(8), dp(10), dp(8))
             visibility = View.GONE
             addView(tvStatus)
+            addView(tvScreen)
             addView(tvMessage)
             addView(tradeRow, wrap().apply { topMargin = dp(6) })
             addView(controlRow, wrap().apply { topMargin = dp(6) })
+            addView(toolsRow, wrap().apply { topMargin = dp(6) })
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -320,8 +341,22 @@ class OverlayService : LifecycleService() {
             s.sentiment < -0.15 -> "▼"
             else -> "■"
         }
-        bubble.text = if (s.killSwitch) "⛔ KILL" else
-            "$arrow %+.2f".format(s.sentiment) + (s.lastPrice?.let { "  %.2f".format(it) } ?: "")
+        val q = s.screen?.takeIf { it.isFresh() }
+        bubble.text = when {
+            s.killSwitch -> "⛔ KILL"
+            q?.instrument != null -> "$arrow %+.2f  ${q.instrument} ${q.mid?.let(::fmtPrice) ?: ""}".format(s.sentiment)
+            else -> "$arrow %+.2f".format(s.sentiment) + (s.lastPrice?.let { "  %.2f".format(it) } ?: "")
+        }
+        tvScreen.text = when {
+            q == null -> "XTB: niewidoczne – otwórz instrument w XTB"
+            q.instrument == null -> "${q.appLabel}: nie rozpoznano instrumentu"
+            else -> buildString {
+                append(q.appLabel).append(": ").append(q.instrument)
+                q.bid?.let { append("  S ").append(fmtPrice(it)) }
+                q.ask?.let { append("  K ").append(fmtPrice(it)) }
+                append("  📰 %+.2f (%d)".format(s.screenSentiment, s.screenNews))
+            }
+        }
         (bubble.background as GradientDrawable).setColor(
             when {
                 s.killSwitch -> 0xE0B71C1C.toInt()
@@ -375,6 +410,15 @@ class OverlayService : LifecycleService() {
     }
 
     // ───────────── Pomocnicze ─────────────
+
+    private fun dumpScreen() {
+        val svc = AutoExecutionService.instance ?: return toast("Najpierw włącz usługę ułatwień dostępu (krok 3)")
+        val text = svc.dumpActiveWindow() ?: return toast("Nie widzę aktywnego okna – otwórz XTB")
+        getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Algo HUD dump", text))
+        toast("Skopiowano zrzut (${text.lines().size} linii) – wklej go w czacie")
+    }
+
+    private fun fmtPrice(v: Double): String = BigDecimal.valueOf(v).stripTrailingZeros().toPlainString()
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 

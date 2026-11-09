@@ -18,6 +18,14 @@
     <!-- Opcjonalnie (tylko poza Google Play – polityka Play to ogranicza):
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" /> -->
 
+    <!-- Widoczność aplikacji z launchera (Android 11+), żeby rozpoznać XTB po nazwie -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:allowBackup="false"
         android:label="@string/app_name"

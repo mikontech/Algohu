@@ -39,7 +39,7 @@ class RiskManager(
         val cooldownAfterLossMs: Long = 10 * 60_000L,
         val allowShort: Boolean = false,             // spot: sprzedaż tylko do zamknięcia pozycji
         val allowPyramiding: Boolean = false,
-        val allowedSymbols: Set<String> = setOf("BTCUSDT"),
+        val allowedSymbols: Set<String> = emptySet(),   // pusta = każdy symbol
         val lotStep: Double = 0.00001
     )
 
@@ -105,7 +105,9 @@ class RiskManager(
         }
 
         if (!order.quantity.isFinite() || order.quantity <= 0.0) return@withLock reject("Nieprawidłowa ilość")
-        if (order.symbol !in config.allowedSymbols) return@withLock reject("Symbol spoza białej listy")
+        if (config.allowedSymbols.isNotEmpty() && order.symbol !in config.allowedSymbols) {
+            return@withLock reject("Symbol spoza białej listy")
+        }
 
         val existing = positions[order.symbol]
         val reducing = existing != null && existing.side != order.side &&

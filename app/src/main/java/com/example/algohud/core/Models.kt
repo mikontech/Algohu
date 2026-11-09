@@ -57,6 +57,21 @@ data class Position(
     val stopPrice: Double
 )
 
+/** Co jest teraz widoczne w aplikacji brokera (odczytane przez AccessibilityService). */
+data class ScreenQuote(
+    val packageName: String,
+    val appLabel: String,
+    val instrument: String?,
+    val bid: Double?,
+    val ask: Double?,
+    val timestamp: Long
+) {
+    val mid: Double?
+        get() = if (bid != null && ask != null) (bid + ask) / 2 else bid ?: ask
+
+    fun isFresh(now: Long = System.currentTimeMillis(), maxAgeMs: Long = 5_000) = now - timestamp <= maxAgeMs
+}
+
 data class HudState(
     val sentiment: Double = 0.0,
     val lastPrice: Double? = null,
@@ -65,5 +80,8 @@ data class HudState(
     val killSwitch: Boolean = false,
     val dailyPnl: Double = 0.0,
     val feedConnected: Boolean = false,
+    val screen: ScreenQuote? = null,
+    val screenSentiment: Double = 0.0,
+    val screenNews: Int = 0,
     val lastMessage: String = "Uruchamianie…"
 )

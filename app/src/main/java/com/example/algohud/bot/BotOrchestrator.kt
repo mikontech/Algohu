@@ -5,6 +5,7 @@ import com.example.algohud.core.OrderRequest
 import com.example.algohud.core.Side
 import com.example.algohud.core.Tick
 import com.example.algohud.data.MarketNewsEngine
+import com.example.algohud.execution.AutoExecutionService
 import com.example.algohud.execution.ExecutionEngine
 import com.example.algohud.risk.RiskManager
 import kotlinx.coroutines.CoroutineScope
@@ -90,12 +91,27 @@ class BotOrchestrator(
             }
         }
         scope.launch { engine.events.collect { msg(it) } }
+        // Ekran brokera: instrument + ceny + sentyment newsów dla tego instrumentu.
+        scope.launch {
+            AutoExecutionService.screenQuote.filterNotNull().collect { q ->
+                val inst = q.instrument
+                val (s, n) = if (inst != null) news.sentimentFor(aliasesFor(inst)) else 0.0 to 0
+                _hud.update { it.copy(screen = q, screenSentiment = s, screenNews = n) }
+                if (inst != null) q.mid?.let { px ->
+                    risk.onMark(inst, px)?.let { stop -> engine.submit(stop, bypassConfirmation = true) }
+                }
+            }
+        }
         // Kill-switch (ręczny, dzienny limit, błąd wykonania) → zamknij wszystko.
         scope.launch { risk.killSwitch.filter { it }.collect { engine.flattenAll(risk.killReason ?: "KILL") } }
     }
 
     suspend fun manualOrder(side: Side) {
-        val t = lastTick ?: return msg("Brak notowań – nie mogę wycenić zlecenia")
+        // Jeśli w XTB jest otwarty instrument – handlujemy nim (po cenie z ekranu), inaczej feedem.
+        val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument != null }
+        val screenPx = q?.let { if (side == Side.BUY) it.ask ?: it.mid else it.bid ?: it.mid }
+        val t = if (q != null && screenPx != null) Tick(q.instrument!!, screenPx, System.currentTimeMillis())
+        else lastTick ?: return msg("Brak notowań – nie mogę wycenić zlecenia")
         val stop = if (side == Side.BUY) t.price * (1 - manualStopPct) else t.price * (1 + manualStopPct)
         buildOrder(t, side, stop, "MANUAL")?.let { engine.submit(it, bypassConfirmation = true) }
     }
@@ -125,4 +141,32 @@ class BotOrchestrator(
     }
 
     private fun msg(text: String) = _hud.update { it.copy(lastMessage = text) }
+
+    private fun aliasesFor(instrument: String): List<String> {
+        val base = instrument.substringBefore('.')
+        val extra = ALIASES.entries.firstOrNull { base.startsWith(it.key) }?.value.orEmpty()
+        return extra + base.lowercase()
+    }
+
+    private companion object {
+        /** Słowa w nagłówkach newsów powiązane z instrumentem (EN + PL). */
+        val ALIASES = mapOf(
+            "BITCOIN" to listOf("bitcoin", "btc", "crypto", "kryptowalut"),
+            "ETHEREUM" to listOf("ethereum", "ether", "eth ", "crypto"),
+            "GOLD" to listOf("gold", "złoto", "zloto", "bullion"),
+            "SILVER" to listOf("silver", "srebro"),
+            "OIL" to listOf("oil", "crude", "brent", "wti", "opec", "ropa"),
+            "NATGAS" to listOf("natural gas", "lng", "gaz"),
+            "US500" to listOf("s&p", "wall street", "stocks", "equities"),
+            "US100" to listOf("nasdaq", "big tech"),
+            "US30" to listOf("dow"),
+            "DE40" to listOf("dax", "germany", "german", "niemcy"),
+            "W20" to listOf("wig20", "gpw", "warsaw"),
+            "EURUSD" to listOf("euro", "ecb", "fed", "dollar"),
+            "GBPUSD" to listOf("pound", "sterling", "boe", "fed", "dollar"),
+            "USDJPY" to listOf("yen", "boj", "fed", "dollar"),
+            "EURPLN" to listOf("złot", "zlot", "nbp", "rpp", "ecb"),
+            "USDPLN" to listOf("złot", "zlot", "nbp", "rpp", "fed", "dollar")
+        )
+    }
 }

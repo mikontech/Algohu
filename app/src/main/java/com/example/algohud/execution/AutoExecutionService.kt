@@ -12,6 +12,7 @@ import android.view.accessibility.AccessibilityNodeInfo
 import com.example.algohud.core.ExecutionMode
 import com.example.algohud.core.ExecutionResult
 import com.example.algohud.core.OrderRequest
+import com.example.algohud.core.ScreenQuote
 import com.example.algohud.core.Side
 import com.example.algohud.risk.RiskManager
 import kotlinx.coroutines.CancellationException
@@ -41,6 +42,8 @@ import kotlin.math.abs
 interface OrderExecutor {
     suspend fun submit(order: OrderRequest): ExecutionResult
     suspend fun cancelAll()
+    /** null = gotowy do prawdziwych zleceń, w przeciwnym razie powód blokady. */
+    fun readiness(): String? = null
 }
 
 private fun formatQty(q: Double): String = BigDecimal.valueOf(q).stripTrailingZeros().toPlainString()
@@ -69,10 +72,20 @@ class ExecutionEngine(
     private val execMutex = Mutex()
     private val flattenMutex = Mutex()
 
-    fun cycleMode() {
-        val all = ExecutionMode.values()
-        _mode.value = all[(_mode.value.ordinal + 1) % all.size]
-        log("Tryb: ${_mode.value}")
+    /**
+     * Zmienia tryb. CONFIRM i AUTO wymagają gotowego wykonawcy (API z kluczem albo prawdziwy profil UI).
+     * @return null przy sukcesie, w przeciwnym razie powód blokady.
+     */
+    fun setMode(target: ExecutionMode): String? {
+        if (target != ExecutionMode.DRY_RUN) {
+            executor.readiness()?.let { reason ->
+                log("🔒 $target zablokowany: $reason")
+                return reason
+            }
+        }
+        _mode.value = target
+        log("Tryb: $target")
+        return null
     }
 
     /** @param bypassConfirmation true dla akcji człowieka i stopów ochronnych. */
@@ -115,6 +128,11 @@ class ExecutionEngine(
             log("🧪 PAPER ${order.side} ${formatQty(order.quantity)} ${order.symbol} @ %.2f".format(order.referencePrice))
             return ExecutionResult.Filled("PAPER-${order.clientOrderId}", order.referencePrice, order.quantity)
         }
+        executor.readiness()?.let { reason ->
+            _mode.value = ExecutionMode.DRY_RUN
+            log("🔒 Wykonawca niegotowy ($reason) – powrót do DRY_RUN")
+            return ExecutionResult.Rejected(reason)
+        }
         val result = withTimeoutOrNull(executorTimeoutMs) { executor.submit(order) }
             ?: ExecutionResult.Failed(TimeoutException("Brak odpowiedzi wykonawcy – stan NIEZNANY"))
         when (result) {
@@ -156,6 +174,9 @@ class BinanceSpotExecutor(
     private val symbols: Set<String>,
     private val baseUrl: String = "https://testnet.binance.vision"
 ) : OrderExecutor {
+
+    override fun readiness(): String? =
+        if (apiKey.isBlank() || apiSecret.isBlank()) "brak klucza API" else null
 
     override suspend fun submit(order: OrderRequest): ExecutionResult = withContext(Dispatchers.IO) {
         try {
@@ -247,6 +268,12 @@ object UiProfiles {
 }
 
 class AccessibilityExecutor(private val profileProvider: () -> UiTargetProfile?) : OrderExecutor {
+    override fun readiness(): String? = when {
+        AutoExecutionService.instance == null -> "usługa ułatwień dostępu wyłączona"
+        profileProvider()?.packageName?.startsWith("com.example.") != false -> "brak prawdziwego profilu UI brokera"
+        else -> null
+    }
+
     override suspend fun submit(order: OrderRequest): ExecutionResult {
         val svc = AutoExecutionService.instance
             ?: return ExecutionResult.Rejected("Usługa ułatwień dostępu jest wyłączona")
@@ -264,6 +291,12 @@ class AutoExecutionService : AccessibilityService() {
         @Volatile var instance: AutoExecutionService? = null
             private set
         @Volatile var activeProfile: UiTargetProfile? = null
+        /** Aplikacje, których ekran HUD odczytuje (dopasowanie po nazwie widocznej w launcherze). */
+        @Volatile var targetAppLabels: Set<String> = setOf("XTB")
+
+        private val _screenQuote = MutableStateFlow<ScreenQuote?>(null)
+        /** Instrument i ceny widoczne aktualnie w aplikacji brokera. */
+        val screenQuote: StateFlow<ScreenQuote?> = _screenQuote.asStateFlow()
 
         private val _screenPrice = MutableStateFlow<Double?>(null)
         /** Cena odczytana z ekranu brokera – do weryfikacji spójności z feedem. */
@@ -278,6 +311,7 @@ class AutoExecutionService : AccessibilityService() {
     }
 
     private var lastScan = 0L
+    private val labelCache = HashMap<String, String>()
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -298,15 +332,36 @@ class AutoExecutionService : AccessibilityService() {
     override fun onInterrupt() = Unit
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val p = activeProfile ?: return
-        if (event?.packageName?.toString() != p.packageName) return
-        val sel = p.priceLabel ?: return
+        val pkg = event?.packageName?.toString() ?: return
+        val label = targetLabel(pkg) ?: return // inne aplikacje odrzucamy od razu – nic z nich nie czytamy
         val now = SystemClock.uptimeMillis()
-        if (now - lastScan < 250) return // throttling – drzewo widoków jest drogie
+        if (now - lastScan < 300) return // throttling – drzewo widoków jest drogie
         lastScan = now
         val root = rootInActiveWindow ?: return
-        find(root, sel)?.text?.toString()?.let(::parsePrice)?.let { _screenPrice.value = it }
+        if (root.packageName?.toString() != pkg) return
+
+        val profile = activeProfile?.takeIf { it.packageName == pkg }
+        val profilePrice = profile?.priceLabel?.let { sel -> find(root, sel)?.text?.toString()?.let(::parsePrice) }
+        val quote = runCatching { ScreenScanner.scan(root, pkg, label, System.currentTimeMillis()) }.getOrNull()
+        if (quote != null) _screenQuote.value = quote
+        (profilePrice ?: quote?.mid)?.let { _screenPrice.value = it }
     }
+
+    /** Etykieta aplikacji, jeśli to aplikacja docelowa (np. "XTB"); dla pozostałych null. */
+    private fun targetLabel(pkg: String): String? {
+        if (pkg == packageName) return null
+        return labelCache.getOrPut(pkg) {
+            val label = runCatching {
+                packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+            }.getOrNull()
+            val isTarget = activeProfile?.packageName == pkg ||
+                (label != null && targetAppLabels.any { label.contains(it, ignoreCase = true) })
+            if (isTarget) label ?: pkg else ""
+        }.ifEmpty { null }
+    }
+
+    /** Tekstowy zrzut drzewa widoków aktywnej aplikacji – do zbudowania profilu UI. */
+    fun dumpActiveWindow(): String? = rootInActiveWindow?.let { ScreenScanner.dump(it) }
 
     suspend fun executeOnScreen(order: OrderRequest, profile: UiTargetProfile): ExecutionResult =
         withContext(Dispatchers.Main.immediate) {

@@ -184,7 +184,7 @@ class MarketNewsEngine(
     private val seen = object : LinkedHashMap<String, Boolean>(1024, 0.75f, false) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>?) = size > 3000
     }
-    private val recent = ArrayDeque<Pair<Long, Double>>() // (publishedAt, score)
+    private val recent = ArrayDeque<NewsItem>()
     private val jobs = mutableListOf<Job>()
 
     fun start() {
@@ -257,9 +257,9 @@ class MarketNewsEngine(
                 for (raw in items) {
                     val isNew = lock.withLock { seen.put(raw.id, true) == null }
                     if (!isNew) continue
-                    val score = scorer.score(raw.title)
-                    lock.withLock { recent.addLast(raw.ts to score) }
-                    _news.emit(NewsItem(raw.id, raw.title, host(url), raw.ts, score))
+                    val item = NewsItem(raw.id, raw.title, host(url), raw.ts, scorer.score(raw.title))
+                    lock.withLock { recent.addLast(item) }
+                    _news.emit(item)
                 }
             }
             recomputeSentiment()
@@ -335,20 +335,38 @@ class MarketNewsEngine(
     private suspend fun recomputeSentiment() {
         val now = System.currentTimeMillis()
         val value = lock.withLock {
-            recent.removeAll { now - it.first > MAX_NEWS_AGE_MS }
+            recent.removeAll { now - it.publishedAt > MAX_NEWS_AGE_MS }
             while (recent.size > 500) recent.removeFirst()
-            var num = 0.0
-            var den = 0.0
-            for ((ts, s) in recent) {
-                val age = (now - ts).coerceAtLeast(0L).toDouble()
-                val w = 0.5.pow(age / config.sentimentHalfLifeMs)
-                num += w * s
-                den += w
-            }
-            // +1.0 w mianowniku = neutralny "prior": przy małej liczbie newsów wynik ciąży ku 0.
-            num / (den + 1.0)
+            weighted(recent, now)
         }
         _sentiment.value = value.coerceIn(-1.0, 1.0)
+    }
+
+    /** Sentyment tylko z nagłówków zawierających któryś alias (np. "gold", "złoto"). Zwraca (wynik, liczba newsów). */
+    suspend fun sentimentFor(aliases: Collection<String>): Pair<Double, Int> {
+        if (aliases.isEmpty()) return 0.0 to 0
+        val now = System.currentTimeMillis()
+        val keys = aliases.map { it.lowercase() }
+        return lock.withLock {
+            val matching = recent.filter { n ->
+                val t = n.title.lowercase()
+                keys.any { t.contains(it) }
+            }
+            weighted(matching, now).coerceIn(-1.0, 1.0) to matching.size
+        }
+    }
+
+    private fun weighted(items: Iterable<NewsItem>, now: Long): Double {
+        var num = 0.0
+        var den = 0.0
+        for (n in items) {
+            val age = (now - n.publishedAt).coerceAtLeast(0L).toDouble()
+            val w = 0.5.pow(age / config.sentimentHalfLifeMs)
+            num += w * n.sentiment
+            den += w
+        }
+        // +1.0 w mianowniku = neutralny "prior": przy małej liczbie newsów wynik ciąży ku 0.
+        return num / (den + 1.0)
     }
 
     private companion object {
