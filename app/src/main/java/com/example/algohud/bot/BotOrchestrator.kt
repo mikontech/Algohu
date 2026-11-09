@@ -20,6 +20,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.math.BigDecimal
@@ -137,6 +138,50 @@ class BotOrchestrator(
     private val aggregators = HashMap<String, BarAggregator>()
     private val learners = HashMap<String, Learner>()
     private val binanceFallback = java.util.Collections.synchronizedSet(HashSet<String>())
+    private val noHistory = java.util.Collections.synchronizedSet(HashSet<String>())
+
+    /** Historia z Binance (np. PAXG) przesunięta do poziomu ceny z Pyth (spot) – kształt ruchów prawie identyczny. */
+    private suspend fun loadShiftedBinanceHistory(inst: String) {
+        val feed = FEEDS[inst] ?: return
+        setLoading(inst, "czekam na cenę z Pyth do wyrównania historii…")
+        val live = withTimeoutOrNull(30_000) {
+            var p: Double? = null
+            while (p == null) { p = lastPx[inst]?.first; if (p == null) delay(500) }
+            p
+        }
+        for (tf in Learner.TIMEFRAMES) {
+            setLoading(inst, "historia zastępcza ${tfLabel(tf)} (Binance $feed)…")
+            runCatching { news.historyPaged(feed, tfLabel(tf), Learner.historyBars(tf)) }
+                .onSuccess { h ->
+                    val shift = if (live != null && h.isNotEmpty()) live - h.last().close else 0.0
+                    val adj = h.map { b -> b.copy(open = b.open + shift, high = b.high + shift, low = b.low + shift, close = b.close + shift) }
+                    setLoading(inst, "uczę się na ${adj.size} świecach ${tfLabel(tf)}…")
+                    lock.withLock {
+                        agg(inst, tf).seed(adj)
+                        learner(inst).backtest(tf, adj, spreadOf(inst))
+                    }
+                }
+                .onFailure { msg("Historia zastępcza $inst (${tfLabel(tf)}): ${it.message}") }
+        }
+        setLoading(inst, null)
+    }
+
+    /** Świece zebrane wcześniej na żywo i zapisane w telefonie. */
+    private suspend fun loadStoredBars(inst: String) {
+        var total = 0
+        for (tf in Learner.TIMEFRAMES) {
+            val saved = runCatching { barStore.load(inst, tf) }.getOrDefault(emptyList())
+            if (saved.isEmpty()) continue
+            total += saved.size
+            lock.withLock {
+                agg(inst, tf).seed(saved)
+                learner(inst).backtest(tf, saved, spreadOf(inst))
+            }
+        }
+        setLoading(inst, if (total == 0) "brak darmowej historii – zbieram świece na żywo (zapisywane w telefonie)" else null)
+        if (total > 0) msg("$inst: wczytano $total zapisanych świec do nauki")
+    }
+
     /** Postęp ładowania historii (do HUD); null = gotowe. */
     private val loading = java.util.concurrent.ConcurrentHashMap<String, String>()
 
@@ -191,7 +236,22 @@ class BotOrchestrator(
                     }
                     .onFailure { errors += "${tfLabel(tf)}: ${it.message}" }
             }
-            setLoading(inst, if (errors.isEmpty()) null else "historia niedostępna (${errors.joinToString("; ")}) – uczę się na żywo")
+            if (errors.isEmpty()) {
+                setLoading(inst, null)
+            } else {
+                // Darmowa historia Pyth została wyłączona (HTTP 404) – zastępstwo:
+                noHistory.add(inst)
+                if (inst in FEEDS) loadShiftedBinanceHistory(inst) else loadStoredBars(inst)
+            }
+        }
+        // Strażnik: jeśli Pyth nie podaje cen na żywo, złoto przechodzi na Binance, reszta informuje w HUD.
+        scope.launch {
+            delay(90_000)
+            for (inst in PYTH_FEEDS.keys) {
+                if (pyth.status.value[inst] != "ok" || lastPx.containsKey(inst)) continue
+                if (inst in FEEDS && binanceFallback.add(inst)) msg("$inst: Pyth nie podaje cen na żywo – przełączam na Binance ${FEEDS[inst]}")
+                else setLoading(inst, "Pyth nie podaje cen na żywo – uczę się tylko przy otwartym XTB")
+            }
         }
         scope.launch { pyth.ticks.collect { t -> lock.withLock { processPrice(t.symbol, t.price, t.timestamp) } } }
         scope.launch {
@@ -324,8 +384,8 @@ class BotOrchestrator(
         for (tf in Learner.TIMEFRAMES) {
             val a = agg(inst, tf)
             val closed = a.onTick(px, ts) ?: continue
-            // Instrumenty bez cen w tle: zapisujemy świece, żeby nauka rosła z każdym dniem i przetrwała restart.
-            if (!hasBackground(inst)) runCatching { barStore.append(inst, tf, closed) }
+            // Instrumenty bez historii (lub bez cen w tle): zapisujemy świece – nauka rośnie z każdym dniem i przetrwa restart.
+            if (!hasBackground(inst) || inst in noHistory) runCatching { barStore.append(inst, tf, closed) }
             val (sent, _) = news.sentimentFor(aliasesFor(inst))
             val l = learner(inst)
             val sig = l.onBar(tf, a.closed(), sent, spreadOf(inst))
