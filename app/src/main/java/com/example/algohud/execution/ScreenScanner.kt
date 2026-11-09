@@ -23,7 +23,8 @@ object ScreenScanner {
         "KUP", "SPRZEDAJ", "BUY", "SELL", "MENU", "LIVE", "DEMO", "MAX", "MIN", "OFF", "USD", "PLN", "EUR",
         "GBP", "CHF", "JPY", "XTB", "RYNEK", "MARKET", "LIMIT", "STOP", "WYKRES", "CHART", "PROFIL", "KONTO",
         "NEWS", "HOME", "SALDO", "DEPOZYT", "MARGIN", "OPEN", "CLOSE", "ZAMKNIJ", "OTWARTE", "HISTORIA", "LOT",
-        "LOTY", "PIPS", "SWAP", "INFO", "OK", "ANULUJ", "CANCEL", "WSZYSTKIE", "ALL", "TOP", "NOWE"
+        "LOTY", "PIPS", "SWAP", "INFO", "OK", "ANULUJ", "CANCEL", "WSZYSTKIE", "ALL", "TOP", "NOWE",
+        "CFD", "ETF", "STC", "CRYPTO", "FX", "INDEX"
     )
 
     fun collect(root: AccessibilityNodeInfo, limit: Int = 600): List<TextNode> {
@@ -50,10 +51,14 @@ object ScreenScanner {
         val nodes = collect(root)
         val bounds = Rect().also { root.getBoundsInScreen(it) }
         val topZone = bounds.top + (bounds.height() * 0.45).toInt()
-        val instrument = nodes.asSequence()
-            .filter { it.top <= topZone }
-            .mapNotNull { normalizeInstrument(it.text) }
-            .firstOrNull()
+        // Kandydaci w górnej części ekranu; z tych w najwyższym "wierszu" wybieramy najdłuższy
+        // (XTB: "GOLD" obok plakietki "CFD").
+        val candidates = nodes.filter { it.top <= topZone }
+            .mapNotNull { n -> normalizeInstrument(n.text)?.let { n.top to it } }
+        val firstRow = candidates.minOfOrNull { it.first }
+        val instrument = firstRow?.let { row ->
+            candidates.filter { it.first - row <= 40 }.maxByOrNull { it.second.length }?.second
+        }
         return ScreenQuote(
             packageName = pkg,
             appLabel = label,
