@@ -60,8 +60,11 @@ class ExecutionEngine(
     private val risk: RiskManager,
     private val executor: OrderExecutor,
     initialMode: ExecutionMode = ExecutionMode.DRY_RUN,
-    private val executorTimeoutMs: Long = 20_000
+    private val executorTimeoutMs: Long = 20_000,
+    /** Dodatkowa bramka AUTO (np. wyniki papierowe); null = OK. */
+    private val autoGate: () -> String? = { null }
 ) {
+    private var pendingAt = 0L
     private val _mode = MutableStateFlow(initialMode)
     val mode: StateFlow<ExecutionMode> = _mode.asStateFlow()
 
@@ -82,7 +85,7 @@ class ExecutionEngine(
         val blocked = when (target) {
             ExecutionMode.DRY_RUN -> null
             ExecutionMode.CONFIRM -> executor.readiness()
-            ExecutionMode.AUTO -> executor.autoReadiness()
+            ExecutionMode.AUTO -> executor.autoReadiness() ?: autoGate()
         }
         if (blocked != null) {
             log("🔒 $target zablokowany: $blocked")
@@ -107,6 +110,7 @@ class ExecutionEngine(
         }
         if (_mode.value == ExecutionMode.CONFIRM && !bypassConfirmation) {
             _pending.value = order
+            pendingAt = System.currentTimeMillis()
             log("❓ Potwierdź: ${order.side} ${formatQty(order.quantity)} ${order.symbol}")
             return ExecutionResult.Rejected("Oczekuje na potwierdzenie")
         }
@@ -116,6 +120,10 @@ class ExecutionEngine(
     suspend fun confirmPending() {
         val o = _pending.value ?: return
         _pending.value = null
+        if (System.currentTimeMillis() - pendingAt > 60_000) {
+            log("⌛ Propozycja wygasła (starsza niż 60 s) – cena mogła się zmienić")
+            return
+        }
         submit(o, bypassConfirmation = true)
     }
 
@@ -279,6 +287,7 @@ object UiProfiles {
         quantityField = NodeSelector(viewId = "StepperTextField"),
         confirmButton = null,
         priceLabel = null,
+        maxPriceDriftPct = 0.02, // ceny w tle z PAXG różnią się lekko od XTB
         canClosePositions = false,
         verifyInstrument = true,
         allowAuto = false

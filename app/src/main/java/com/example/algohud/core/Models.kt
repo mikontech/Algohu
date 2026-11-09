@@ -13,6 +13,9 @@ enum class ExecutionMode { DRY_RUN, CONFIRM, AUTO }
 
 data class Tick(val symbol: String, val price: Double, val timestamp: Long)
 
+/** Świeca OHLC; [start] = początek okresu (ms). */
+data class Bar(val start: Long, val open: Double, val high: Double, val low: Double, val close: Double)
+
 data class NewsItem(
     val id: String,
     val title: String,
@@ -41,6 +44,7 @@ data class OrderRequest(
     val pointValue: Double = 1.0,
     /** Zlecenie zamykające – nie może otworzyć nowej pozycji. */
     val reduceOnly: Boolean = false,
+    val takeProfit: Double? = null,
     val clientOrderId: String = "hud" + UUID.randomUUID().toString().replace("-", "").take(16)
 )
 
@@ -61,7 +65,12 @@ data class Position(
     val stopPrice: Double,
     val pointValue: Double = 1.0,
     /** Pozycja papierowa (DRY_RUN) – nie istnieje u brokera. */
-    val paper: Boolean = false
+    val paper: Boolean = false,
+    /** Pierwotny stop – definiuje 1R (stopPrice może być przesuwany przez trailing). */
+    val initialStop: Double = stopPrice,
+    val takeProfit: Double? = null,
+    /** Najlepsza cena od otwarcia (do trailing stopu). */
+    val best: Double = entryPrice
 )
 
 /** Co jest teraz widoczne w aplikacji brokera (odczytane przez AccessibilityService). */
@@ -104,5 +113,6 @@ data class HudState(
     val screen: ScreenQuote? = null,
     val screenSentiment: Double = 0.0,
     val screenNews: Int = 0,
+    val paperStats: String = "",
     val lastMessage: String = "Uruchamianie…"
 )

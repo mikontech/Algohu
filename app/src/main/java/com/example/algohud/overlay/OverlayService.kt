@@ -42,6 +42,7 @@ import com.example.algohud.execution.ExecutionEngine
 import com.example.algohud.execution.OrderExecutor
 import com.example.algohud.execution.UiProfiles
 import com.example.algohud.risk.RiskManager
+import com.example.algohud.risk.TradeJournal
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -65,6 +66,7 @@ class OverlayService : LifecycleService() {
         const val ACTION_KILL = "com.example.algohud.KILL"
         private const val CHANNEL_ID = "algo_hud"
         private const val NOTIF_ID = 1001
+        private const val MIN_PAPER_TRADES = 30
 
         fun start(ctx: Context) = ContextCompat.startForegroundService(
             ctx, Intent(ctx, OverlayService::class.java).setAction(ACTION_START)
@@ -84,6 +86,7 @@ class OverlayService : LifecycleService() {
     private lateinit var tvStatus: TextView
     private lateinit var tvMessage: TextView
     private lateinit var tvScreen: TextView
+    private lateinit var tvStats: TextView
     private lateinit var btnMode: Button
     private lateinit var btnConfirm: Button
 
@@ -136,10 +139,12 @@ class OverlayService : LifecycleService() {
 
         val news = MarketNewsEngine(botScope, http, MarketNewsEngine.Config(), KeywordSentimentScorer())
 
+        val journal = TradeJournal(getSharedPreferences("journal", MODE_PRIVATE))
         risk = RiskManager(
             prefs = getSharedPreferences("risk_state", MODE_PRIVATE),
             config = RiskManager.Config(),
-            marketBlackout = { news.isInMacroBlackout() }
+            marketBlackout = { news.isInMacroBlackout() },
+            journal = journal
         )
 
         // Wariant B (UI): wymaga włączonej usługi ułatwień dostępu i poprawnego profilu.
@@ -148,13 +153,26 @@ class OverlayService : LifecycleService() {
         // Wariant A (API) – preferowany, gdy broker ma API:
         // val executor = BinanceSpotExecutor(http, apiKey, apiSecret, risk.config.allowedSymbols)
 
-        engine = ExecutionEngine(risk, executor, initialMode = ExecutionMode.DRY_RUN)
+        engine = ExecutionEngine(
+            risk, executor, initialMode = ExecutionMode.DRY_RUN,
+            // AUTO dopiero po udokumentowanym dodatnim wyniku na papierze.
+            autoGate = {
+                val s = journal.stats.value
+                when {
+                    s.trades < MIN_PAPER_TRADES -> "za mało transakcji papierowych (${s.trades}/$MIN_PAPER_TRADES)"
+                    s.avgR <= 0.0 -> "wynik papierowy nie jest dodatni (E=%+.2fR)".format(s.avgR)
+                    else -> null
+                }
+            }
+        )
 
         bot = BotOrchestrator(
             scope = botScope,
             news = news,
             risk = risk,
             engine = engine,
+            journal = journal,
+            prefs = getSharedPreferences("instruments", MODE_PRIVATE),
             equityProvider = {
                 val funds = AutoExecutionService.lastAccountFunds
                 when {
@@ -182,6 +200,7 @@ class OverlayService : LifecycleService() {
             setTextColor(0xFFAAAAAA.toInt()); textSize = 11f
             maxLines = 2; maxWidth = dp(260); ellipsize = TextUtils.TruncateAt.END
         }
+        tvStats = TextView(this).apply { setTextColor(0xFF90CAF9.toInt()); textSize = 11f; maxWidth = dp(280) }
         tvScreen = TextView(this).apply { setTextColor(0xFFFFE082.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 3 }
         // Dotknięcie: DRY_RUN ⇄ CONFIRM. Przytrzymanie: AUTO. Oba wymagają gotowego wykonawcy.
         btnMode = actionButton("Tryb", 0xFF455A64.toInt()) {
@@ -250,6 +269,7 @@ class OverlayService : LifecycleService() {
             visibility = View.GONE
             addView(tvStatus)
             addView(tvScreen)
+            addView(tvStats)
             addView(tvMessage)
             addView(tradeRow, wrap().apply { topMargin = dp(6) })
             addView(controlRow, wrap().apply { topMargin = dp(6) })
@@ -392,6 +412,7 @@ class OverlayService : LifecycleService() {
         tvStatus.text = "${s.symbol} • ${if (s.feedConnected) "● LIVE" else "○ offline"} • PnL dnia: %+.2f"
             .format(s.dailyPnl)
         tvMessage.text = s.lastMessage
+        tvStats.text = s.paperStats
         btnMode.text = "Tryb: ${s.mode.name}"
 
         val key = "${s.mode}|${s.killSwitch}|${s.feedConnected}"

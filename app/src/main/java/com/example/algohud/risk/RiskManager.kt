@@ -15,6 +15,7 @@ import java.time.LocalDate
 import java.time.ZoneId
 import kotlin.math.abs
 import kotlin.math.floor
+import kotlin.math.max
 import kotlin.math.min
 import java.math.BigDecimal
 
@@ -28,7 +29,8 @@ class RiskManager(
     val config: Config = Config(),
     private val marketBlackout: () -> Boolean = { false },
     private val clock: () -> Long = System::currentTimeMillis,
-    private val zone: ZoneId = ZoneId.systemDefault()
+    private val zone: ZoneId = ZoneId.systemDefault(),
+    private val journal: TradeJournal? = null
 ) {
     data class Config(
         val maxDailyLossPct: Double = 0.05,          // twardy limit dziennej straty: 5% kapitału z początku dnia
@@ -175,6 +177,7 @@ class RiskManager(
                 val closedQty = min(qty, existing.quantity)
                 val pnl = (price - existing.entryPrice) * closedQty * existing.side.sign * existing.pointValue
                 realizedToday += pnl
+                journal?.record(closedTradeLocked(existing, closedQty, price, pnl, order.reason))
                 if (pnl < 0) lastLossAt = clock()
                 val remaining = existing.quantity - closedQty
                 if (remaining <= 1e-12) {
@@ -191,8 +194,10 @@ class RiskManager(
                     entryPrice = (existing.entryPrice * existing.quantity + price * qty) / newQty
                 )
             }
-            else -> positions[order.symbol] =
-                Position(order.symbol, order.side, qty, price, order.stopPrice, order.pointValue, paper)
+            else -> positions[order.symbol] = Position(
+                order.symbol, order.side, qty, price, order.stopPrice, order.pointValue, paper,
+                takeProfit = order.takeProfit
+            )
         }
         recomputePnlLocked()
         persistLocked()
@@ -204,13 +209,36 @@ class RiskManager(
      */
     suspend fun onMark(symbol: String, price: Double): OrderRequest? = mutex.withLock {
         marks[symbol] = price
+        val p = positions[symbol]?.let { trailLocked(it, price) }?.also { positions[symbol] = it }
         recomputePnlLocked()
-        val p = positions[symbol] ?: return@withLock null
-        val hit = if (p.side == Side.BUY) price <= p.stopPrice else price >= p.stopPrice
-        if (!hit || symbol in pendingStops) return@withLock null
+        if (p == null || symbol in pendingStops) return@withLock null
+        val long = p.side == Side.BUY
+        val stopHit = if (long) price <= p.stopPrice else price >= p.stopPrice
+        val tpHit = p.takeProfit?.let { if (long) price >= it else price <= it } == true
+        if (!stopHit && !tpHit) return@withLock null
         pendingStops += symbol
-        OrderRequest(symbol, p.side.opposite(), p.quantity, price, stopPrice = price, reason = "SOFT-STOP",
+        val reason = when {
+            tpHit -> "TP"
+            p.stopPrice != p.initialStop -> "TRAILING-STOP"
+            else -> "SL"
+        }
+        OrderRequest(symbol, p.side.opposite(), p.quantity, price, stopPrice = price, reason = reason,
             pointValue = p.pointValue, reduceOnly = true)
+    }
+
+    /** Po zysku 1R stop idzie na cenę wejścia, dalej podąża w odległości 1R za najlepszą ceną. */
+    private fun trailLocked(p: Position, price: Double): Position {
+        val r = abs(p.entryPrice - p.initialStop)
+        if (r <= 0) return p
+        return if (p.side == Side.BUY) {
+            val best = max(p.best, price)
+            val stop = if (best - p.entryPrice >= r) max(p.stopPrice, max(p.entryPrice, best - r)) else p.stopPrice
+            p.copy(best = best, stopPrice = stop)
+        } else {
+            val best = min(p.best, price)
+            val stop = if (p.entryPrice - best >= r) min(p.stopPrice, min(p.entryPrice, best + r)) else p.stopPrice
+            p.copy(best = best, stopPrice = stop)
+        }
     }
 
     suspend fun closingOrder(symbol: String, side: Side, price: Double): OrderRequest? = mutex.withLock {
@@ -241,6 +269,7 @@ class RiskManager(
             val px = marks[p.symbol] ?: p.entryPrice
             val pnl = (px - p.entryPrice) * p.quantity * p.side.sign * p.pointValue
             realizedToday += pnl
+            journal?.record(closedTradeLocked(p, p.quantity, px, pnl, "ZAMKNIĘTE RĘCZNIE"))
             if (pnl < 0) lastLossAt = clock()
             positions.remove(p.symbol)
             pendingStops.remove(p.symbol)
@@ -265,6 +294,15 @@ class RiskManager(
     }
 
     // ── Wewnętrzne (wywoływać pod mutexem) ──
+
+    private fun closedTradeLocked(p: Position, qty: Double, exit: Double, pnl: Double, reason: String): ClosedTrade {
+        val riskAtEntry = abs(p.entryPrice - p.initialStop) * qty * p.pointValue
+        return ClosedTrade(
+            symbol = p.symbol, side = p.side, quantity = qty, entry = p.entryPrice, exit = exit, pnl = pnl,
+            r = if (riskAtEntry > 0) pnl / riskAtEntry else 0.0,
+            reason = reason, paper = p.paper, closedAt = clock()
+        )
+    }
 
     private fun today(): LocalDate = Instant.ofEpochMilli(clock()).atZone(zone).toLocalDate()
 

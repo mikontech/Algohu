@@ -2,6 +2,7 @@ package com.example.algohud.data
 
 import android.util.Log
 import android.util.Xml
+import com.example.algohud.core.Bar
 import com.example.algohud.core.MacroEvent
 import com.example.algohud.core.NewsItem
 import com.example.algohud.core.Tick
@@ -26,6 +27,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import org.json.JSONArray
 import org.json.JSONObject
 import org.xmlpull.v1.XmlPullParser
 import java.net.URI
@@ -139,8 +141,8 @@ class MarketNewsEngine(
     private val calendar: EconomicCalendarSource = EconomicCalendarSource.None
 ) {
     data class Config(
-        /** Przykład: publiczny strumień transakcji Binance (format {"s","p","T"}). */
-        val tickStreamUrl: String = "wss://stream.binance.com:9443/ws/btcusdt@trade",
+        /** Publiczne strumienie transakcji Binance (PAXG ≈ cena złota). */
+        val feedSymbols: List<String> = listOf("BTCUSDT", "PAXGUSDT", "ETHUSDT"),
         /** Przykładowe kanały – sprawdź regulaminy źródeł przed użyciem. */
         val rssFeeds: List<String> = listOf(
             "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -211,7 +213,9 @@ class MarketNewsEngine(
         var attempt = 0
         while (currentCoroutineContext().isActive) {
             try {
-                tickStream(config.tickStreamUrl).collect { tick ->
+                val url = "wss://stream.binance.com:9443/stream?streams=" +
+                    config.feedSymbols.joinToString("/") { it.lowercase() + "@trade" }
+                tickStream(url).collect { tick ->
                     attempt = 0
                     _ticks.emit(tick)
                 }
@@ -236,9 +240,24 @@ class MarketNewsEngine(
     }.buffer(256, BufferOverflow.DROP_OLDEST)
 
     private fun parseTick(text: String): Tick? = runCatching {
-        val o = JSONObject(text)
+        val root = JSONObject(text)
+        val o = root.optJSONObject("data") ?: root // strumień łączony: {"stream":…, "data":{…}}
         Tick(o.getString("s"), o.getString("p").toDouble(), o.optLong("T", System.currentTimeMillis()))
     }.getOrNull()
+
+    /** Historia świec z Binance REST (bez trwającej świecy). */
+    suspend fun history(symbol: String, interval: String, limit: Int): List<Bar> = withContext(Dispatchers.IO) {
+        val url = "https://api.binance.com/api/v3/klines?symbol=$symbol&interval=$interval&limit=$limit"
+        http.newCall(Request.Builder().url(url).build()).execute().use { r ->
+            if (!r.isSuccessful) error("HTTP ${r.code}")
+            val arr = JSONArray(r.body!!.string())
+            (0 until arr.length()).map { i ->
+                val k = arr.getJSONArray(i)
+                Bar(k.getLong(0), k.getString(1).toDouble(), k.getString(2).toDouble(),
+                    k.getString(3).toDouble(), k.getString(4).toDouble())
+            }.dropLast(1)
+        }
+    }
 
     // ── RSS / Atom ──
 
