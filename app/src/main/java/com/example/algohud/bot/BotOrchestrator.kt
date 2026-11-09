@@ -140,6 +140,99 @@ class BotOrchestrator(
     private val lock = Mutex()
     private val aggregators = HashMap<String, BarAggregator>()
     private val learners = HashMap<String, Learner>()
+
+    // ───────────── Profil agresywny: impuls w czasie rzeczywistym (RT) + Open Range Breakout (ORB) ─────────────
+    private val aggressive = MutableStateFlow(prefs.getBoolean("profile_aggressive", true))
+    private val rtLastBar = HashMap<String, Long>()
+    private data class Orb(val eventMs: Long, var hi: Double = Double.MIN_VALUE, var lo: Double = Double.MAX_VALUE, var fired: Boolean = false)
+    private val orbs = HashMap<String, Orb>()
+
+    fun toggleProfile(): Boolean {
+        val v = !aggressive.value
+        aggressive.value = v
+        prefs.edit().putBoolean("profile_aggressive", v).apply()
+        _hud.update { it.copy(profile = profileLabel()) }
+        return v
+    }
+
+    private fun profileLabel() = if (aggressive.value) "⚡ AGRESYWNY (RT+ORB)" else "STANDARD"
+
+    /** Reguły sesji: null = wolno otwierać; inaczej powód blokady. */
+    private fun sessionBlock(inst: String, ts: Long): String? {
+        val st = MarketHours.status(inst, ts)
+        return when {
+            !st.open -> "rynek $inst zamknięty"
+            st.minutesToClose != null && st.minutesToClose < SESSION_NO_ENTRY_MIN ->
+                "$SESSION_NO_ENTRY_MIN min przed zamknięciem sesji (zostało ${st.minutesToClose} min)"
+            else -> null
+        }
+    }
+
+    /**
+     * on_candle_update dla świecy 1m: wejście W TRAKCIE świecy, gdy
+     *  zasięg ≥ 1,2×ATR14, korpus ≥ 70% zasięgu, knot po stronie ruchu ≤ 15% zasięgu
+     *  i cena wybija High/Low ostatnich [RT_LOOKBACK] zamkniętych świec. Jedno wejście na świecę.
+     */
+    private suspend fun realtimeCheck(inst: String, px: Double, ts: Long) {
+        val a = aggregators["$inst@${Learner.M1}"] ?: return
+        val cur = a.current() ?: return
+        if (rtLastBar[inst] == cur.start) return
+        val closed = a.closed()
+        if (closed.size < RT_LOOKBACK + 15) return
+        val atr = Indicators.atr(closed)?.takeIf { it > 0 } ?: return
+        val range = cur.high - cur.low
+        val body = abs(cur.close - cur.open)
+        if (range < RT_RANGE_ATR * atr || body < RT_BODY_RATIO * range) return
+        val dir = if (cur.close > cur.open) 1 else -1
+        // Long: cena przy szczycie (mały górny knot); short: przy dołku (mały dolny knot).
+        val wickAgainst = if (dir > 0) cur.high - cur.close else cur.close - cur.low
+        if (wickAgainst > RT_MAX_WICK * range) return
+        val look = closed.takeLast(RT_LOOKBACK)
+        val breaks = if (dir > 0) cur.close > look.maxOf { it.high } else cur.close < look.minOf { it.low }
+        if (!breaks) return
+        rtLastBar[inst] = cur.start
+        // Stop: tuż za bazą świecy impulsu albo 0,8×ATR – ciaśniejszy z dwóch, ale nie bliżej niż 3× spread / min. dystans.
+        val base = if (dir > 0) cur.low - 0.1 * atr else cur.high + 0.1 * atr
+        val atrStop = px - dir * 0.8 * atr
+        val stop = if (dir > 0) maxOf(base, atrStop) else minOf(base, atrStop)
+        enterAggressive(inst, dir, px, stop, "RT impuls %.1f×ATR, korpus %.0f%%".format(range / atr, body / range * 100), ts)
+    }
+
+    /** Open Breakout: zasięg pierwszych [ORB_RANGE_MIN] min po otwarciu, wybicie w kolejnych minutach (do [ORB_ACTIVE_MIN]). */
+    private suspend fun orbCheck(inst: String, px: Double, ts: Long) {
+        val ev = MarketHours.status(inst, ts).lastOpenEventMs ?: return
+        val minutes = (ts - ev) / 60_000
+        if (minutes < 0 || minutes >= ORB_ACTIVE_MIN) return
+        val o = orbs[inst]?.takeIf { it.eventMs == ev } ?: Orb(ev).also { orbs[inst] = it }
+        if (minutes < ORB_RANGE_MIN) { o.hi = maxOf(o.hi, px); o.lo = minOf(o.lo, px); return }
+        if (o.fired || o.hi <= o.lo) return
+        val dir = when { px > o.hi -> 1; px < o.lo -> -1; else -> return }
+        o.fired = true
+        val atr = aggregators["$inst@${Learner.M1}"]?.closed()?.let { Indicators.atr(it) } ?: (o.hi - o.lo)
+        // Stop po drugiej stronie zasięgu otwarcia, ale nie dalej niż 1,5×ATR.
+        val opposite = if (dir > 0) o.lo else o.hi
+        val capped = px - dir * 1.5 * atr
+        val stop = if (dir > 0) maxOf(opposite, capped) else minOf(opposite, capped)
+        rtLastBar[inst] = aggregators["$inst@${Learner.M1}"]?.current()?.start ?: 0L // priorytet ORB nad RT w tej minucie
+        enterAggressive(inst, dir, px, stop, "ORB wybicie zasięgu otwarcia %.2f–%.2f".format(o.lo, o.hi), ts)
+    }
+
+    private suspend fun enterAggressive(inst: String, dir: Int, px: Double, rawStop: Double, why: String, ts: Long) {
+        sessionBlock(inst, ts)?.let { msg("✋ $inst: $why – pominięte: $it"); return }
+        val spread = spreadOf(inst)
+        val entry = px + spread / 2 * dir
+        val minDist = maxOf(3 * spread, entry * risk.config.minStopDistancePct)
+        val stop = if (abs(entry - rawStop) < minDist) entry - dir * minDist else rawStop
+        val tp = entry + dir * 2.0 * abs(entry - stop)
+        val side = if (dir > 0) Side.BUY else Side.SELL
+        risk.closingOrder(inst, side, px)?.let { close ->
+            val r = engine.submit(withSpread(close.copy(reason = "ODWRÓCENIE (impuls)"), inst), bypassConfirmation = true)
+            if (r !is ExecutionResult.Filled && r !is ExecutionResult.Submitted) return
+        }
+        val order = buildOrder(inst, side, entry, stop, tp, why, pointValue(inst), Tier.AGGRESSIVE) ?: return
+        decisionCard(inst, order, Signal(side, stop, tp, why, Tier.AGGRESSIVE), ev = Double.NaN)
+        engine.submit(order)
+    }
     private val binanceFallback = java.util.Collections.synchronizedSet(HashSet<String>())
     private val noHistory = java.util.Collections.synchronizedSet(HashSet<String>())
 
@@ -286,7 +379,14 @@ class BotOrchestrator(
                 _hud.update { it.copy(sentiment = s, feedConnected = c, killSwitch = k, dailyPnl = pnl, mode = m) }
             }.collect()
         }
-        scope.launch { journal.stats.collect { s -> _hud.update { it.copy(paperStats = s.summary()) } } }
+        scope.launch {
+            journal.stats.collect { s ->
+                val rt = journal.statsWhere { it.reason.startsWith("RT") || it.reason.startsWith("ORB") }
+                val rtLine = if (rt.trades == 0) "⚡ RT/ORB: brak zamkniętych transakcji"
+                else "⚡ RT/ORB: %d tr. • %.0f%% • E=%+.2fR • %+.2f".format(rt.trades, rt.winRate * 100, rt.avgR, rt.pnl)
+                _hud.update { it.copy(paperStats = s.summary() + "\n" + rtLine) }
+            }
+        }
         scope.launch {
             news.news.collect { n ->
                 if (abs(n.sentiment) >= 0.5) msg("📰 %+.2f %s".format(n.sentiment, n.title.take(90)))
@@ -295,16 +395,24 @@ class BotOrchestrator(
         scope.launch { engine.events.collect { msg(it) } }
         scope.launch { AutoExecutionService.screenQuote.filterNotNull().collect { onScreen(it) } }
         scope.launch { risk.killSwitch.filter { it }.collect { engine.flattenAll(risk.killReason ?: "KILL") } }
-        // Polityka intraday: zamknięcie pozycji tuż przed rozliczeniem swapu (swap nie wchodzi do EV, bo go nie płacimy).
+        // Koniec sesji / weekend: zamknięcie pozycji intraday [SESSION_CLOSE_MIN] min przed zamknięciem rynku.
         scope.launch {
             while (isActive) {
-                if (risk.minutesToRollover() <= risk.config.closeBeforeRolloverMin && risk.hasRealPositions()) {
-                    msg("🌙 Zamykam pozycje przed rozliczeniem swapu")
-                    for (o in risk.flattenOrders()) engine.submit(o.copy(reason = "ROLLOVER"), bypassConfirmation = true)
+                val now = System.currentTimeMillis()
+                for (sym in risk.openSymbols()) {
+                    val left = MarketHours.status(sym, now).minutesToClose ?: continue
+                    if (left > SESSION_CLOSE_MIN) continue
+                    val px = lastPx[sym]?.first ?: continue
+                    val pos = risk.position(sym) ?: continue
+                    risk.closingOrder(sym, pos.side.opposite(), px)?.let {
+                        msg("🌙 $sym: $left min do zamknięcia sesji – zamykam pozycję intraday")
+                        engine.submit(withSpread(it.copy(reason = "KONIEC SESJI"), sym), bypassConfirmation = true)
+                    }
                 }
                 delay(30_000)
             }
         }
+        _hud.update { it.copy(profile = profileLabel()) }
     }
 
     suspend fun manualOrder(side: Side) {
@@ -406,10 +514,15 @@ class BotOrchestrator(
             updateLearningHud()
             if (sig != null) handleSignal(inst, sig, px)
         }
+        if (aggressive.value) {
+            orbCheck(inst, px, ts)
+            realtimeCheck(inst, px, ts)
+        }
     }
 
     private suspend fun handleSignal(inst: String, sig: Signal, px: Double) {
         val learner = learner(inst)
+        sessionBlock(inst, System.currentTimeMillis())?.let { msg("✋ $inst: sygnał pominięty – $it"); return }
         msg("📈 $inst ${sig.side} [${learner.champion?.name}]: ${sig.reason}")
         // Sygnał przeciwny do otwartej pozycji = zamknięcie i odwrócenie (long → short i odwrotnie).
         risk.closingOrder(inst, sig.side, px)?.let { close ->
@@ -444,14 +557,15 @@ class BotOrchestrator(
 
     /** Decyzja w formacie: kondycja • kierunek • poziom agresji i wielkość • wejście/SL/TP (w cenach XTB). */
     private fun decisionCard(inst: String, o: OrderRequest, sig: Signal, ev: Double) {
+        val evText = if (ev.isNaN()) "EV: mierzone na żywo" else "EV %+.2fR".format(ev)
         val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
         val sh = q?.let { basis(inst, it) } ?: 0.0
         val tf = learners[inst]?.championBarMs ?: Learner.M5
         val cond = aggregators["$inst@$tf"]?.closed()?.let { MarketRead.describe(it) } ?: "?"
         msg(
             "📊 $cond\n➡️ ${if (o.side == Side.BUY) "LONG" else "SHORT"} • ${Tier.name(sig.tier)} " +
-                "(%.1f%% ryzyka, %s lota, EV %+.2fR)\n🎯 E %.2f • SL %.2f • TP %s".format(
-                    risk.tierRiskPct(sig.tier) * 100, BigDecimal.valueOf(o.quantity).toPlainString(), ev,
+                "(%.1f%% ryzyka, %s lota, %s)\n🎯 E %.2f • SL %.2f • TP %s".format(
+                    risk.tierRiskPct(sig.tier) * 100, BigDecimal.valueOf(o.quantity).toPlainString(), evText,
                     o.referencePrice + sh, o.stopPrice + sh, o.takeProfit?.let { "%.2f".format(it + sh) } ?: "trailing"
                 )
         )
@@ -575,6 +689,16 @@ class BotOrchestrator(
 
     private companion object {
         const val HUD_FEED = "BTCUSDT"
+
+        // Profil agresywny – progi wejść w czasie rzeczywistym
+        const val RT_RANGE_ATR = 1.2      // zasięg bieżącej świecy ≥ 1,2 × ATR14
+        const val RT_BODY_RATIO = 0.70    // korpus ≥ 70% zasięgu
+        const val RT_MAX_WICK = 0.15      // knot po stronie ruchu ≤ 15% zasięgu
+        const val RT_LOOKBACK = 10        // wybicie High/Low ostatnich 10 świec 1m
+        const val ORB_RANGE_MIN = 5L      // zasięg otwarcia = pierwsze 5 min
+        const val ORB_ACTIVE_MIN = 15L    // tryb Open Breakout przez 15 min od otwarcia
+        const val SESSION_NO_ENTRY_MIN = 30L // brak nowych wejść 30 min przed zamknięciem sesji
+        const val SESSION_CLOSE_MIN = 10L    // zamknięcie pozycji 10 min przed zamknięciem sesji
 
         /** Instrument XTB → strumień Binance używany w tle (PAXG = token oparty na złocie, ~cena złota). */
         val FEEDS = mapOf("GOLD" to "PAXGUSDT", "BITCOIN" to "BTCUSDT", "ETHEREUM" to "ETHUSDT")

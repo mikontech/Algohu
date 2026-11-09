@@ -37,6 +37,9 @@ class BarAggregator(private val periodMs: Long = 5 * 60_000L, private val maxBar
     }
 
     fun closed(): List<Bar> = bars.toList()
+
+    /** Bieżąca, jeszcze trwająca świeca (do detekcji impulsu w czasie rzeczywistym). */
+    fun current(): Bar? = current
 }
 
 object Indicators {

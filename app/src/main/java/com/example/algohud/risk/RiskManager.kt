@@ -37,12 +37,12 @@ class RiskManager(
         val riskPerTradePct: Double = 0.02,          // 2% kapitału ryzyka na transakcję (do stop-lossa)
         val maxNotionalToEquity: Double = 5.0,       // wartość kontraktu maks. 5× kapitał (dźwignia CFD) – poziom umiarkowany
         /** Ryzyko na transakcję wg poziomu agresji: zredukowany / umiarkowany / agresywny. */
-        val tierRiskPct: List<Double> = listOf(0.005, 0.01, 0.02), // bazowo 1%; ×0,5 zredukowany, ×2 tylko przy udowodnionej przewadze
+        val tierRiskPct: List<Double> = listOf(0.005, 0.01, 0.025), // agresywny = 2,5% (profil momentum / RT / ORB)
         /** Maks. dźwignia wg poziomu agresji. */
         val tierLeverage: List<Double> = listOf(3.0, 5.0, 8.0),
         val maxOpenPositions: Int = 1,
         val maxOrdersPerMinute: Int = 3,
-        val minStopDistancePct: Double = 0.001,      // stop bliżej niż 0,1% = szum (TA SAMA wartość trafia do nauki)
+        val minStopDistancePct: Double = 0.0005,     // min. 0,05% ceny (złoto ≈ 2 USD); RT dodatkowo ≥ 3× spread
         val cooldownAfterLossMs: Long = 10 * 60_000L,
         val allowShort: Boolean = true,              // CFD: krótka sprzedaż dozwolona
         val allowPyramiding: Boolean = false,
@@ -51,9 +51,9 @@ class RiskManager(
         /** Godzina rozliczenia swapu (czas lokalny telefonu). Sprawdź w specyfikacji instrumentu w XTB. */
         val rolloverHour: Int = 23,
         /** Brak nowych wejść tyle minut przed rozliczeniem swapu (pozycje intraday – bez swapu). */
-        val noEntryBeforeRolloverMin: Int = 15,
+        val noEntryBeforeRolloverMin: Int = 0, // wyłączone – zastąpione regułami sesji (MarketHours)
         /** Zamknięcie otwartych pozycji tyle minut przed rozliczeniem swapu. */
-        val closeBeforeRolloverMin: Int = 3
+        val closeBeforeRolloverMin: Int = -1
     )
 
     sealed interface Decision {
@@ -137,6 +137,8 @@ class RiskManager(
     }
 
     suspend fun hasRealPositions(): Boolean = mutex.withLock { positions.values.any { !it.paper } }
+
+    suspend fun openSymbols(): List<String> = mutex.withLock { positions.keys.toList() }
 
     suspend fun sizeFor(entry: Double, stop: Double, pointValue: Double = 1.0, tier: Int = 1): Double =
         mutex.withLock { positionSize(equity, entry, stop, pointValue, tier) }
@@ -229,7 +231,7 @@ class RiskManager(
             }
             else -> positions[order.symbol] = Position(
                 order.symbol, order.side, qty, price, order.stopPrice, order.pointValue, paper,
-                takeProfit = order.takeProfit
+                takeProfit = order.takeProfit, entryReason = order.reason
             )
         }
         recomputePnlLocked()
@@ -335,7 +337,8 @@ class RiskManager(
         return ClosedTrade(
             symbol = p.symbol, side = p.side, quantity = qty, entry = p.entryPrice, exit = exit, pnl = pnl,
             r = if (riskAtEntry > 0) pnl / riskAtEntry else 0.0,
-            reason = reason, paper = p.paper, closedAt = clock()
+            reason = if (p.entryReason.isNotEmpty()) "${p.entryReason} → $reason" else reason,
+            paper = p.paper, closedAt = clock()
         )
     }
 

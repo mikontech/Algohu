@@ -72,7 +72,9 @@ data class Position(
     val initialStop: Double = stopPrice,
     val takeProfit: Double? = null,
     /** Najlepsza cena od otwarcia (do trailing stopu). */
-    val best: Double = entryPrice
+    val best: Double = entryPrice,
+    /** Powód wejścia (np. "RT impuls…", "ORB…") – do statystyk w dzienniku. */
+    val entryReason: String = ""
 )
 
 /** Co jest teraz widoczne w aplikacji brokera (odczytane przez AccessibilityService). */
@@ -116,6 +118,7 @@ data class HudState(
     val screenSentiment: Double = 0.0,
     val screenNews: Int = 0,
     val paperStats: String = "",
+    val profile: String = "",
     val learning: String = "",
     val lastMessage: String = "Uruchamianie…"
 )

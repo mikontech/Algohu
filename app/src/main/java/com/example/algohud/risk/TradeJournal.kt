@@ -50,6 +50,18 @@ class TradeJournal(private val prefs: SharedPreferences, private val maxTrades: 
     @Synchronized
     fun all(): List<ClosedTrade> = trades.toList()
 
+    /** Statystyki wybranych transakcji (np. wejść RT/ORB – papierowych i prawdziwych). */
+    @Synchronized
+    fun statsWhere(pred: (ClosedTrade) -> Boolean): JournalStats {
+        val p = trades.filter(pred)
+        return if (p.isEmpty()) JournalStats() else JournalStats(
+            trades = p.size,
+            winRate = p.count { it.pnl > 0 }.toDouble() / p.size,
+            avgR = p.map { it.r }.average(),
+            pnl = p.sumOf { it.pnl }
+        )
+    }
+
     private fun recompute() {
         val p = trades.filter { it.paper }
         _stats.value = if (p.isEmpty()) JournalStats() else JournalStats(

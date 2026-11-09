@@ -272,6 +272,10 @@ class OverlayService : LifecycleService() {
             addView(actionButton("🛡 SL/TP", 0xFF1565C0.toInt(), longPress = true) {
                 botScope.launch { bot.applyProtectionOnScreen() }
             })
+            addView(actionButton("⚡ Profil", 0xFFE65100.toInt(), longPress = true) {
+                val on = bot.toggleProfile()
+                toast(if (on) "⚡ Profil AGRESYWNY: wejścia w trakcie świecy (RT) i Open Breakout" else "Profil STANDARD: tylko zwycięzca turnieju")
+            })
         }
         val positionRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -449,6 +453,7 @@ class OverlayService : LifecycleService() {
         setKeepScreenOn(s.mode == ExecutionMode.AUTO && !s.killSwitch)
         tvStats.text = listOf(s.learning, s.paperStats).filter { it.isNotBlank() }.joinToString("\n")
         btnMode.text = "Tryb: ${s.mode.name}"
+        if (s.profile.isNotEmpty()) tvStatus.text = tvStatus.text.toString() + "\n" + s.profile
 
         val key = "${s.mode}|${s.killSwitch}|${s.feedConnected}"
         if (key != lastNotifKey) { // nie aktualizuj powiadomienia przy każdym ticku
