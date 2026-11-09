@@ -78,7 +78,13 @@ class ReversalStrategy(
  * Wyjścia jak w prawdziwym bocie: SL, TP, stop na wejście po +1R, potem trailing 1R; sygnał przeciwny = odwrócenie.
  * Gdy w jednej świecy padłby i SL, i TP – zakładamy SL (ostrożnie).
  */
-class ShadowTrader(val name: String, private val strategy: Strategy, private val maxResults: Int = 300) {
+class ShadowTrader(
+    val name: String,
+    private val strategy: Strategy,
+    private val maxResults: Int = 300,
+    /** Jak w RiskManager: zbyt ciasne stopy są odrzucane, więc wirtualnie też ich nie gramy. */
+    private val minStopPct: Double = 0.001
+) {
     private data class Sim(val side: Side, val entry: Double, var stop: Double, val initStop: Double, val tp: Double, var best: Double)
 
     private var pos: Sim? = null
@@ -106,6 +112,7 @@ class ShadowTrader(val name: String, private val strategy: Strategy, private val
             errors++
             null
         } ?: return null
+        if (abs(bar.close - sig.stopPrice) < bar.close * minStopPct) return null
         val p = pos
         if (p != null && p.side == sig.side) return null
         if (p != null) { record(rAt(p, bar.close, cost)); pos = null }
@@ -141,69 +148,85 @@ class ShadowTrader(val name: String, private val strategy: Strategy, private val
     }
 }
 
+data class Variant(val name: String, val barMs: Long, val factory: () -> Strategy)
+
+fun tfLabel(barMs: Long) = "${barMs / 60_000}m"
+
 /**
- * "Uczenie" = turniej wariantów: każdy gra wirtualnie na historii i na żywo, bot handluje wariantem
- * z najlepszym wynikiem (min. [minTrades] transakcji i E > [minEdge]). Brak zwycięzcy = bot nie handluje.
+ * "Uczenie" = turniej wariantów na kilku interwałach (5m, 1m): każdy gra wirtualnie na historii i na żywo
+ * (ze spreadem), bot handluje wariantem z najlepszym wynikiem (min. [minTrades] transakcji i E > [minEdge]).
+ * Brak zwycięzcy = bot nie handluje.
  */
 class Learner(
     val instrument: String,
-    variants: List<Pair<String, () -> Strategy>>,
+    variants: List<Variant>,
     private val minTrades: Int = 15,
-    private val minEdge: Double = 0.05
+    private val minEdge: Double = 0.05,
+    private val minStopPct: Double = 0.001
 ) {
-    private val shadows = variants.map { (name, factory) -> ShadowTrader(name, factory()) }
+    private val shadows = variants.map { v -> v to ShadowTrader("${v.name} • ${tfLabel(v.barMs)}", v.factory(), minStopPct = minStopPct) }
     var champion: ShadowTrader? = null
         private set
-    var learnedBars = 0
-        private set
+    val championBarMs: Long? get() = shadows.firstOrNull { it.second === champion }?.first?.barMs
+    private val learned = HashMap<Long, Int>()
 
-    /** Nauka na historii (sentyment historyczny nieznany = 0). */
-    fun backtest(history: List<Bar>, cost: Double) {
+    /** Nauka na historii danego interwału (sentyment historyczny nieznany = 0). */
+    fun backtest(barMs: Long, history: List<Bar>, cost: Double) {
+        val group = shadows.filter { it.first.barMs == barMs }.map { it.second }
         for (i in history.indices) {
             val window = history.subList(max(0, i - 299), i + 1)
-            shadows.forEach { it.onBar(window, 0.0, cost) }
+            group.forEach { it.onBar(window, 0.0, cost) }
         }
-        learnedBars += history.size
+        learned[barMs] = (learned[barMs] ?: 0) + history.size
         pick()
     }
 
-    /** Zwraca sygnał aktualnego zwycięzcy (wybranego przed tą świecą). */
-    fun onBar(bars: List<Bar>, sentiment: Double, cost: Double): Signal? {
+    /** Nowa zamknięta świeca interwału [barMs]. Zwraca sygnał zwycięzcy, jeśli gra na tym interwale. */
+    fun onBar(barMs: Long, bars: List<Bar>, sentiment: Double, cost: Double): Signal? {
         val current = champion
         var out: Signal? = null
-        for (s in shadows) {
+        for ((v, s) in shadows) {
+            if (v.barMs != barMs) continue
             val sig = s.onBar(bars, sentiment, cost)
             if (s === current) out = sig
         }
-        learnedBars++
+        learned[barMs] = (learned[barMs] ?: 0) + 1
         pick()
         return out
     }
 
     private fun pick() {
-        champion = shadows.filter { it.trades >= minTrades && it.avgR > minEdge }.maxByOrNull { it.avgR }
+        champion = shadows.map { it.second }.filter { it.trades >= minTrades && it.avgR > minEdge }.maxByOrNull { it.avgR }
     }
 
-    fun describeWait(bars: List<Bar>): String? {
+    fun describeWait(barsFor: (Long) -> List<Bar>?): String? {
         val c = champion ?: return null
-        c.openSide?.let { return "${c.name} jest w pozycji ${if (it == Side.BUY) "LONG" else "SHORT"} – czeka na wyjście" }
+        c.openSide?.let { return "${c.name}: w pozycji ${if (it == Side.BUY) "LONG" else "SHORT"} – czeka na wyjście" }
+        val bars = championBarMs?.let(barsFor) ?: return null
         return c.describeWait(bars)
     }
 
     fun summary(): String {
         val c = champion
         if (c != null) return "🧠 $instrument: ${c.name} • %d tr. • %.0f%% • E=%+.2fR".format(c.trades, c.winRate * 100, c.avgR)
-        val best = shadows.maxByOrNull { if (it.trades > 0) it.avgR else -9.0 }
-        return if (best == null || best.trades == 0) "🧠 $instrument: uczę się… ($learnedBars świec)"
+        val best = shadows.map { it.second }.maxByOrNull { if (it.trades > 0) it.avgR else -9.0 }
+        val n = learned.entries.joinToString(", ") { (tf, k) -> "$k×${tfLabel(tf)}" }
+        return if (best == null || best.trades == 0) "🧠 $instrument: uczę się… ($n)"
         else "🧠 $instrument: brak przewagi – najlepszy ${best.name} E=%+.2fR (%d tr.), nie handluję".format(best.avgR, best.trades)
     }
 
     companion object {
-        fun defaultVariants(barMs: Long): List<Pair<String, () -> Strategy>> = listOf(
-            "Wybicie 20" to { TrendBreakoutStrategy(donchian = 20, barMs = barMs) },
-            "Wybicie 55" to { TrendBreakoutStrategy(donchian = 55, barMs = barMs) },
-            "Odbicie BB2.0" to { ReversalStrategy(k = 2.0, barMs = barMs) },
-            "Odbicie BB2.5" to { ReversalStrategy(k = 2.5, rsiLow = 25.0, rsiHigh = 75.0, barMs = barMs) }
-        )
+        const val M5 = 5 * 60_000L
+        const val M1 = 60_000L
+        val TIMEFRAMES = listOf(M5, M1)
+
+        fun defaultVariants(): List<Variant> = TIMEFRAMES.flatMap { tf ->
+            listOf(
+                Variant("Wybicie 20", tf) { TrendBreakoutStrategy(donchian = 20, barMs = tf) },
+                Variant("Wybicie 55", tf) { TrendBreakoutStrategy(donchian = 55, barMs = tf) },
+                Variant("Odbicie BB2.0", tf) { ReversalStrategy(k = 2.0, barMs = tf) },
+                Variant("Odbicie BB2.5", tf) { ReversalStrategy(k = 2.5, rsiLow = 25.0, rsiHigh = 75.0, barMs = tf) }
+            )
+        }
     }
 }

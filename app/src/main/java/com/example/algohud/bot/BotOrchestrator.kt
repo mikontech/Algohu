@@ -84,8 +84,9 @@ class TrendBreakoutStrategy(
         val closes = bars.map { it.close }
         val up = (Indicators.ema(closes, fast) ?: return null) > (Indicators.ema(closes, slow) ?: return null)
         val channel = bars.takeLast(donchian)
-        return if (up) "LONG, gdy świeca 5m zamknie się > %.2f".format(channel.maxOf { it.high })
-        else "SHORT, gdy świeca 5m zamknie się < %.2f".format(channel.minOf { it.low })
+        val tf = tfLabel(barMs)
+        return if (up) "LONG, gdy świeca $tf zamknie się > %.2f (trend ↑ – shorty dopiero po odwróceniu trendu)".format(channel.maxOf { it.high })
+        else "SHORT, gdy świeca $tf zamknie się < %.2f (trend ↓ – longi dopiero po odwróceniu trendu)".format(channel.minOf { it.low })
     }
 }
 
@@ -123,13 +124,13 @@ class BotOrchestrator(
         news.start()
 
         // Rozgrzewka strategii historią świec.
-        for ((inst, feed) in FEEDS) {
+        for ((inst, feed) in FEEDS) for (tf in Learner.TIMEFRAMES) {
             scope.launch {
-                runCatching { news.history(feed, "5m", 1000) } // ~3,5 dnia świec 5-min do nauki
+                runCatching { news.history(feed, tfLabel(tf), 1000) } // 5m ≈ 3,5 dnia, 1m ≈ 16 h
                     .onSuccess { h ->
                         lock.withLock {
-                            agg(inst).seed(h)
-                            learner(inst).backtest(h, spreadOf(inst))
+                            agg(inst, tf).seed(h)
+                            learner(inst).backtest(tf, h, spreadOf(inst))
                         }
                         updateLearningHud()
                     }
@@ -251,13 +252,18 @@ class BotOrchestrator(
             msg("🏁 $inst: ${exit.reason} @ %.2f".format(px))
             engine.submit(withSpread(exit, inst), bypassConfirmation = true)
         }
-        agg(inst).onTick(px, ts) ?: return
-        val bars = agg(inst).closed()
-        val (sent, _) = news.sentimentFor(aliasesFor(inst))
+        for (tf in Learner.TIMEFRAMES) {
+            val a = agg(inst, tf)
+            a.onTick(px, ts) ?: continue
+            val (sent, _) = news.sentimentFor(aliasesFor(inst))
+            val sig = learner(inst).onBar(tf, a.closed(), sent, spreadOf(inst))
+            updateLearningHud()
+            if (sig != null) handleSignal(inst, sig, px)
+        }
+    }
+
+    private suspend fun handleSignal(inst: String, sig: Signal, px: Double) {
         val learner = learner(inst)
-        val sig = learner.onBar(bars, sent, spreadOf(inst))
-        updateLearningHud()
-        sig ?: return
         msg("📈 $inst ${sig.side} [${learner.champion?.name}]: ${sig.reason}")
         // Sygnał przeciwny do otwartej pozycji = zamknięcie i odwrócenie (long → short i odwrotnie).
         risk.closingOrder(inst, sig.side, px)?.let { close ->
@@ -302,14 +308,14 @@ class BotOrchestrator(
         return px + spreadOf(inst) / 2 * side.sign
     }
 
-    private fun agg(inst: String) = aggregators.getOrPut(inst) { BarAggregator(barMs) }
-    private fun learner(inst: String) = learners.getOrPut(inst) { Learner(inst, Learner.defaultVariants(barMs)) }
+    private fun agg(inst: String, tf: Long) = aggregators.getOrPut("$inst@$tf") { BarAggregator(tf) }
+    private fun learner(inst: String) = learners.getOrPut(inst) { Learner(inst, Learner.defaultVariants()) }
 
     @Volatile private var hudLearningInstrument: String = "GOLD"
 
     private fun updateLearningHud() {
         val l = learners[hudLearningInstrument] ?: return
-        val wait = aggregators[hudLearningInstrument]?.closed()?.let { l.describeWait(it) }
+        val wait = l.describeWait { tf -> aggregators["$hudLearningInstrument@$tf"]?.closed() }
         _hud.update { it.copy(learning = l.summary() + (wait?.let { "\n⏳ $it" } ?: "")) }
     }
 
