@@ -8,10 +8,13 @@ import android.os.Bundle
 import android.provider.Settings
 import android.widget.Button
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import com.example.algohud.execution.AutoExecutionService
 import com.example.algohud.overlay.OverlayService
 
@@ -23,6 +26,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        actionBar?.hide() // Android 15 (edge-to-edge) chował treść pod paskiem tytułu
         val pad = (16 * resources.displayMetrics.density).toInt()
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -31,7 +35,12 @@ class MainActivity : ComponentActivity() {
         fun button(label: String, action: () -> Unit) =
             Button(this).apply { text = label; setOnClickListener { action() } }.also { layout.addView(it) }
 
-        status = TextView(this).also { layout.addView(it) }
+        TextView(this).apply {
+            text = "Algo HUD"
+            textSize = 24f
+            setPadding(0, 0, 0, pad)
+        }.also { layout.addView(it) }
+        status = TextView(this).apply { setPadding(0, 0, 0, pad) }.also { layout.addView(it) }
         button("1. Zezwól na wyświetlanie nad aplikacjami") {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
         }
@@ -48,7 +57,14 @@ class MainActivity : ComponentActivity() {
             else Toast.makeText(this, "Najpierw krok 1", Toast.LENGTH_SHORT).show()
         }
         button("■ Zatrzymaj") { stopService(Intent(this, OverlayService::class.java)) }
-        setContentView(layout)
+        val scroll = ScrollView(this).apply { addView(layout) }
+        // Odsunięcie od paska stanu, wycięcia aparatu i paska nawigacji.
+        ViewCompat.setOnApplyWindowInsetsListener(scroll) { v, insets ->
+            val b = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
+            v.setPadding(b.left, b.top, b.right, b.bottom)
+            insets
+        }
+        setContentView(scroll)
     }
 
     override fun onResume() {
