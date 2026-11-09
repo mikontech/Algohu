@@ -52,20 +52,20 @@ class PythFeed(
     fun resolvedFor(instrument: String): Resolved? = synchronized(resolved) { resolved[instrument] }
 
     fun start(specs: List<Spec>, onResolved: suspend (Resolved) -> Unit) {
-        scope.launch {
-            for (s in specs) {
-                val r = runCatching { resolve(s) }.getOrElse { e ->
-                    setStatus(s.instrument, "błąd wyszukiwania (${e.message})"); null
-                }
-                if (r == null) {
-                    if (_status.value[s.instrument] == null) setStatus(s.instrument, "brak darmowego źródła w Pyth")
-                    continue
-                }
-                synchronized(resolved) { resolved[s.instrument] = r }
-                setStatus(s.instrument, "ok")
-                runCatching { onResolved(r) }.onFailure { Log.w(TAG, "onResolved ${s.instrument}: ${it.message}") }
+        // 1) Ceny na żywo ruszają od razu (wcześniej czekały na pobranie WSZYSTKICH historii – minuty opóźnienia).
+        scope.launch { pollLoop() }
+        // 2) Wyszukiwanie feedów równolegle; historia każdego instrumentu w osobnej korutynie.
+        for (s in specs) scope.launch {
+            val r = runCatching { resolve(s) }.getOrElse { e ->
+                setStatus(s.instrument, "błąd wyszukiwania (${e.message})"); null
             }
-            pollLoop()
+            if (r == null) {
+                if (_status.value[s.instrument] == null) setStatus(s.instrument, "brak darmowego źródła w Pyth")
+                return@launch
+            }
+            synchronized(resolved) { resolved[s.instrument] = r }
+            setStatus(s.instrument, "ok")
+            runCatching { onResolved(r) }.onFailure { Log.w(TAG, "onResolved ${s.instrument}: ${it.message}") }
         }
     }
 

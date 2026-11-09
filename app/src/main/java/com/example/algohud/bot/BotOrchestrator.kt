@@ -137,6 +137,13 @@ class BotOrchestrator(
     private val aggregators = HashMap<String, BarAggregator>()
     private val learners = HashMap<String, Learner>()
     private val binanceFallback = java.util.Collections.synchronizedSet(HashSet<String>())
+    /** Postęp ładowania historii (do HUD); null = gotowe. */
+    private val loading = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    private fun setLoading(inst: String, text: String?) {
+        if (text == null) loading.remove(inst) else loading[inst] = text
+        updateLearningHud()
+    }
     private val lastPx = HashMap<String, Pair<Double, Long>>()
     private val warned = HashSet<String>()
     @Volatile private var lastTick: Tick? = null
@@ -170,17 +177,21 @@ class BotOrchestrator(
         }
         // Towary z Pyth (ropa, kawa, kakao…): dynamiczne wyszukanie feedu, historia do nauki, ceny co 2 s.
         pyth.start(PYTH_FEEDS.map { (inst, q) -> PythFeed.Spec(inst, q) }) { r ->
+            val inst = r.instrument
+            val errors = mutableListOf<String>()
             for (tf in Learner.TIMEFRAMES) {
+                setLoading(inst, "pobieram historię ${tfLabel(tf)} z Pyth…")
                 runCatching { pyth.history(r, (tf / 60_000).toInt(), Learner.historyBars(tf)) }
                     .onSuccess { h ->
+                        setLoading(inst, "uczę się na ${h.size} świecach ${tfLabel(tf)}…")
                         lock.withLock {
-                            agg(r.instrument, tf).seed(h)
-                            learner(r.instrument).backtest(tf, h, spreadOf(r.instrument))
+                            agg(inst, tf).seed(h)
+                            learner(inst).backtest(tf, h, spreadOf(inst))
                         }
                     }
-                    .onFailure { msg("Historia ${r.instrument} (${tfLabel(tf)}): ${it.message}") }
+                    .onFailure { errors += "${tfLabel(tf)}: ${it.message}" }
             }
-            updateLearningHud()
+            setLoading(inst, if (errors.isEmpty()) null else "historia niedostępna (${errors.joinToString("; ")}) – uczę się na żywo")
         }
         scope.launch { pyth.ticks.collect { t -> lock.withLock { processPrice(t.symbol, t.price, t.timestamp) } } }
         scope.launch {
@@ -398,11 +409,19 @@ class BotOrchestrator(
 
     private fun updateLearningHud() {
         val inst = hudLearningInstrument
-        val l = learners[inst] ?: run {
+        val l = learners[inst]
+        val load = loading[inst]
+        if (l != null && load != null) {
+            _hud.update { it.copy(learning = "🧠 $inst: $load\n" + l.summary().substringAfter('\n', "")) }
+            return
+        }
+        if (l == null) {
             // Nie pokazuj wyników innego instrumentu (wcześniej zostawała linijka GOLD).
             _hud.update {
                 it.copy(
                     learning = "🧠 $inst: " + when {
+                        load != null -> load
+                        inst in PYTH_FEEDS && pyth.status.value[inst] == null -> "szukam źródła cen w Pyth…"
                         hasBackground(inst) -> "wczytuję historię…"
                         inst in PYTH_FEEDS -> "${pyth.status.value[inst] ?: "szukam źródła cen…"}; uczę się tylko, gdy $inst jest otwarty w XTB"
                         else -> "brak cen w tle; uczę się tylko, gdy $inst jest otwarty w XTB (potrzeba ~50 świec)"
