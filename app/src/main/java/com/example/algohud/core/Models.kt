@@ -45,6 +45,8 @@ data class OrderRequest(
     /** Zlecenie zamykające – nie może otworzyć nowej pozycji. */
     val reduceOnly: Boolean = false,
     val takeProfit: Double? = null,
+    /** Poziom agresji: 0 zredukowany, 1 umiarkowany, 2 agresywny (wpływa na ryzyko i dźwignię). */
+    val tier: Int = 1,
     val clientOrderId: String = "hud" + UUID.randomUUID().toString().replace("-", "").take(16)
 )
 

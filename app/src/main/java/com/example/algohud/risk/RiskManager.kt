@@ -35,7 +35,11 @@ class RiskManager(
     data class Config(
         val maxDailyLossPct: Double = 0.05,          // twardy limit dziennej straty: 5% kapitału z początku dnia
         val riskPerTradePct: Double = 0.02,          // 2% kapitału ryzyka na transakcję (do stop-lossa)
-        val maxNotionalToEquity: Double = 5.0,       // wartość kontraktu maks. 5× kapitał (dźwignia CFD)
+        val maxNotionalToEquity: Double = 5.0,       // wartość kontraktu maks. 5× kapitał (dźwignia CFD) – poziom umiarkowany
+        /** Ryzyko na transakcję wg poziomu agresji: zredukowany / umiarkowany / agresywny. */
+        val tierRiskPct: List<Double> = listOf(0.01, 0.02, 0.03),
+        /** Maks. dźwignia wg poziomu agresji. */
+        val tierLeverage: List<Double> = listOf(3.0, 5.0, 8.0),
         val maxOpenPositions: Int = 1,
         val maxOrdersPerMinute: Int = 3,
         val minStopDistancePct: Double = 0.001,      // stop bliżej niż 0,1% = szum (TA SAMA wartość trafia do nauki)
@@ -94,24 +98,29 @@ class RiskManager(
 
     fun riskOf(qty: Double, entry: Double, stop: Double, pointValue: Double) = abs(entry - stop) * qty * pointValue
 
-    suspend fun maxTradeRisk(): Double = mutex.withLock { equity * config.riskPerTradePct }
+    suspend fun maxTradeRisk(tier: Int = 1): Double = mutex.withLock { equity * riskPct(tier) }
 
     /**
      * Fixed-fractional: qty = (kapitał × ryzyko%) / |wejście − stop|,
      * przycięte limitem ekspozycji i zaokrąglone W DÓŁ do kroku lota.
      */
-    fun positionSize(equity: Double, entry: Double, stop: Double, pointValue: Double = 1.0): Double {
+    private fun riskPct(tier: Int) = config.tierRiskPct.getOrElse(tier) { config.riskPerTradePct }
+    private fun leverage(tier: Int) = config.tierLeverage.getOrElse(tier) { config.maxNotionalToEquity }
+
+    fun positionSize(equity: Double, entry: Double, stop: Double, pointValue: Double = 1.0, tier: Int = 1): Double {
         val dist = abs(entry - stop)
         if (equity <= 0 || entry <= 0 || pointValue <= 0 || dist < entry * config.minStopDistancePct) return 0.0
-        val byRisk = equity * config.riskPerTradePct / (dist * pointValue)
-        val byNotional = equity * config.maxNotionalToEquity / (entry * pointValue)
+        val byRisk = equity * riskPct(tier) / (dist * pointValue)
+        val byNotional = equity * leverage(tier) / (entry * pointValue)
         val steps = floor(min(byRisk, byNotional) / config.lotStep + 1e-9).toLong()
         // BigDecimal: 0.001 × 3 = 0.003 (a nie 0.0030000000000000005)
         return BigDecimal.valueOf(config.lotStep).multiply(BigDecimal.valueOf(steps)).toDouble()
     }
 
-    suspend fun sizeFor(entry: Double, stop: Double, pointValue: Double = 1.0): Double =
-        mutex.withLock { positionSize(equity, entry, stop, pointValue) }
+    suspend fun sizeFor(entry: Double, stop: Double, pointValue: Double = 1.0, tier: Int = 1): Double =
+        mutex.withLock { positionSize(equity, entry, stop, pointValue, tier) }
+
+    fun tierRiskPct(tier: Int) = riskPct(tier)
 
     // ── Bramka zleceń ──
 
@@ -151,12 +160,12 @@ class RiskManager(
         if (dist < ref * config.minStopDistancePct) return@withLock reject("Stop-loss zbyt blisko ceny")
 
         val tradeRisk = dist * order.quantity * order.pointValue
-        val maxTradeRisk = equity * config.riskPerTradePct
+        val maxTradeRisk = equity * riskPct(order.tier)
         if (tradeRisk > maxTradeRisk * 1.05) {
             return@withLock reject("Ryzyko %.2f > limit %.2f".format(tradeRisk, maxTradeRisk))
         }
-        if (order.quantity * ref * order.pointValue > equity * config.maxNotionalToEquity * 1.01) {
-            return@withLock reject("Zbyt duża ekspozycja (dźwignia > %.0f×)".format(config.maxNotionalToEquity))
+        if (order.quantity * ref * order.pointValue > equity * leverage(order.tier) * 1.01) {
+            return@withLock reject("Zbyt duża ekspozycja (dźwignia > %.0f×)".format(leverage(order.tier)))
         }
         val dailyLimit = dayStartEquity * config.maxDailyLossPct
         val currentLoss = (-_dailyPnl.value).coerceAtLeast(0.0)

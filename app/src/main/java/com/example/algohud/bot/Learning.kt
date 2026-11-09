@@ -397,8 +397,171 @@ class Learner(
                 Variant("Odbicie BB2.0", tf) { ReversalStrategy(k = 2.0, barMs = tf) },
                 Variant("Odbicie BB2.5", tf) { ReversalStrategy(k = 2.5, rsiLow = 25.0, rsiHigh = 75.0, barMs = tf) },
                 Variant("Cofnięcie w trendzie", tf) { PullbackStrategy(barMs = tf) },
-                Variant("Zawężenie→wybicie", tf) { SqueezeStrategy(barMs = tf) }
+                Variant("Zawężenie→wybicie", tf) { SqueezeStrategy(barMs = tf) },
+                Variant("Price action", tf) { PriceActionStrategy(withTrend = false, barMs = tf) },
+                Variant("Price action z trendem", tf) { PriceActionStrategy(withTrend = true, barMs = tf) }
             )
         }
+    }
+}
+
+// ───────────── Price action: formacje świecowe, kondycja rynku, poziomy agresji ─────────────
+
+/** Poziom agresji pozycji: 0 = zredukowany, 1 = umiarkowany, 2 = agresywny. */
+object Tier {
+    const val REDUCED = 0
+    const val MODERATE = 1
+    const val AGGRESSIVE = 2
+    fun name(t: Int) = when (t) { REDUCED -> "Zredukowany"; AGGRESSIVE -> "Agresywny"; else -> "Umiarkowany" }
+}
+
+object Candles {
+    data class Shape(val body: Double, val range: Double, val upper: Double, val lower: Double, val bull: Boolean)
+
+    fun shape(b: Bar) = Shape(
+        body = abs(b.close - b.open),
+        range = b.high - b.low,
+        upper = b.high - max(b.open, b.close),
+        lower = min(b.open, b.close) - b.low,
+        bull = b.close > b.open
+    )
+
+    /** Formacja na ostatniej świecy: (nazwa, kierunek +1/-1) albo null. */
+    fun pattern(bars: List<Bar>, atr: Double): Pair<String, Int>? {
+        if (bars.size < 6 || atr <= 0) return null
+        val last = bars.last()
+        val prev = bars[bars.size - 2]
+        val s = shape(last)
+        val p = shape(prev)
+        if (s.range <= 0) return null
+        val fell = bars[bars.size - 6].close > prev.close
+        val rose = bars[bars.size - 6].close < prev.close
+        val lows = bars.takeLast(4).map { it.low }
+        val highs = bars.takeLast(4).map { it.high }
+        return when {
+            !p.bull && s.bull && last.close >= prev.open && last.open <= prev.close && s.body >= 0.5 * atr -> "objęcie hossy" to 1
+            p.bull && !s.bull && last.close <= prev.open && last.open >= prev.close && s.body >= 0.5 * atr -> "objęcie bessy" to -1
+            s.bull && s.body >= 0.8 * s.range && s.range >= 1.2 * atr -> "marubozu ↑ (silny impet)" to 1
+            !s.bull && s.body >= 0.8 * s.range && s.range >= 1.2 * atr -> "marubozu ↓ (silny impet)" to -1
+            fell && s.lower >= 2 * s.body && s.upper <= 0.25 * s.range && s.range >= 0.6 * atr -> "młot (odrzucenie dołka)" to 1
+            rose && s.upper >= 2 * s.body && s.lower <= 0.25 * s.range && s.range >= 0.6 * atr -> "spadająca gwiazda (odrzucenie szczytu)" to -1
+            lows.zipWithNext().all { (a, b) -> b > a } && last.close > prev.high -> "seria wyższych dołków" to 1
+            highs.zipWithNext().all { (a, b) -> b < a } && last.close < prev.low -> "seria niższych szczytów" to -1
+            else -> null
+        }
+    }
+
+    fun describeLast(bars: List<Bar>, atr: Double): String {
+        pattern(bars, atr)?.let { return it.first }
+        val s = shape(bars.last())
+        return when {
+            s.range <= 0 -> "brak ruchu"
+            s.upper >= 0.3 * s.range && s.lower >= 0.3 * s.range -> "niepewność (knoty z obu stron)"
+            s.body >= 0.6 * s.range -> if (s.bull) "wzrostowa, pełny korpus" else "spadkowa, pełny korpus"
+            else -> "neutralna"
+        }
+    }
+}
+
+/** Zwięzła "kondycja rynku" do HUD: trend, zmienność, faza świecy. */
+object MarketRead {
+    fun describe(bars: List<Bar>): String? {
+        if (bars.size < 60) return null
+        val closes = bars.map { it.close }
+        val e20 = Indicators.ema(closes, 20) ?: return null
+        val e50 = Indicators.ema(closes, 50) ?: return null
+        val atr = Indicators.atr(bars) ?: return null
+        val avgRange = bars.takeLast(50).map { it.high - it.low }.average()
+        val trend = when {
+            e20 > e50 && abs(e20 - e50) > 0.3 * atr -> "trend ↑"
+            e20 < e50 && abs(e20 - e50) > 0.3 * atr -> "trend ↓"
+            else -> "bez trendu"
+        }
+        val vol = when {
+            avgRange <= 0 -> "?"
+            atr / avgRange > 1.5 -> "zmienność wysoka"
+            atr / avgRange < 0.7 -> "zmienność niska"
+            else -> "zmienność normalna"
+        }
+        return "$trend • $vol • świeca: ${Candles.describeLast(bars, atr)}"
+    }
+}
+
+/**
+ * Price action (profil agresywny): wejście na formacjach świecowych, wielkość wg siły setupu.
+ * Agresywny: silny impet (szeroka świeca, mały przeciwny knot) + wybicie poziomu 20 świec.
+ * Umiarkowany: formacja przy EMA20 w trendzie (pullback) lub zwykłe potwierdzenie.
+ * Zredukowany: wysoka zmienność bez kierunku.
+ */
+class PriceActionStrategy(
+    private val withTrend: Boolean,
+    private val rewardR: Double = 2.0,
+    private val newsVeto: Double = 0.4,
+    private val cooldownBars: Int = 3,
+    private val barMs: Long = 5 * 60_000L
+) : Strategy {
+    private var lastSignalBar = 0L
+    private var note: String? = null
+    override fun lastNote(): String? = note
+
+    override fun onBar(bars: List<Bar>, sentiment: Double): Signal? {
+        if (bars.size < 60) return null
+        val last = bars.last()
+        val prev = bars[bars.size - 2]
+        val closes = bars.map { it.close }
+        val atr = Indicators.atr(bars)?.takeIf { it > 0 } ?: return null
+        val (name, dir) = Candles.pattern(bars, atr) ?: return null
+        val e20 = Indicators.ema(closes, 20) ?: return null
+        val e50 = Indicators.ema(closes, 50) ?: return null
+        val skip = when {
+            last.start - lastSignalBar < cooldownBars * barMs -> "przerwa po poprzednim sygnale"
+            withTrend && dir > 0 && e20 <= e50 -> "trend ↓ – nie kupuję przeciw trendowi"
+            withTrend && dir < 0 && e20 >= e50 -> "trend ↑ – nie sprzedaję przeciw trendowi"
+            dir > 0 && sentiment <= -newsVeto -> "newsy negatywne (%+.2f)".format(sentiment)
+            dir < 0 && sentiment >= newsVeto -> "newsy pozytywne (%+.2f)".format(sentiment)
+            else -> null
+        }
+        if (skip != null) { note = "$name na ${tfLabel(barMs)} pominięte: $skip"; return null }
+        note = null
+
+        val s = Candles.shape(last)
+        val channel = bars.subList(bars.size - 21, bars.size - 1)
+        val breaks = if (dir > 0) last.close > channel.maxOf { it.high } else last.close < channel.minOf { it.low }
+        val oppositeWick = if (dir > 0) s.upper else s.lower
+        val strong = s.range >= 1.3 * atr && oppositeWick <= 0.15 * s.range
+        val avgRange = bars.takeLast(50).map { it.high - it.low }.average()
+        val choppy = avgRange > 0 && atr / avgRange > 1.5 && abs(e20 - e50) < 0.3 * atr
+        val pullback = abs(last.close - e20) <= 0.5 * atr && ((dir > 0 && e20 > e50) || (dir < 0 && e20 < e50))
+        val tier = when {
+            choppy -> Tier.REDUCED
+            strong && breaks -> Tier.AGGRESSIVE
+            else -> Tier.MODERATE
+        }
+        val entry = last.close
+        val stop = if (dir > 0) min(last.low, prev.low) - 0.2 * atr else max(last.high, prev.high) + 0.2 * atr
+        val risk = abs(entry - stop)
+        if (risk <= 0) return null
+        lastSignalBar = last.start
+        val why = buildList {
+            add(name)
+            if (breaks) add("wybicie poziomu 20 świec")
+            if (strong) add("silny impet")
+            if (pullback) add("przy EMA20 w trendzie")
+            if (choppy) add("chaotyczna zmienność")
+        }.joinToString(", ")
+        return Signal(
+            side = if (dir > 0) Side.BUY else Side.SELL,
+            stopPrice = stop,
+            takeProfit = entry + dir * rewardR * risk,
+            reason = why,
+            tier = tier
+        )
+    }
+
+    override fun describeWait(bars: List<Bar>): String? {
+        if (bars.size < 60) return null
+        val atr = Indicators.atr(bars) ?: return null
+        return "ODCZEKAJ – czekam na formację (objęcie, młot/gwiazda, marubozu, wyższe dołki/niższe szczyty); " +
+            "ostatnia świeca: ${Candles.describeLast(bars, atr)}"
     }
 }

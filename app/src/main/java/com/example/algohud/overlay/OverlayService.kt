@@ -202,9 +202,9 @@ class OverlayService : LifecycleService() {
         tvStatus = TextView(this).apply { setTextColor(0xFFDDDDDD.toInt()); textSize = 11f }
         tvMessage = TextView(this).apply {
             setTextColor(0xFFAAAAAA.toInt()); textSize = 11f
-            maxLines = 2; maxWidth = dp(260); ellipsize = TextUtils.TruncateAt.END
+            maxLines = 4; maxWidth = dp(280); ellipsize = TextUtils.TruncateAt.END
         }
-        tvStats = TextView(this).apply { setTextColor(0xFF90CAF9.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 6 }
+        tvStats = TextView(this).apply { setTextColor(0xFF90CAF9.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 8 }
         tvScreen = TextView(this).apply { setTextColor(0xFFFFE082.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 3 }
         // Dotknięcie: DRY_RUN ⇄ CONFIRM. Przytrzymanie: AUTO. Oba wymagają gotowego wykonawcy.
         btnMode = actionButton("Tryb", 0xFF455A64.toInt()) {

@@ -26,7 +26,7 @@ import kotlinx.coroutines.sync.withLock
 import java.math.BigDecimal
 import kotlin.math.abs
 
-data class Signal(val side: Side, val stopPrice: Double, val takeProfit: Double, val reason: String)
+data class Signal(val side: Side, val stopPrice: Double, val takeProfit: Double, val reason: String, val tier: Int = 1)
 
 interface Strategy {
     /** Wywoływane po zamknięciu każdej świecy. */
@@ -92,12 +92,15 @@ class TrendBreakoutStrategy(
         lastSignalBar = last.start
         val dist = stopAtr * atr
         val long = side == Side.BUY
+        val sh = Candles.shape(last)
+        val strong = sh.range >= 1.3 * atr && sh.body >= 0.7 * sh.range
         return Signal(
             side = side,
             stopPrice = if (long) last.close - dist else last.close + dist,
             takeProfit = if (long) last.close + rewardR * dist else last.close - rewardR * dist,
-            reason = "wybicie %s z %d św., ATR %.2f, RSI %.0f, news %+.2f"
-                .format(if (long) "w górę" else "w dół", donchian, atr, rsi, sentiment)
+            reason = "wybicie %s z %d św.%s, RSI %.0f, news %+.2f"
+                .format(if (long) "w górę" else "w dół", donchian, if (strong) ", silny impet" else "", rsi, sentiment),
+            tier = if (strong) Tier.AGGRESSIVE else Tier.MODERATE
         )
     }
 
@@ -404,12 +407,30 @@ class BotOrchestrator(
             if (r !is ExecutionResult.Filled && r !is ExecutionResult.Submitted) return
         }
         val entry = px + spreadOf(inst) / 2 * sig.side.sign
-        buildOrder(inst, sig.side, entry, sig.stopPrice, sig.takeProfit, "STRAT ${sig.reason}", pointValue(inst))
-            ?.let { engine.submit(it) }
+        val order = buildOrder(inst, sig.side, entry, sig.stopPrice, sig.takeProfit, "STRAT ${sig.reason}", pointValue(inst), sig.tier)
+            ?: return
+        decisionCard(inst, order, sig)
+        engine.submit(order)
+    }
+
+    /** Decyzja w formacie: kondycja • kierunek • poziom agresji i wielkość • wejście/SL/TP (w cenach XTB). */
+    private fun decisionCard(inst: String, o: OrderRequest, sig: Signal) {
+        val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
+        val sh = q?.let { basis(inst, it) } ?: 0.0
+        val tf = learners[inst]?.championBarMs ?: Learner.M5
+        val cond = aggregators["$inst@$tf"]?.closed()?.let { MarketRead.describe(it) } ?: "?"
+        msg(
+            "📊 $cond\n➡️ ${if (o.side == Side.BUY) "LONG" else "SHORT"} • ${Tier.name(sig.tier)} " +
+                "(%.0f%% ryzyka, %s lota)\n🎯 E %.2f • SL %.2f • TP %s".format(
+                    risk.tierRiskPct(sig.tier) * 100, BigDecimal.valueOf(o.quantity).toPlainString(),
+                    o.referencePrice + sh, o.stopPrice + sh, o.takeProfit?.let { "%.2f".format(it + sh) } ?: "trailing"
+                )
+        )
     }
 
     private suspend fun buildOrder(
-        symbol: String, side: Side, price: Double, stop: Double, takeProfit: Double?, reason: String, pointValue: Double?
+        symbol: String, side: Side, price: Double, stop: Double, takeProfit: Double?, reason: String, pointValue: Double?,
+        tier: Int = 1
     ): OrderRequest? {
         risk.closingOrder(symbol, side, price)?.let { return it.copy(reason = "$reason (zamknięcie)") }
         val pv = pointValue ?: run {
@@ -421,17 +442,17 @@ class BotOrchestrator(
             msg("✋ $symbol: stop %.2f od ceny – za blisko (min. %.2f)".format(abs(price - stop), minDist))
             return null
         }
-        val qty = risk.sizeFor(price, stop, pv)
+        val qty = risk.sizeFor(price, stop, pv, tier)
         if (qty <= 0.0) {
             val step = risk.config.lotStep
             msg(
-                "✋ $symbol: najmniejsza pozycja (%s) = ryzyko %.2f, limit %.2f".format(
-                    BigDecimal.valueOf(step).toPlainString(), risk.riskOf(step, price, stop, pv), risk.maxTradeRisk()
+                "✋ $symbol: najmniejsza pozycja (%s) = ryzyko %.2f, limit %.2f (%s)".format(
+                    BigDecimal.valueOf(step).toPlainString(), risk.riskOf(step, price, stop, pv), risk.maxTradeRisk(tier), Tier.name(tier)
                 )
             )
             return null
         }
-        return OrderRequest(symbol, side, qty, price, stop, reason, pointValue = pv, takeProfit = takeProfit)
+        return OrderRequest(symbol, side, qty, price, stop, reason, pointValue = pv, takeProfit = takeProfit, tier = tier)
     }
 
     /** Symulacja spreadu XTB w handlu papierowym: kupno po ask, sprzedaż po bid. */
@@ -498,7 +519,11 @@ class BotOrchestrator(
                 b.copy(open = b.open + shift, high = b.high + shift, low = b.low + shift, close = b.close + shift)
             }
         }
-        _hud.update { it.copy(learning = l.summary() + (wait?.let { "\n⏳ $it" } ?: "")) }
+        val readTf = l.championBarMs ?: Learner.M5
+        val read = aggregators["$inst@$readTf"]?.closed()?.let { MarketRead.describe(it) }
+        _hud.update {
+            it.copy(learning = l.summary() + (read?.let { r -> "\n📊 ${tfLabel(readTf)}: $r" } ?: "") + (wait?.let { w -> "\n⏳ $w" } ?: ""))
+        }
     }
 
     private fun pointValue(inst: String): Double? = prefs.getString("pv_$inst", null)?.toDoubleOrNull()
