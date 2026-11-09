@@ -63,6 +63,14 @@ class ReversalStrategy(
         lastSignalBar = last.start
         return signal
     }
+
+    override fun describeWait(bars: List<Bar>): String? {
+        if (bars.size < period) return null
+        val closes = bars.takeLast(period).map { it.close }
+        val sma = closes.average()
+        val sd = sqrt(closes.sumOf { (it - sma) * (it - sma) } / closes.size)
+        return "LONG po spadku < %.2f i odbiciu • SHORT po wzroście > %.2f i zawróceniu".format(sma - k * sd, sma + k * sd)
+    }
 }
 
 /**
@@ -83,6 +91,11 @@ class ShadowTrader(val name: String, private val strategy: Strategy, private val
     val winRate: Double get() = if (results.isEmpty()) 0.0 else results.count { it > 0 }.toDouble() / results.size
 
     /** @param cost koszt transakcji w jednostkach ceny (spread). Zwraca sygnał, jeśli otworzył pozycję. */
+    fun describeWait(bars: List<Bar>): String? = runCatching { strategy.describeWait(bars) }.getOrNull()
+
+    /** Kierunek otwartej pozycji wirtualnej (null = brak). */
+    val openSide: Side? get() = pos?.side
+
     fun onBar(bars: List<Bar>, sentiment: Double, cost: Double): Signal? {
         val bar = bars.last()
         pos?.let { p -> exitOnBar(p, bar, cost)?.let { r -> record(r); pos = null } }
@@ -169,6 +182,12 @@ class Learner(
 
     private fun pick() {
         champion = shadows.filter { it.trades >= minTrades && it.avgR > minEdge }.maxByOrNull { it.avgR }
+    }
+
+    fun describeWait(bars: List<Bar>): String? {
+        val c = champion ?: return null
+        c.openSide?.let { return "${c.name} jest w pozycji ${if (it == Side.BUY) "LONG" else "SHORT"} – czeka na wyjście" }
+        return c.describeWait(bars)
     }
 
     fun summary(): String {

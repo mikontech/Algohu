@@ -29,6 +29,8 @@ data class Signal(val side: Side, val stopPrice: Double, val takeProfit: Double,
 interface Strategy {
     /** Wywoływane po zamknięciu każdej świecy. */
     fun onBar(bars: List<Bar>, sentiment: Double): Signal?
+    /** Na co strategia teraz czeka (do HUD). */
+    fun describeWait(bars: List<Bar>): String? = null
 }
 
 /**
@@ -75,6 +77,15 @@ class TrendBreakoutStrategy(
             reason = "wybicie %s z %d św., ATR %.2f, RSI %.0f, news %+.2f"
                 .format(if (long) "w górę" else "w dół", donchian, atr, rsi, sentiment)
         )
+    }
+
+    override fun describeWait(bars: List<Bar>): String? {
+        if (bars.size < maxOf(slow, donchian) + 1) return null
+        val closes = bars.map { it.close }
+        val up = (Indicators.ema(closes, fast) ?: return null) > (Indicators.ema(closes, slow) ?: return null)
+        val channel = bars.takeLast(donchian)
+        return if (up) "LONG, gdy świeca 5m zamknie się > %.2f".format(channel.maxOf { it.high })
+        else "SHORT, gdy świeca 5m zamknie się < %.2f".format(channel.minOf { it.low })
     }
 }
 
@@ -298,7 +309,8 @@ class BotOrchestrator(
 
     private fun updateLearningHud() {
         val l = learners[hudLearningInstrument] ?: return
-        _hud.update { it.copy(learning = l.summary()) }
+        val wait = aggregators[hudLearningInstrument]?.closed()?.let { l.describeWait(it) }
+        _hud.update { it.copy(learning = l.summary() + (wait?.let { "\n⏳ $it" } ?: "")) }
     }
 
     private fun pointValue(inst: String): Double? = prefs.getString("pv_$inst", null)?.toDoubleOrNull()
