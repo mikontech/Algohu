@@ -136,6 +136,7 @@ class BotOrchestrator(
     private val lock = Mutex()
     private val aggregators = HashMap<String, BarAggregator>()
     private val learners = HashMap<String, Learner>()
+    private val binanceFallback = java.util.Collections.synchronizedSet(HashSet<String>())
     private val lastPx = HashMap<String, Pair<Double, Long>>()
     private val warned = HashSet<String>()
     @Volatile private var lastTick: Tick? = null
@@ -149,6 +150,7 @@ class BotOrchestrator(
 
         // Rozgrzewka strategii historią świec.
         for ((inst, feed) in FEEDS) for (tf in Learner.TIMEFRAMES) {
+            if (inst in PYTH_FEEDS) continue // np. GOLD: najpierw Pyth XAU/USD, Binance tylko jako zapas
             scope.launch {
                 runCatching { news.historyPaged(feed, tfLabel(tf), Learner.historyBars(tf)) } // 5m ≈ 30 dni, 1m ≈ 7 dni
                     .onSuccess { h ->
@@ -181,7 +183,21 @@ class BotOrchestrator(
             updateLearningHud()
         }
         scope.launch { pyth.ticks.collect { t -> lock.withLock { processPrice(t.symbol, t.price, t.timestamp) } } }
-        scope.launch { pyth.status.collect { updateLearningHud() } }
+        scope.launch {
+            pyth.status.collect { st ->
+                // Zapas: jeśli Pyth nie ma instrumentu, który ma też Binance (GOLD → PAXG), wczytaj historię z Binance.
+                for ((inst, feed) in FEEDS) {
+                    val state = st[inst] ?: continue
+                    if (inst !in PYTH_FEEDS || state == "ok" || !binanceFallback.add(inst)) continue
+                    msg("$inst: Pyth niedostępny ($state) – zapasowo ceny z Binance $feed")
+                    for (tf in Learner.TIMEFRAMES) scope.launch {
+                        runCatching { news.historyPaged(feed, tfLabel(tf), Learner.historyBars(tf)) }
+                            .onSuccess { h -> lock.withLock { agg(inst, tf).seed(h); learner(inst).backtest(tf, h, spreadOf(inst)) } }
+                    }
+                }
+                updateLearningHud()
+            }
+        }
 
         scope.launch {
             while (isActive) {
@@ -270,6 +286,7 @@ class BotOrchestrator(
             _hud.update { it.copy(lastPrice = tick.price, symbol = tick.symbol) }
         }
         val inst = FEED_TO_INSTRUMENT[tick.symbol] ?: return
+        if (inst in PYTH_FEEDS && inst !in binanceFallback) return // np. GOLD liczony z Pyth XAU/USD
         lock.withLock { processPrice(inst, tick.price, tick.timestamp) }
     }
 
@@ -429,6 +446,7 @@ class BotOrchestrator(
 
         /** Instrument XTB → fraza symbolu w Pyth (darmowy Hermes). OIL w XTB = Brent, OIL.WTI = WTI. */
         val PYTH_FEEDS = mapOf(
+            "GOLD" to "XAU/USD", // spot złota – zbliżony do GOLD w XTB (PAXG z Binance tylko jako zapas)
             "OIL" to "UKOILSPOT",
             "OIL.WTI" to "USOILSPOT",
             "SILVER" to "XAG/USD",

@@ -498,7 +498,8 @@ class OverlayService : LifecycleService() {
         toast("Skopiowano zrzut (${text.lines().size} linii) – wklej go w czacie")
     }
 
-    private fun fmtPrice(v: Double): String = BigDecimal.valueOf(v).stripTrailingZeros().toPlainString()
+    private fun fmtPrice(v: Double): String =
+        BigDecimal.valueOf(v).setScale(if (v >= 100) 2 else 5, java.math.RoundingMode.HALF_UP).stripTrailingZeros().toPlainString()
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
