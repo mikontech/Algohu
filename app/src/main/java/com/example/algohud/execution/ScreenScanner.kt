@@ -202,6 +202,7 @@ object ScreenScanner {
                 d?.let { append(" d=\"").append(it).append('"') }
                 if (n.isClickable) append(" [click]")
                 if (n.isEditable) append(" [edit]")
+                if (n.isCheckable) append(if (n.isChecked) " [on]" else " [off]")
                 append(" @").append(r.left).append(',').append(r.top)
                 append(' ').append(r.width()).append('x').append(r.height())
                 appendLine()

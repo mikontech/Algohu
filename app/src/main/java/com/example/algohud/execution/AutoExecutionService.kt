@@ -30,6 +30,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.math.BigDecimal
+import java.math.RoundingMode
 import java.net.URLEncoder
 import java.util.concurrent.TimeoutException
 import javax.crypto.Mac
@@ -448,7 +449,11 @@ class AutoExecutionService : AccessibilityService() {
         val pkg = root.packageName?.toString()
         if (pkg != p.packageName) return ExecutionResult.Rejected("Na ekranie jest $pkg zamiast ${p.packageName}")
         if (order.reduceOnly && !p.canClosePositions) {
-            return ExecutionResult.Rejected("ZAMKNIJ POZYCJĘ RĘCZNIE w aplikacji brokera (tu przycisk przeciwny otwiera nową pozycję)")
+            // Przycisk przeciwny otworzyłby NOWĄ pozycję. Zamykamy przez ekran pozycji, jeśli jest otwarty.
+            if (pkg == ScreenScanner.XTB_PACKAGE && positionScreenProblem(root, order.symbol) == null) {
+                return doClosePosition(order.symbol)
+            }
+            return ExecutionResult.Rejected("ZAMKNIJ POZYCJĘ ${order.symbol} w XTB – otwórz jej ekran, a bot zamknie ją sam, albo zamknij ręcznie")
         }
         if (p.verifyInstrument) {
             val q = screenQuote.value
@@ -493,6 +498,111 @@ class AutoExecutionService : AccessibilityService() {
             }
         }
         return ExecutionResult.Submitted("Kliknięto ${order.side} ${formatQty(order.quantity)} ${order.symbol} – sprawdź w aplikacji i ustaw tam SL")
+    }
+
+
+    // ───────────── Ekran pozycji XTB: SL/TP i zamykanie ─────────────
+
+    /** Wpisuje SL/TP na ekranie pozycji XTB i dotyka "Modyfikuj pozycję". */
+    suspend fun setProtection(instrument: String, sl: Double?, tp: Double?): ExecutionResult =
+        withContext(Dispatchers.Main.immediate) {
+            try {
+                doSetProtection(instrument, sl, tp)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                ExecutionResult.Failed(t)
+            }
+        }
+
+    /** Dotyka "Zamknij pozycję" na ekranie pozycji XTB. */
+    suspend fun closeXtbPosition(instrument: String): ExecutionResult =
+        withContext(Dispatchers.Main.immediate) {
+            try {
+                doClosePosition(instrument)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                ExecutionResult.Failed(t)
+            }
+        }
+
+    /** null = na ekranie jest pozycja [instrument] z przyciskami Zamknij/Modyfikuj. */
+    private fun positionScreenProblem(root: AccessibilityNodeInfo?, instrument: String): String? {
+        if (root == null) return "brak dostępu do okna"
+        if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) return "XTB nie jest na ekranie"
+        val title = ScreenScanner.findById(root, "ElementTitleHorizontalText").firstOrNull()
+            ?.text?.toString()?.trim()?.substringBefore(' ')
+        if (title != instrument) return "na ekranie jest ${title ?: "?"}, a pozycja dotyczy $instrument"
+        if (ScreenScanner.findById(root, "ModifyPositionButton").isEmpty()) {
+            return "otwórz w XTB ekran pozycji $instrument (Take Profit / Stop Loss / Zamknij pozycję)"
+        }
+        return null
+    }
+
+    private suspend fun doSetProtection(instrument: String, sl: Double?, tp: Double?): ExecutionResult {
+        positionScreenProblem(rootInActiveWindow, instrument)?.let { return ExecutionResult.Rejected(it) }
+        tp?.let { price -> setPriceIn("TakeProfitInput", "TakeProfitToggle", price)?.let { return ExecutionResult.Rejected("TP: $it") } }
+        sl?.let { price -> setPriceIn("StopLossInput", "StopLossToggle", price)?.let { return ExecutionResult.Rejected("SL: $it") } }
+        val modify = rootInActiveWindow?.let { ScreenScanner.findById(it, "ModifyPositionButton").firstOrNull() }
+            ?: return ExecutionResult.Rejected("brak przycisku Modyfikuj pozycję")
+        if (!click(modify)) return ExecutionResult.Rejected("nie udało się dotknąć Modyfikuj pozycję")
+        delay(1_200)
+        return ExecutionResult.Submitted(
+            "Ustawiono w XTB" + (sl?.let { " SL %.2f".format(it) } ?: "") + (tp?.let { " TP %.2f".format(it) } ?: "") +
+                " – sprawdź na wykresie"
+        )
+    }
+
+    private suspend fun doClosePosition(instrument: String): ExecutionResult {
+        positionScreenProblem(rootInActiveWindow, instrument)?.let { return ExecutionResult.Rejected(it) }
+        val close = rootInActiveWindow?.let { ScreenScanner.findById(it, "CloseVolumeButton").firstOrNull() }
+            ?: return ExecutionResult.Rejected("brak przycisku Zamknij pozycję")
+        if (!click(close)) return ExecutionResult.Rejected("nie udało się dotknąć Zamknij pozycję")
+        delay(1_500)
+        // Jeśli ekran pozycji nadal jest widoczny, XTB pokazało coś jeszcze (np. wybór wolumenu) – nie zgadujemy.
+        val stillThere = rootInActiveWindow?.let { ScreenScanner.findById(it, "CloseVolumeButton").isNotEmpty() } ?: true
+        return if (stillThere) {
+            ExecutionResult.Rejected("XTB pokazało dodatkowe okno – dokończ zamknięcie ręcznie i wyślij mi 📋 zrzut tego okna")
+        } else {
+            ExecutionResult.Submitted("Zamknięto pozycję $instrument w XTB – sprawdź listę pozycji")
+        }
+    }
+
+    /** Włącza (jeśli trzeba) sekcję SL/TP, wpisuje cenę i sprawdza, czy XTB ją przyjęło. null = OK. */
+    private suspend fun setPriceIn(containerId: String, toggleId: String, price: Double): String? {
+        var field = fieldIn(containerId)
+        if (field == null) {
+            val root = rootInActiveWindow ?: return "brak okna"
+            val toggleArea = ScreenScanner.findById(root, toggleId).firstOrNull()?.let { n -> Rect().also { n.getBoundsInScreen(it) } }
+                ?: return "nie znaleziono przełącznika"
+            val r = Rect()
+            val sw = ScreenScanner.findById(root, "ToggleRowSwitch").firstOrNull { n ->
+                n.getBoundsInScreen(r); toggleArea.contains(r.centerX(), r.centerY())
+            } ?: return "nie znaleziono przełącznika"
+            if (!click(sw)) return "nie udało się włączyć przełącznika"
+            delay(500)
+            field = fieldIn(containerId) ?: return "pole ceny nie pojawiło się"
+        }
+        val decimals = field.text?.toString()?.substringAfter('.', "")?.length?.takeIf { it in 1..6 } ?: 2
+        val txt = BigDecimal(price).setScale(decimals, RoundingMode.HALF_UP).toPlainString()
+        val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, txt) }
+        if (!field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return "nie udało się wpisać ceny"
+        delay(300)
+        val typed = fieldIn(containerId)?.text?.toString()?.let { ScreenScanner.parseNumber(it) }
+        val tolerance = BigDecimal.ONE.movePointLeft(decimals).toDouble()
+        if (typed == null || abs(typed - txt.toDouble()) > tolerance / 2) return "XTB nie przyjęło ceny (jest $typed, miało być $txt)"
+        return null
+    }
+
+    private fun fieldIn(containerId: String): AccessibilityNodeInfo? {
+        val root = rootInActiveWindow ?: return null
+        val area = ScreenScanner.findById(root, containerId).firstOrNull()?.let { n -> Rect().also { n.getBoundsInScreen(it) } }
+            ?: return null
+        val r = Rect()
+        return ScreenScanner.findById(root, "StepperTextField").firstOrNull { n ->
+            n.getBoundsInScreen(r); area.contains(r.centerX(), r.centerY())
+        }
     }
 
     private suspend fun awaitNode(sel: NodeSelector, timeoutMs: Long): AccessibilityNodeInfo? =

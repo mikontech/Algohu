@@ -241,6 +241,8 @@ class RiskManager(
         }
     }
 
+    suspend fun position(symbol: String): Position? = mutex.withLock { positions[symbol] }
+
     suspend fun closingOrder(symbol: String, side: Side, price: Double): OrderRequest? = mutex.withLock {
         val p = positions[symbol] ?: return@withLock null
         if (p.side == side) null

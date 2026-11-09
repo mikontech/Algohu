@@ -255,6 +255,15 @@ class OverlayService : LifecycleService() {
         val toolsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(actionButton("📋 Zrzut ekranu", 0xFF5D4037.toInt()) { dumpScreen() })
+            addView(actionButton("🛡 SL/TP", 0xFF1565C0.toInt(), longPress = true) {
+                botScope.launch { bot.applyProtectionOnScreen() }
+            })
+        }
+        val positionRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(actionButton("✖ Zamknij", 0xFF7F0000.toInt(), longPress = true) {
+                botScope.launch { bot.closeOnScreen() }
+            })
             addView(actionButton("✔ Zamknąłem w XTB", 0xFF37474F.toInt(), longPress = true) {
                 botScope.launch {
                     val n = risk.markClosedManually()
@@ -274,6 +283,7 @@ class OverlayService : LifecycleService() {
             addView(tradeRow, wrap().apply { topMargin = dp(6) })
             addView(controlRow, wrap().apply { topMargin = dp(6) })
             addView(toolsRow, wrap().apply { topMargin = dp(6) })
+            addView(positionRow, wrap().apply { topMargin = dp(6) })
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL

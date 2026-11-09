@@ -159,6 +159,44 @@ class BotOrchestrator(
         buildOrder(t.symbol, side, t.price, stop, null, "MANUAL", 1.0)?.let { engine.submit(it, bypassConfirmation = true) }
     }
 
+    /** Na ekranie pozycji w XTB: wpisz SL/TP z księgi bota (przeliczone na ceny XTB) i zatwierdź. */
+    suspend fun applyProtectionOnScreen() {
+        val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument != null }
+            ?: return msg("Otwórz w XTB ekran pozycji")
+        val inst = q.instrument!!
+        val pos = risk.position(inst) ?: return msg("Bot nie ma w księdze pozycji $inst")
+        val svc = AutoExecutionService.instance ?: return msg("Usługa ułatwień dostępu wyłączona")
+        val basis = basis(inst, q)
+        val r = svc.setProtection(inst, pos.stopPrice + basis, pos.takeProfit?.plus(basis))
+        msg(
+            when (r) {
+                is com.example.algohud.core.ExecutionResult.Submitted -> "🛡 ${r.note}"
+                is com.example.algohud.core.ExecutionResult.Rejected -> "🛡 ${r.reason}"
+                is com.example.algohud.core.ExecutionResult.Failed -> "🛡 błąd: ${r.error.message}"
+                is com.example.algohud.core.ExecutionResult.Filled -> "🛡 OK"
+            }
+        )
+    }
+
+    /** Zamyka pozycję instrumentu widocznego w XTB (przez ekran pozycji). */
+    suspend fun closeOnScreen() {
+        val inst = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() }?.instrument
+            ?: return msg("Otwórz w XTB ekran pozycji")
+        val pos = risk.position(inst) ?: return msg("Bot nie ma w księdze pozycji $inst")
+        val px = lastPx[inst]?.first ?: pos.entryPrice
+        risk.closingOrder(inst, pos.side.opposite(), px)?.let {
+            engine.submit(it.copy(reason = "ZAMKNIĘCIE RĘCZNE Z HUD"), bypassConfirmation = true)
+        }
+    }
+
+    /** Różnica XTB − feed w tle (PAXG vs złoto XTB); dla instrumentów bez feedu 0. */
+    private fun basis(inst: String, q: ScreenQuote): Double {
+        val mid = q.mid ?: return 0.0
+        val (px, ts) = lastPx[inst] ?: return 0.0
+        if (inst !in FEEDS || System.currentTimeMillis() - ts > 30_000) return 0.0
+        return mid - px
+    }
+
     // ───────────── Źródła cen ─────────────
 
     private suspend fun onFeedTick(tick: Tick) {
