@@ -74,6 +74,8 @@ class ShadowTrader(val name: String, private val strategy: Strategy, private val
     private data class Sim(val side: Side, val entry: Double, var stop: Double, val initStop: Double, val tp: Double, var best: Double)
 
     private var pos: Sim? = null
+    var errors = 0
+        private set
     private val results = ArrayDeque<Double>()
 
     val trades: Int get() = results.size
@@ -84,7 +86,13 @@ class ShadowTrader(val name: String, private val strategy: Strategy, private val
     fun onBar(bars: List<Bar>, sentiment: Double, cost: Double): Signal? {
         val bar = bars.last()
         pos?.let { p -> exitOnBar(p, bar, cost)?.let { r -> record(r); pos = null } }
-        val sig = strategy.onBar(bars, sentiment) ?: return null
+        // Błąd jednego wariantu nie może zatrzymać nauki pozostałych.
+        val sig = try {
+            strategy.onBar(bars, sentiment)
+        } catch (t: Throwable) {
+            errors++
+            null
+        } ?: return null
         val p = pos
         if (p != null && p.side == sig.side) return null
         if (p != null) { record(rAt(p, bar.close, cost)); pos = null }

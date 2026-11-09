@@ -49,7 +49,7 @@ class TrendBreakoutStrategy(
     private var lastSignalBar = 0L
 
     override fun onBar(bars: List<Bar>, sentiment: Double): Signal? {
-        if (bars.size < slow + 2) return null
+        if (bars.size < maxOf(slow, donchian, atrPeriod) + 2) return null // BŁĄD BYŁ TU: Wybicie 55 przy 52 świecach
         val last = bars.last()
         if (last.start - lastSignalBar < cooldownBars * barMs) return null
         val closes = bars.map { it.close }
@@ -122,7 +122,12 @@ class BotOrchestrator(
                         }
                         updateLearningHud()
                     }
-                    .onFailure { msg("Historia $inst: ${it.message}") }
+                    .onFailure { e ->
+                        msg("Historia $inst: ${e.message}")
+                        if (inst == hudLearningInstrument) {
+                            _hud.update { it.copy(learning = "🧠 $inst: brak historii (${e.message}) – uczę się na żywo") }
+                        }
+                    }
             }
         }
         scope.launch {

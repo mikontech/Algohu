@@ -95,6 +95,7 @@ class OverlayService : LifecycleService() {
     private lateinit var bot: BotOrchestrator
 
     private var expanded = false
+    @Volatile private var lastAutoAsk = 0L
     private var lastNotifKey = ""
 
     // ───────────── Cykl życia ─────────────
@@ -216,9 +217,19 @@ class OverlayService : LifecycleService() {
                 )
             }
         }.apply {
+            // Przytrzymanie: AUTO. Gdy brakuje tylko wyników papierowych – drugie przytrzymanie w ciągu 10 s
+            // włącza AUTO na odpowiedzialność użytkownika (limity ryzyka i SL nadal obowiązują).
             setOnLongClickListener {
                 botScope.launch {
-                    val blocked = engine.setMode(ExecutionMode.AUTO)
+                    val now = System.currentTimeMillis()
+                    val second = now - lastAutoAsk < 10_000
+                    if (!second && engine.autoBlockedOnlyByGate()) {
+                        lastAutoAsk = now
+                        toast("⚠️ Brak potwierdzonych wyników. Przytrzymaj „Tryb” jeszcze raz w ciągu 10 s, aby włączyć AUTO na własne ryzyko")
+                        return@launch
+                    }
+                    lastAutoAsk = 0L
+                    val blocked = engine.setMode(ExecutionMode.AUTO, overrideGate = second)
                     toast(if (blocked != null) "🔒 AUTO zablokowane: $blocked" else "⚠️ AUTO włączone – bot sam składa zlecenia")
                 }
                 true

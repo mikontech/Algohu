@@ -82,11 +82,18 @@ class ExecutionEngine(
      * Zmienia tryb. CONFIRM i AUTO wymagają gotowego wykonawcy (API z kluczem albo prawdziwy profil UI).
      * @return null przy sukcesie, w przeciwnym razie powód blokady.
      */
-    suspend fun setMode(target: ExecutionMode): String? {
+    /** true, gdy AUTO blokuje WYŁĄCZNIE bramka wyników papierowych (technicznie wszystko gotowe). */
+    fun autoBlockedOnlyByGate(): Boolean = executor.autoReadiness() == null && autoGate() != null
+
+    /** @param overrideGate świadome włączenie AUTO mimo braku wyników papierowych (decyzja użytkownika). */
+    suspend fun setMode(target: ExecutionMode, overrideGate: Boolean = false): String? {
         val blocked = when (target) {
             ExecutionMode.DRY_RUN -> null
             ExecutionMode.CONFIRM -> executor.readiness()
-            ExecutionMode.AUTO -> executor.autoReadiness() ?: autoGate()
+            ExecutionMode.AUTO -> executor.autoReadiness() ?: if (overrideGate) null else autoGate()
+        }
+        if (target == ExecutionMode.AUTO && overrideGate && blocked == null) {
+            log("⚠️ AUTO włączone przez użytkownika BEZ potwierdzonych wyników papierowych")
         }
         if (blocked != null) {
             log("🔒 $target zablokowany: $blocked")
