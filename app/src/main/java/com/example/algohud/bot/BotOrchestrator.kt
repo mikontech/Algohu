@@ -314,8 +314,19 @@ class BotOrchestrator(
     @Volatile private var hudLearningInstrument: String = "GOLD"
 
     private fun updateLearningHud() {
-        val l = learners[hudLearningInstrument] ?: return
-        val wait = l.describeWait { tf -> aggregators["$hudLearningInstrument@$tf"]?.closed() }
+        val inst = hudLearningInstrument
+        val l = learners[inst] ?: run {
+            // Nie pokazuj wyników innego instrumentu (wcześniej zostawała linijka GOLD).
+            _hud.update {
+                it.copy(
+                    learning = "🧠 $inst: brak danych" +
+                        if (inst in FEEDS) " – wczytuję historię…"
+                        else " – brak cen w tle; uczę się tylko, gdy $inst jest otwarty w XTB (potrzeba ~50 świec)"
+                )
+            }
+            return
+        }
+        val wait = l.describeWait { tf -> aggregators["$inst@$tf"]?.closed() }
         _hud.update { it.copy(learning = l.summary() + (wait?.let { "\n⏳ $it" } ?: "")) }
     }
 
