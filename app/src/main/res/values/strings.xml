@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Algo HUD</string>
+    <string name="accessibility_label">Algo HUD – wykonawca zleceń</string>
+    <string name="accessibility_desc">Odczytuje ceny i klika przyciski Kup/Sprzedaj w wybranej aplikacji brokera wyłącznie na Twoje polecenie lub zgodnie z regułami bota, które zatwierdziłeś. Działa tylko dla pakietów wskazanych w konfiguracji.</string>
+</resources>

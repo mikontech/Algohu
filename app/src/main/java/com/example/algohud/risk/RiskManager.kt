@@ -1,0 +1,273 @@
+package com.example.algohud.risk
+
+import android.content.SharedPreferences
+import android.util.Log
+import com.example.algohud.core.OrderRequest
+import com.example.algohud.core.Position
+import com.example.algohud.core.Side
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import kotlin.math.abs
+import kotlin.math.floor
+import kotlin.math.min
+
+/**
+ * Bezpiecznik. KAŻDE zlecenie (bot, ręczne, stop) przechodzi przez evaluate().
+ * Zasada: zlecenia ZMNIEJSZAJĄCE ekspozycję są zawsze dozwolone (także przy KILL),
+ * zlecenia ZWIĘKSZAJĄCE muszą przejść wszystkie testy.
+ */
+class RiskManager(
+    private val prefs: SharedPreferences,
+    val config: Config = Config(),
+    private val marketBlackout: () -> Boolean = { false },
+    private val clock: () -> Long = System::currentTimeMillis,
+    private val zone: ZoneId = ZoneId.systemDefault()
+) {
+    data class Config(
+        val maxDailyLossPct: Double = 0.02,          // twardy limit dziennej straty: 2% kapitału z początku dnia
+        val riskPerTradePct: Double = 0.005,         // 0,5% kapitału ryzyka na transakcję (do stop-lossa)
+        val maxPositionNotionalPct: Double = 0.25,   // maks. 25% kapitału w jednej pozycji
+        val maxOpenPositions: Int = 1,
+        val maxOrdersPerMinute: Int = 3,
+        val minStopDistancePct: Double = 0.002,      // stop bliżej niż 0,2% = szum, odrzucamy
+        val cooldownAfterLossMs: Long = 10 * 60_000L,
+        val allowShort: Boolean = false,             // spot: sprzedaż tylko do zamknięcia pozycji
+        val allowPyramiding: Boolean = false,
+        val allowedSymbols: Set<String> = setOf("BTCUSDT"),
+        val lotStep: Double = 0.00001
+    )
+
+    sealed interface Decision {
+        data class Approved(val order: OrderRequest) : Decision
+        data class Rejected(val reason: String) : Decision
+    }
+
+    private val mutex = Mutex()
+
+    private val _killSwitch = MutableStateFlow(prefs.getBoolean(K_KILL, false))
+    val killSwitch: StateFlow<Boolean> = _killSwitch.asStateFlow()
+
+    var killReason: String? = prefs.getString(K_KILL_REASON, null)
+        private set
+
+    private val _dailyPnl = MutableStateFlow(0.0)
+    val dailyPnl: StateFlow<Double> = _dailyPnl.asStateFlow()
+
+    private var tradingDay: LocalDate = prefs.getString(K_DAY, null)?.let(LocalDate::parse) ?: today()
+    private var dayStartEquity = prefs.getString(K_DAY_EQUITY, null)?.toDoubleOrNull() ?: 0.0
+    private var realizedToday = prefs.getString(K_REALIZED, null)?.toDoubleOrNull() ?: 0.0
+    private var equity = 0.0
+    private var lastLossAt = 0L
+
+    // TODO: po starcie zsynchronizuj pozycje z brokerem (API) – tu trzymane są tylko w pamięci.
+    private val positions = mutableMapOf<String, Position>()
+    private val marks = mutableMapOf<String, Double>()
+    private val pendingStops = mutableSetOf<String>()
+    private val orderTimes = ArrayDeque<Long>()
+
+    // ── Kapitał i wielkość pozycji ──
+
+    suspend fun updateEquity(value: Double) = mutex.withLock {
+        equity = value
+        rolloverLocked()
+        if (dayStartEquity <= 0.0 && value > 0.0) { dayStartEquity = value; persistLocked() }
+        recomputePnlLocked()
+    }
+
+    /**
+     * Fixed-fractional: qty = (kapitał × ryzyko%) / |wejście − stop|,
+     * przycięte limitem ekspozycji i zaokrąglone W DÓŁ do kroku lota.
+     */
+    fun positionSize(equity: Double, entry: Double, stop: Double): Double {
+        val dist = abs(entry - stop)
+        if (equity <= 0 || entry <= 0 || dist < entry * config.minStopDistancePct) return 0.0
+        val byRisk = equity * config.riskPerTradePct / dist
+        val byNotional = equity * config.maxPositionNotionalPct / entry
+        return floor(min(byRisk, byNotional) / config.lotStep) * config.lotStep
+    }
+
+    suspend fun sizeFor(entry: Double, stop: Double): Double = mutex.withLock { positionSize(equity, entry, stop) }
+
+    // ── Bramka zleceń ──
+
+    suspend fun evaluate(order: OrderRequest): Decision = mutex.withLock {
+        rolloverLocked()
+        val now = clock()
+        fun reject(reason: String): Decision {
+            Log.w(TAG, "REJECT ${order.side} ${order.quantity} ${order.symbol}: $reason")
+            return Decision.Rejected(reason)
+        }
+
+        if (!order.quantity.isFinite() || order.quantity <= 0.0) return@withLock reject("Nieprawidłowa ilość")
+        if (order.symbol !in config.allowedSymbols) return@withLock reject("Symbol spoza białej listy")
+
+        val existing = positions[order.symbol]
+        val reducing = existing != null && existing.side != order.side &&
+            order.quantity <= existing.quantity + 1e-12
+        if (reducing) return@withLock Decision.Approved(order)
+
+        if (_killSwitch.value) return@withLock reject("KILL-SWITCH aktywny: $killReason")
+        if (equity <= 0.0 || dayStartEquity <= 0.0) return@withLock reject("Brak danych o kapitale")
+        if (order.side == Side.SELL && existing == null && !config.allowShort) return@withLock reject("Short wyłączony")
+        if (existing == null && positions.size >= config.maxOpenPositions) return@withLock reject("Limit otwartych pozycji")
+        if (existing != null && !config.allowPyramiding) return@withLock reject("Pozycja już otwarta")
+        if (marketBlackout()) return@withLock reject("Okno publikacji makro (blackout)")
+        if (now - lastLossAt < config.cooldownAfterLossMs) return@withLock reject("Cooldown po stratnej transakcji")
+
+        while (orderTimes.isNotEmpty() && now - orderTimes.first() > 60_000) orderTimes.removeFirst()
+        if (orderTimes.size >= config.maxOrdersPerMinute) return@withLock reject("Limit zleceń na minutę")
+
+        val ref = order.referencePrice
+        val stopOnCorrectSide = if (order.side == Side.BUY) order.stopPrice < ref else order.stopPrice > ref
+        if (!stopOnCorrectSide) return@withLock reject("Stop-loss po złej stronie ceny")
+        val dist = abs(ref - order.stopPrice)
+        if (dist < ref * config.minStopDistancePct) return@withLock reject("Stop-loss zbyt blisko ceny")
+
+        val tradeRisk = dist * order.quantity
+        val maxTradeRisk = equity * config.riskPerTradePct
+        if (tradeRisk > maxTradeRisk * 1.05) {
+            return@withLock reject("Ryzyko %.2f > limit %.2f".format(tradeRisk, maxTradeRisk))
+        }
+        if (order.quantity * ref > equity * config.maxPositionNotionalPct * 1.01) {
+            return@withLock reject("Zbyt duża ekspozycja")
+        }
+        val dailyLimit = dayStartEquity * config.maxDailyLossPct
+        val currentLoss = (-_dailyPnl.value).coerceAtLeast(0.0)
+        if (currentLoss + tradeRisk > dailyLimit) {
+            return@withLock reject("Trafienie SL przekroczyłoby dzienny limit straty")
+        }
+
+        orderTimes.addLast(now)
+        Decision.Approved(order)
+    }
+
+    // ── Księgowanie ──
+
+    suspend fun onFill(order: OrderRequest, price: Double, qty: Double) = mutex.withLock {
+        val existing = positions[order.symbol]
+        when {
+            existing != null && existing.side != order.side -> {
+                val closedQty = min(qty, existing.quantity)
+                val pnl = (price - existing.entryPrice) * closedQty * existing.side.sign
+                realizedToday += pnl
+                if (pnl < 0) lastLossAt = clock()
+                val remaining = existing.quantity - closedQty
+                if (remaining <= 1e-12) {
+                    positions.remove(order.symbol)
+                    pendingStops.remove(order.symbol)
+                } else {
+                    positions[order.symbol] = existing.copy(quantity = remaining)
+                }
+            }
+            existing != null -> {
+                val newQty = existing.quantity + qty
+                positions[order.symbol] = existing.copy(
+                    quantity = newQty,
+                    entryPrice = (existing.entryPrice * existing.quantity + price * qty) / newQty
+                )
+            }
+            else -> positions[order.symbol] = Position(order.symbol, order.side, qty, price, order.stopPrice)
+        }
+        recomputePnlLocked()
+        persistLocked()
+    }
+
+    /**
+     * Aktualizuje wycenę; jeśli cena przebiła stop pozycji, zwraca zlecenie zamykające (soft-stop).
+     * Soft-stop to ZAPASOWY bezpiecznik – podstawowy stop powinien siedzieć u brokera.
+     */
+    suspend fun onMark(symbol: String, price: Double): OrderRequest? = mutex.withLock {
+        marks[symbol] = price
+        recomputePnlLocked()
+        val p = positions[symbol] ?: return@withLock null
+        val hit = if (p.side == Side.BUY) price <= p.stopPrice else price >= p.stopPrice
+        if (!hit || symbol in pendingStops) return@withLock null
+        pendingStops += symbol
+        OrderRequest(symbol, p.side.opposite(), p.quantity, price, stopPrice = price, reason = "SOFT-STOP")
+    }
+
+    suspend fun closingOrder(symbol: String, side: Side, price: Double): OrderRequest? = mutex.withLock {
+        val p = positions[symbol] ?: return@withLock null
+        if (p.side == side) null
+        else OrderRequest(symbol, side, p.quantity, price, stopPrice = price, reason = "CLOSE")
+    }
+
+    suspend fun flattenOrders(): List<OrderRequest> = mutex.withLock {
+        positions.values.map { p ->
+            val px = marks[p.symbol] ?: p.entryPrice
+            OrderRequest(p.symbol, p.side.opposite(), p.quantity, px, stopPrice = px, reason = "FLATTEN")
+        }
+    }
+
+    // ── Kill-switch ──
+
+    suspend fun engageKillSwitch(reason: String) = mutex.withLock {
+        if (!_killSwitch.value) setKillLocked(true, reason)
+    }
+
+    /** Ręczne odblokowanie. Blokady z dziennego limitu straty nie da się zdjąć przed nowym dniem. */
+    suspend fun resetKillSwitch(): Boolean = mutex.withLock {
+        rolloverLocked()
+        if (killReason == REASON_DAILY_LOSS) return@withLock false
+        setKillLocked(false, null)
+        true
+    }
+
+    // ── Wewnętrzne (wywoływać pod mutexem) ──
+
+    private fun today(): LocalDate = Instant.ofEpochMilli(clock()).atZone(zone).toLocalDate()
+
+    private fun rolloverLocked() {
+        val d = today()
+        if (d == tradingDay) return
+        tradingDay = d
+        dayStartEquity = if (equity > 0) equity else 0.0
+        realizedToday = 0.0
+        if (killReason == REASON_DAILY_LOSS) setKillLocked(false, null)
+        persistLocked()
+    }
+
+    private fun recomputePnlLocked() {
+        val unrealized = positions.values.sumOf { p ->
+            val m = marks[p.symbol] ?: p.entryPrice
+            (m - p.entryPrice) * p.quantity * p.side.sign
+        }
+        _dailyPnl.value = realizedToday + unrealized
+        if (dayStartEquity > 0 && !_killSwitch.value &&
+            _dailyPnl.value <= -dayStartEquity * config.maxDailyLossPct
+        ) {
+            setKillLocked(true, REASON_DAILY_LOSS)
+        }
+    }
+
+    private fun setKillLocked(on: Boolean, reason: String?) {
+        _killSwitch.value = on
+        killReason = reason
+        prefs.edit().putBoolean(K_KILL, on).putString(K_KILL_REASON, reason).apply()
+        Log.w(TAG, if (on) "KILL-SWITCH ON: $reason" else "KILL-SWITCH OFF")
+    }
+
+    private fun persistLocked() {
+        prefs.edit()
+            .putString(K_DAY, tradingDay.toString())
+            .putString(K_DAY_EQUITY, dayStartEquity.toString())
+            .putString(K_REALIZED, realizedToday.toString())
+            .apply()
+    }
+
+    companion object {
+        const val REASON_DAILY_LOSS = "Przekroczony dzienny limit straty"
+        private const val TAG = "RiskManager"
+        private const val K_KILL = "kill"
+        private const val K_KILL_REASON = "kill_reason"
+        private const val K_DAY = "day"
+        private const val K_DAY_EQUITY = "day_equity"
+        private const val K_REALIZED = "realized"
+    }
+}

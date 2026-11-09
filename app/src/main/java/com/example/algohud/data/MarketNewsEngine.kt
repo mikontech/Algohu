@@ -1,0 +1,358 @@
+package com.example.algohud.data
+
+import android.util.Log
+import android.util.Xml
+import com.example.algohud.core.MacroEvent
+import com.example.algohud.core.NewsItem
+import com.example.algohud.core.Tick
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import org.json.JSONObject
+import org.xmlpull.v1.XmlPullParser
+import java.net.URI
+import java.time.OffsetDateTime
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.util.concurrent.TimeUnit
+import kotlin.math.abs
+import kotlin.math.min
+import kotlin.math.pow
+import kotlin.math.sqrt
+import kotlin.math.tanh
+
+// ───────────────────────────── Sentyment ─────────────────────────────
+
+interface SentimentScorer {
+    /** Zwraca wynik w zakresie [-1.0, +1.0]. */
+    suspend fun score(text: String): Double
+}
+
+/** Szybki silnik regułowy: leksykon z wagami + negacje + wzmacniacze. Działa offline, < 1 ms. */
+class KeywordSentimentScorer : SentimentScorer {
+    private val lexicon: Map<String, Double> = mapOf(
+        // EN – pozytywne
+        "beat" to 0.6, "beats" to 0.6, "surge" to 0.7, "surges" to 0.7, "soar" to 0.7, "soars" to 0.7,
+        "rally" to 0.6, "rallies" to 0.6, "upgrade" to 0.5, "upgraded" to 0.5, "approval" to 0.5,
+        "approved" to 0.5, "stimulus" to 0.4, "growth" to 0.3, "bullish" to 0.6, "inflows" to 0.4,
+        "record high" to 0.7, "rate cut" to 0.5, "rate cuts" to 0.5,
+        // EN – negatywne
+        "miss" to -0.6, "misses" to -0.6, "plunge" to -0.8, "plunges" to -0.8, "crash" to -0.9,
+        "selloff" to -0.6, "downgrade" to -0.5, "downgraded" to -0.5, "recession" to -0.7,
+        "default" to -0.8, "bankruptcy" to -0.9, "hack" to -0.8, "hacked" to -0.8, "exploit" to -0.7,
+        "sanctions" to -0.5, "inflation" to -0.3, "layoffs" to -0.4, "lawsuit" to -0.4, "ban" to -0.6,
+        "bearish" to -0.6, "outflows" to -0.4, "rate hike" to -0.4, "rate hikes" to -0.4,
+        // PL
+        "wzrost" to 0.4, "wzrosty" to 0.4, "rekord" to 0.5, "hossa" to 0.6, "spadek" to -0.4,
+        "spadki" to -0.4, "krach" to -0.9, "recesja" to -0.7, "upadłość" to -0.9, "bessa" to -0.6,
+        "obniżka stóp" to 0.5, "podwyżka stóp" to -0.4
+    )
+    private val negations = setOf("not", "no", "fails", "without", "nie", "brak", "bez")
+    private val intensifiers = mapOf(
+        "sharply" to 1.5, "massive" to 1.5, "huge" to 1.4, "slightly" to 0.5, "modest" to 0.6,
+        "mocno" to 1.5, "gwałtowny" to 1.5, "lekko" to 0.5, "nieznacznie" to 0.5
+    )
+    private val tokenizer = Regex("[^\\p{L}\\p{N}]+")
+
+    override suspend fun score(text: String): Double {
+        val lower = text.lowercase()
+        val tokens = lower.split(tokenizer).filter { it.isNotBlank() }
+        var sum = 0.0
+        var hits = 0
+        for ((phrase, w) in lexicon) {
+            if (' ' in phrase && lower.contains(phrase)) { sum += w; hits++ }
+        }
+        tokens.forEachIndexed { i, tok ->
+            val base = lexicon[tok] ?: return@forEachIndexed
+            val window = tokens.subList(maxOf(0, i - 3), i)
+            var v = base
+            if (window.any { it in negations }) v = -v * 0.7
+            window.firstNotNullOfOrNull { intensifiers[it] }?.let { v *= it }
+            sum += v
+            hits++
+        }
+        if (hits == 0) return 0.0
+        return tanh(sum / sqrt(hits.toDouble()))
+    }
+}
+
+/**
+ * Scoring przez TWÓJ backend (FinBERT / LLM). Nie umieszczaj kluczy do LLM w APK –
+ * aplikacja woła własny serwer, który zwraca {"score": -1..1}. Fallback: silnik regułowy.
+ */
+class RemoteSentimentScorer(
+    private val http: OkHttpClient,
+    private val endpoint: String,
+    private val fallback: SentimentScorer = KeywordSentimentScorer()
+) : SentimentScorer {
+    override suspend fun score(text: String): Double = withContext(Dispatchers.IO) {
+        try {
+            val body = JSONObject().put("text", text).toString()
+                .toRequestBody("application/json".toMediaType())
+            http.newCall(Request.Builder().url(endpoint).post(body).build()).execute().use { r ->
+                if (!r.isSuccessful) error("HTTP ${r.code}")
+                JSONObject(r.body!!.string()).getDouble("score").coerceIn(-1.0, 1.0)
+            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            fallback.score(text)
+        }
+    }
+}
+
+// ───────────────────────────── Kalendarz makro ─────────────────────────────
+
+interface EconomicCalendarSource {
+    suspend fun upcoming(): List<MacroEvent>
+
+    object None : EconomicCalendarSource {
+        override suspend fun upcoming(): List<MacroEvent> = emptyList()
+    }
+}
+
+// ───────────────────────────── Silnik ─────────────────────────────
+
+class MarketNewsEngine(
+    private val scope: CoroutineScope,
+    http: OkHttpClient,
+    private val config: Config = Config(),
+    private val scorer: SentimentScorer = KeywordSentimentScorer(),
+    private val calendar: EconomicCalendarSource = EconomicCalendarSource.None
+) {
+    data class Config(
+        /** Przykład: publiczny strumień transakcji Binance (format {"s","p","T"}). */
+        val tickStreamUrl: String = "wss://stream.binance.com:9443/ws/btcusdt@trade",
+        /** Przykładowe kanały – sprawdź regulaminy źródeł przed użyciem. */
+        val rssFeeds: List<String> = listOf(
+            "https://www.coindesk.com/arc/outboundfeeds/rss/",
+            "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+            "https://feeds.content.dowjones.io/public/rss/mw_topstories"
+        ),
+        val rssPollMs: Long = 60_000,
+        val calendarPollMs: Long = 15 * 60_000,
+        val sentimentHalfLifeMs: Long = 30 * 60_000,
+        val macroBlackoutMs: Long = 15 * 60_000
+    )
+
+    private val http = http
+    // Osobny klient dla WS: brak read-timeoutu (pingi utrzymują połączenie).
+    private val wsClient = http.newBuilder()
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .pingInterval(20, TimeUnit.SECONDS)
+        .build()
+
+    private val _ticks = MutableSharedFlow<Tick>(
+        replay = 1, extraBufferCapacity = 256, onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val ticks: SharedFlow<Tick> = _ticks.asSharedFlow()
+
+    private val _news = MutableSharedFlow<NewsItem>(
+        replay = 20, extraBufferCapacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val news: SharedFlow<NewsItem> = _news.asSharedFlow()
+
+    private val _sentiment = MutableStateFlow(0.0)
+    /** Zagregowany sentyment z wygaszaniem wykładniczym, [-1, 1]. */
+    val sentiment: StateFlow<Double> = _sentiment.asStateFlow()
+
+    private val _connected = MutableStateFlow(false)
+    val connected: StateFlow<Boolean> = _connected.asStateFlow()
+
+    private val _macro = MutableStateFlow<List<MacroEvent>>(emptyList())
+    val macroEvents: StateFlow<List<MacroEvent>> = _macro.asStateFlow()
+
+    private val lock = Mutex()
+    private val seen = object : LinkedHashMap<String, Boolean>(1024, 0.75f, false) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>?) = size > 3000
+    }
+    private val recent = ArrayDeque<Pair<Long, Double>>() // (publishedAt, score)
+    private val jobs = mutableListOf<Job>()
+
+    fun start() {
+        if (jobs.isNotEmpty()) return
+        jobs += scope.launch { runTickLoop() }
+        jobs += scope.launch { runRssLoop() }
+        jobs += scope.launch { runCalendarLoop() }
+        jobs += scope.launch { while (isActive) { recomputeSentiment(); delay(15_000) } }
+    }
+
+    fun stop() {
+        jobs.forEach { it.cancel() }
+        jobs.clear()
+        _connected.value = false
+    }
+
+    /** true, jeśli w oknie ±macroBlackoutMs jest publikacja o wysokim wpływie (NFP, CPI, FOMC…). */
+    fun isInMacroBlackout(now: Long = System.currentTimeMillis()): Boolean =
+        _macro.value.any { it.impact == MacroEvent.Impact.HIGH && abs(it.timeMillis - now) <= config.macroBlackoutMs }
+
+    // ── WebSocket z reconnectem (exponential backoff) ──
+
+    private suspend fun runTickLoop() {
+        var attempt = 0
+        while (currentCoroutineContext().isActive) {
+            try {
+                tickStream(config.tickStreamUrl).collect { tick ->
+                    attempt = 0
+                    _ticks.emit(tick)
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                Log.w(TAG, "WebSocket: ${t.message}")
+            }
+            _connected.value = false
+            delay(min(30_000L, 1_000L shl min(attempt++, 5)))
+        }
+    }
+
+    private fun tickStream(url: String): Flow<Tick> = callbackFlow {
+        val ws = wsClient.newWebSocket(Request.Builder().url(url).build(), object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) { _connected.value = true }
+            override fun onMessage(webSocket: WebSocket, text: String) { parseTick(text)?.let { trySend(it) } }
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { close(t) }
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { close() }
+        })
+        awaitClose { ws.close(1000, "bye") }
+    }.buffer(256, BufferOverflow.DROP_OLDEST)
+
+    private fun parseTick(text: String): Tick? = runCatching {
+        val o = JSONObject(text)
+        Tick(o.getString("s"), o.getString("p").toDouble(), o.optLong("T", System.currentTimeMillis()))
+    }.getOrNull()
+
+    // ── RSS / Atom ──
+
+    private data class RawItem(val id: String, val title: String, val ts: Long)
+
+    private suspend fun runRssLoop() {
+        while (currentCoroutineContext().isActive) {
+            for (url in config.rssFeeds) {
+                val items = try {
+                    fetchFeed(url)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (t: Throwable) {
+                    Log.w(TAG, "RSS $url: ${t.message}"); emptyList()
+                }
+                for (raw in items) {
+                    val isNew = lock.withLock { seen.put(raw.id, true) == null }
+                    if (!isNew) continue
+                    val score = scorer.score(raw.title)
+                    lock.withLock { recent.addLast(raw.ts to score) }
+                    _news.emit(NewsItem(raw.id, raw.title, host(url), raw.ts, score))
+                }
+            }
+            recomputeSentiment()
+            delay(config.rssPollMs)
+        }
+    }
+
+    private suspend fun fetchFeed(url: String): List<RawItem> = withContext(Dispatchers.IO) {
+        val req = Request.Builder().url(url).header("User-Agent", "AlgoHUD/1.0").build()
+        http.newCall(req).execute().use { resp ->
+            if (!resp.isSuccessful) error("HTTP ${resp.code}")
+            val parser = Xml.newPullParser().apply {
+                setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false)
+                setInput(resp.body!!.charStream())
+            }
+            val out = mutableListOf<RawItem>()
+            var inItem = false
+            var title = ""; var link = ""; var guid = ""; var date = ""
+            var event = parser.eventType
+            while (event != XmlPullParser.END_DOCUMENT) {
+                when (event) {
+                    XmlPullParser.START_TAG -> when (parser.name) {
+                        "item", "entry" -> { inItem = true; title = ""; link = ""; guid = ""; date = "" }
+                        "title" -> if (inItem) title = parser.nextText().trim()
+                        "link" -> if (inItem && link.isEmpty()) {
+                            link = parser.getAttributeValue(null, "href") ?: parser.nextText().trim()
+                        }
+                        "guid", "id" -> if (inItem) guid = parser.nextText().trim()
+                        "pubDate", "published", "updated" ->
+                            if (inItem && date.isEmpty()) date = parser.nextText().trim()
+                    }
+                    XmlPullParser.END_TAG -> if (parser.name == "item" || parser.name == "entry") {
+                        inItem = false
+                        if (title.isNotEmpty()) {
+                            out += RawItem(guid.ifEmpty { link.ifEmpty { title } }, title, parseDate(date))
+                        }
+                    }
+                }
+                event = parser.next()
+            }
+            out
+        }
+    }
+
+    private fun parseDate(s: String): Long {
+        if (s.isEmpty()) return System.currentTimeMillis()
+        return runCatching {
+            ZonedDateTime.parse(s, DateTimeFormatter.RFC_1123_DATE_TIME).toInstant().toEpochMilli()
+        }.recoverCatching {
+            OffsetDateTime.parse(s).toInstant().toEpochMilli()
+        }.getOrDefault(System.currentTimeMillis())
+    }
+
+    private fun host(url: String) = runCatching { URI(url).host }.getOrNull() ?: url
+
+    // ── Kalendarz ──
+
+    private suspend fun runCalendarLoop() {
+        while (currentCoroutineContext().isActive) {
+            try {
+                _macro.value = calendar.upcoming()
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                Log.w(TAG, "Kalendarz: ${t.message}")
+            }
+            delay(config.calendarPollMs)
+        }
+    }
+
+    // ── Agregacja sentymentu ──
+
+    private suspend fun recomputeSentiment() {
+        val now = System.currentTimeMillis()
+        val value = lock.withLock {
+            recent.removeAll { now - it.first > MAX_NEWS_AGE_MS }
+            while (recent.size > 500) recent.removeFirst()
+            var num = 0.0
+            var den = 0.0
+            for ((ts, s) in recent) {
+                val age = (now - ts).coerceAtLeast(0L).toDouble()
+                val w = 0.5.pow(age / config.sentimentHalfLifeMs)
+                num += w * s
+                den += w
+            }
+            // +1.0 w mianowniku = neutralny "prior": przy małej liczbie newsów wynik ciąży ku 0.
+            num / (den + 1.0)
+        }
+        _sentiment.value = value.coerceIn(-1.0, 1.0)
+    }
+
+    private companion object {
+        const val TAG = "MarketNewsEngine"
+        const val MAX_NEWS_AGE_MS = 6 * 3_600_000L
+    }
+}
