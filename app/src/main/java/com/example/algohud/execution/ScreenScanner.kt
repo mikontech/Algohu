@@ -36,11 +36,15 @@ object ScreenScanner {
             val n = queue.removeFirst()
             visited++
             if (n.isVisibleToUser) {
-                val t = (n.text ?: n.contentDescription)?.toString()?.trim()
-                if (!t.isNullOrEmpty() && t.length <= 60) {
-                    n.getBoundsInScreen(r)
-                    out += TextNode(t, r.top, r.left)
-                }
+                // Część aplikacji (np. Flutter) łączy kilka napisów w jeden opis z nowymi liniami
+                // ("Sell\n4 104.29") – rozbijamy je na osobne węzły o tych samych współrzędnych.
+                val raw = listOfNotNull(n.text?.toString(), n.contentDescription?.toString())
+                    .distinct()
+                    .flatMap { it.split('\n', ',') }
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() && it.length <= 60 }
+                if (raw.isNotEmpty()) n.getBoundsInScreen(r)
+                raw.forEach { out += TextNode(it, r.top, r.left) }
             }
             for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
         }
@@ -107,8 +111,8 @@ object ScreenScanner {
         fun walk(n: AccessibilityNodeInfo, depth: Int) {
             if (lines >= maxLines) return
             val id = n.viewIdResourceName?.substringAfter(":id/")
-            val t = n.text?.toString()?.replace('\n', ' ')?.take(60)
-            val d = n.contentDescription?.toString()?.replace('\n', ' ')?.take(60)
+            val t = n.text?.toString()?.replace('\n', '|')?.take(160)
+            val d = n.contentDescription?.toString()?.replace('\n', '|')?.take(160)
             if (n.isVisibleToUser && (id != null || t != null || d != null || n.isClickable)) {
                 n.getBoundsInScreen(r)
                 append("  ".repeat(depth.coerceAtMost(12)))

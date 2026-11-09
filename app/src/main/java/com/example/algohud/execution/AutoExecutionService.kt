@@ -360,8 +360,19 @@ class AutoExecutionService : AccessibilityService() {
         }.ifEmpty { null }
     }
 
-    /** Tekstowy zrzut drzewa widoków aktywnej aplikacji – do zbudowania profilu UI. */
-    fun dumpActiveWindow(): String? = rootInActiveWindow?.let { ScreenScanner.dump(it) }
+    /**
+     * Zrzut drzewa widoków aplikacji brokera. Szuka jej okna wśród widocznych okien
+     * (nie tylko aktywnego), a gdy XTB nie jest na ekranie – zwraca null zamiast zrzutu innej aplikacji.
+     */
+    fun dumpTargetWindow(): String? {
+        val roots = buildList {
+            rootInActiveWindow?.let { add(it) }
+            runCatching { windows }.getOrNull()?.forEach { w -> w.root?.let { add(it) } }
+        }
+        val target = roots.firstOrNull { r -> r.packageName?.toString()?.let { targetLabel(it) } != null }
+            ?: return null
+        return ScreenScanner.dump(target)
+    }
 
     suspend fun executeOnScreen(order: OrderRequest, profile: UiTargetProfile): ExecutionResult =
         withContext(Dispatchers.Main.immediate) {

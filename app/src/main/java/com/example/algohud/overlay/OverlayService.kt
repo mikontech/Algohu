@@ -175,7 +175,7 @@ class OverlayService : LifecycleService() {
             setTextColor(0xFFAAAAAA.toInt()); textSize = 11f
             maxLines = 2; maxWidth = dp(260); ellipsize = TextUtils.TruncateAt.END
         }
-        tvScreen = TextView(this).apply { setTextColor(0xFFFFE082.toInt()); textSize = 11f; maxWidth = dp(280) }
+        tvScreen = TextView(this).apply { setTextColor(0xFFFFE082.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 3 }
         // Dotknięcie: DRY_RUN ⇄ CONFIRM. Przytrzymanie: AUTO. Oba wymagają gotowego wykonawcy.
         btnMode = actionButton("Tryb", 0xFF455A64.toInt()) {
             val target = if (engine.mode.value == ExecutionMode.DRY_RUN) ExecutionMode.CONFIRM else ExecutionMode.DRY_RUN
@@ -413,7 +413,7 @@ class OverlayService : LifecycleService() {
 
     private fun dumpScreen() {
         val svc = AutoExecutionService.instance ?: return toast("Najpierw włącz usługę ułatwień dostępu (krok 3)")
-        val text = svc.dumpActiveWindow() ?: return toast("Nie widzę aktywnego okna – otwórz XTB")
+        val text = svc.dumpTargetWindow() ?: return toast("XTB nie jest na ekranie – otwórz w nim instrument i spróbuj ponownie")
         getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Algo HUD dump", text))
         toast("Skopiowano zrzut (${text.lines().size} linii) – wklej go w czacie")
     }
