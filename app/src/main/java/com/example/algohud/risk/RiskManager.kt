@@ -37,7 +37,7 @@ class RiskManager(
         val riskPerTradePct: Double = 0.02,          // 2% kapitału ryzyka na transakcję (do stop-lossa)
         val maxNotionalToEquity: Double = 5.0,       // wartość kontraktu maks. 5× kapitał (dźwignia CFD) – poziom umiarkowany
         /** Ryzyko na transakcję wg poziomu agresji: zredukowany / umiarkowany / agresywny. */
-        val tierRiskPct: List<Double> = listOf(0.01, 0.02, 0.03),
+        val tierRiskPct: List<Double> = listOf(0.005, 0.01, 0.02), // bazowo 1%; ×0,5 zredukowany, ×2 tylko przy udowodnionej przewadze
         /** Maks. dźwignia wg poziomu agresji. */
         val tierLeverage: List<Double> = listOf(3.0, 5.0, 8.0),
         val maxOpenPositions: Int = 1,
@@ -47,7 +47,13 @@ class RiskManager(
         val allowShort: Boolean = true,              // CFD: krótka sprzedaż dozwolona
         val allowPyramiding: Boolean = false,
         val allowedSymbols: Set<String> = emptySet(),   // pusta = każdy symbol
-        val lotStep: Double = 0.001                  // krok wolumenu (XTB: loty)
+        val lotStep: Double = 0.001,                 // krok wolumenu (XTB: loty)
+        /** Godzina rozliczenia swapu (czas lokalny telefonu). Sprawdź w specyfikacji instrumentu w XTB. */
+        val rolloverHour: Int = 23,
+        /** Brak nowych wejść tyle minut przed rozliczeniem swapu (pozycje intraday – bez swapu). */
+        val noEntryBeforeRolloverMin: Int = 60,
+        /** Zamknięcie otwartych pozycji tyle minut przed rozliczeniem swapu. */
+        val closeBeforeRolloverMin: Int = 3
     )
 
     sealed interface Decision {
@@ -107,15 +113,30 @@ class RiskManager(
     private fun riskPct(tier: Int) = config.tierRiskPct.getOrElse(tier) { config.riskPerTradePct }
     private fun leverage(tier: Int) = config.tierLeverage.getOrElse(tier) { config.maxNotionalToEquity }
 
-    fun positionSize(equity: Double, entry: Double, stop: Double, pointValue: Double = 1.0, tier: Int = 1): Double {
-        val dist = abs(entry - stop)
-        if (equity <= 0 || entry <= 0 || pointValue <= 0 || dist < entry * config.minStopDistancePct) return 0.0
-        val byRisk = equity * riskPct(tier) / (dist * pointValue)
-        val byNotional = equity * leverage(tier) / (entry * pointValue)
-        val steps = floor(min(byRisk, byNotional) / config.lotStep + 1e-9).toLong()
-        // BigDecimal: 0.001 × 3 = 0.003 (a nie 0.0030000000000000005)
-        return BigDecimal.valueOf(config.lotStep).multiply(BigDecimal.valueOf(steps)).toDouble()
+    fun sizing(equity: Double, entry: Double, stop: Double, pointValue: Double = 1.0, tier: Int = 1): PositionSizer.Result {
+        if (abs(entry - stop) < entry * config.minStopDistancePct) {
+            return PositionSizer.Result.Rejected("stop za blisko (min. %.2f)".format(entry * config.minStopDistancePct))
+        }
+        return PositionSizer.size(
+            PositionSizer.Input(equity, entry, stop, pointValue, riskPct(tier), leverage(tier), config.lotStep)
+        )
     }
+
+    fun positionSize(equity: Double, entry: Double, stop: Double, pointValue: Double = 1.0, tier: Int = 1): Double =
+        (sizing(equity, entry, stop, pointValue, tier) as? PositionSizer.Result.Ok)?.lots ?: 0.0
+
+    suspend fun sizingFor(entry: Double, stop: Double, pointValue: Double, tier: Int): PositionSizer.Result =
+        mutex.withLock { sizing(equity, entry, stop, pointValue, tier) }
+
+    /** Minuty do najbliższego rozliczenia swapu. */
+    fun minutesToRollover(): Long {
+        val now = Instant.ofEpochMilli(clock()).atZone(zone)
+        var roll = now.withHour(config.rolloverHour).withMinute(0).withSecond(0).withNano(0)
+        if (!roll.isAfter(now)) roll = roll.plusDays(1)
+        return java.time.Duration.between(now, roll).toMinutes()
+    }
+
+    suspend fun hasRealPositions(): Boolean = mutex.withLock { positions.values.any { !it.paper } }
 
     suspend fun sizeFor(entry: Double, stop: Double, pointValue: Double = 1.0, tier: Int = 1): Double =
         mutex.withLock { positionSize(equity, entry, stop, pointValue, tier) }
@@ -149,6 +170,9 @@ class RiskManager(
         if (existing != null && !config.allowPyramiding) return@withLock reject("Pozycja już otwarta")
         if (marketBlackout()) return@withLock reject("Okno publikacji makro (blackout)")
         if (now - lastLossAt < config.cooldownAfterLossMs) return@withLock reject("Cooldown po stratnej transakcji")
+        if (minutesToRollover() < config.noEntryBeforeRolloverMin) {
+            return@withLock reject("Za blisko rozliczenia swapu (polityka intraday)")
+        }
 
         while (orderTimes.isNotEmpty() && now - orderTimes.first() > 60_000) orderTimes.removeFirst()
         if (orderTimes.size >= config.maxOrdersPerMinute) return@withLock reject("Limit zleceń na minutę")

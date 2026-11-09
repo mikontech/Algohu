@@ -320,12 +320,17 @@ class Learner(
     private val shadows = variants.map { v -> v to ShadowTrader("${v.name} • ${tfLabel(v.barMs)}", v.factory(), minStopPct = minStopPct) }
     var champion: ShadowTrader? = null
         private set
-    private var championStats: LearnStats? = null
+    var championStats: LearnStats? = null
+        private set
+    /** Spread (w jednostkach ceny) użyty w nauce – do korekty EV o bieżący spread. */
+    var learnedCost: Double = 0.0
+        private set
     val championBarMs: Long? get() = shadows.firstOrNull { it.second === champion }?.first?.barMs
     private val learned = HashMap<Long, Int>()
 
     /** Nauka na historii danego interwału (sentyment historyczny nieznany = 0). */
     fun backtest(barMs: Long, history: List<Bar>, cost: Double) {
+        learnedCost = cost
         val group = shadows.filter { it.first.barMs == barMs }.map { it.second }
         for (i in history.indices) {
             val window = history.subList(max(0, i - 299), i + 1)
@@ -426,27 +431,31 @@ object Candles {
         bull = b.close > b.open
     )
 
-    /** Formacja na ostatniej świecy: (nazwa, kierunek +1/-1) albo null. */
+    /**
+     * Formacja na ostatniej świecy: (nazwa, kierunek +1/-1) albo null.
+     * Każda formacja przechodzi przez [CandleEvaluator]: korpus < 25% ATR (szum) → brak sygnału.
+     */
     fun pattern(bars: List<Bar>, atr: Double): Pair<String, Int>? {
         if (bars.size < 6 || atr <= 0) return null
         val last = bars.last()
         val prev = bars[bars.size - 2]
-        val s = shape(last)
+        val e = CandleEvaluator.evaluate(last, atr)
+        if (e.impulse == Impulse.NOISE) return null
         val p = shape(prev)
-        if (s.range <= 0) return null
         val fell = bars[bars.size - 6].close > prev.close
         val rose = bars[bars.size - 6].close < prev.close
         val lows = bars.takeLast(4).map { it.low }
         val highs = bars.takeLast(4).map { it.high }
+        val atLeastNormal = e.impulse == Impulse.NORMAL || e.impulse == Impulse.STRONG
         return when {
-            !p.bull && s.bull && last.close >= prev.open && last.open <= prev.close && s.body >= 0.5 * atr -> "objęcie hossy" to 1
-            p.bull && !s.bull && last.close <= prev.open && last.open >= prev.close && s.body >= 0.5 * atr -> "objęcie bessy" to -1
-            s.bull && s.body >= 0.8 * s.range && s.range >= 1.2 * atr -> "marubozu ↑ (silny impet)" to 1
-            !s.bull && s.body >= 0.8 * s.range && s.range >= 1.2 * atr -> "marubozu ↓ (silny impet)" to -1
-            fell && s.lower >= 2 * s.body && s.upper <= 0.25 * s.range && s.range >= 0.6 * atr -> "młot (odrzucenie dołka)" to 1
-            rose && s.upper >= 2 * s.body && s.lower <= 0.25 * s.range && s.range >= 0.6 * atr -> "spadająca gwiazda (odrzucenie szczytu)" to -1
-            lows.zipWithNext().all { (a, b) -> b > a } && last.close > prev.high -> "seria wyższych dołków" to 1
-            highs.zipWithNext().all { (a, b) -> b < a } && last.close < prev.low -> "seria niższych szczytów" to -1
+            !p.bull && e.direction > 0 && last.close >= prev.open && last.open <= prev.close && atLeastNormal -> "objęcie hossy" to 1
+            p.bull && e.direction < 0 && last.close <= prev.open && last.open >= prev.close && atLeastNormal -> "objęcie bessy" to -1
+            e.direction > 0 && e.impulse == Impulse.STRONG && e.rangeToAtr >= 1.2 -> "marubozu ↑ (silny impet)" to 1
+            e.direction < 0 && e.impulse == Impulse.STRONG && e.rangeToAtr >= 1.2 -> "marubozu ↓ (silny impet)" to -1
+            fell && e.rejectsLow -> "młot (absorpcja podaży)" to 1
+            rose && e.rejectsHigh -> "spadająca gwiazda (odrzucenie szczytu)" to -1
+            lows.zipWithNext().all { (a, b) -> b > a } && last.close > prev.high && e.direction > 0 && atLeastNormal -> "seria wyższych dołków" to 1
+            highs.zipWithNext().all { (a, b) -> b < a } && last.close < prev.low && e.direction < 0 && atLeastNormal -> "seria niższych szczytów" to -1
             else -> null
         }
     }
@@ -524,11 +533,10 @@ class PriceActionStrategy(
         if (skip != null) { note = "$name na ${tfLabel(barMs)} pominięte: $skip"; return null }
         note = null
 
-        val s = Candles.shape(last)
+        val ev = CandleEvaluator.evaluate(last, atr)
         val channel = bars.subList(bars.size - 21, bars.size - 1)
         val breaks = if (dir > 0) last.close > channel.maxOf { it.high } else last.close < channel.minOf { it.low }
-        val oppositeWick = if (dir > 0) s.upper else s.lower
-        val strong = s.range >= 1.3 * atr && oppositeWick <= 0.15 * s.range
+        val strong = ev.impulse == Impulse.STRONG
         val avgRange = bars.takeLast(50).map { it.high - it.low }.average()
         val choppy = avgRange > 0 && atr / avgRange > 1.5 && abs(e20 - e50) < 0.3 * atr
         val pullback = abs(last.close - e20) <= 0.5 * atr && ((dir > 0 && e20 > e50) || (dir < 0 && e20 < e50))
@@ -545,7 +553,7 @@ class PriceActionStrategy(
         val why = buildList {
             add(name)
             if (breaks) add("wybicie poziomu 20 świec")
-            if (strong) add("silny impet")
+            add("impuls %s (korpus %.1f×ATR, %.0f%% świecy)".format(ev.impulse.name.lowercase(), ev.bodyToAtr, ev.bodyToRange * 100))
             if (pullback) add("przy EMA20 w trendzie")
             if (choppy) add("chaotyczna zmienność")
         }.joinToString(", ")

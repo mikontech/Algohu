@@ -295,6 +295,16 @@ class BotOrchestrator(
         scope.launch { engine.events.collect { msg(it) } }
         scope.launch { AutoExecutionService.screenQuote.filterNotNull().collect { onScreen(it) } }
         scope.launch { risk.killSwitch.filter { it }.collect { engine.flattenAll(risk.killReason ?: "KILL") } }
+        // Polityka intraday: zamknięcie pozycji tuż przed rozliczeniem swapu (swap nie wchodzi do EV, bo go nie płacimy).
+        scope.launch {
+            while (isActive) {
+                if (risk.minutesToRollover() <= risk.config.closeBeforeRolloverMin && risk.hasRealPositions()) {
+                    msg("🌙 Zamykam pozycje przed rozliczeniem swapu")
+                    for (o in risk.flattenOrders()) engine.submit(o.copy(reason = "ROLLOVER"), bypassConfirmation = true)
+                }
+                delay(30_000)
+            }
+        }
     }
 
     suspend fun manualOrder(side: Side) {
@@ -407,22 +417,41 @@ class BotOrchestrator(
             if (r !is ExecutionResult.Filled && r !is ExecutionResult.Submitted) return
         }
         val entry = px + spreadOf(inst) / 2 * sig.side.sign
-        val order = buildOrder(inst, sig.side, entry, sig.stopPrice, sig.takeProfit, "STRAT ${sig.reason}", pointValue(inst), sig.tier)
+        // 1) Agresja tylko przy udowodnionej przewadze (rolling, po kosztach) tego instrumentu i interwału.
+        val st = learner.championStats
+        val allowed = when {
+            st == null -> Tier.REDUCED
+            st.tStat >= 2.0 && st.avgR >= 0.20 -> Tier.AGGRESSIVE
+            st.tStat >= 1.5 -> Tier.MODERATE
+            else -> Tier.REDUCED
+        }
+        val tier = minOf(sig.tier, allowed)
+        // 2) EV sygnału w R: wynik zwycięzcy (już po spreadzie z nauki) minus dodatkowy koszt bieżącego spreadu.
+        val dist = abs(entry - sig.stopPrice)
+        val spreadNow = spreadOf(inst)
+        val extraCostR = if (dist > 0) maxOf(0.0, spreadNow - learner.learnedCost) / dist else 0.0
+        val spreadR = if (dist > 0) spreadNow / dist else 1.0
+        val ev = (st?.avgR ?: 0.0) - extraCostR
+        if (spreadR > 0.30 || ev <= 0.05) {
+            msg("✋ $inst: EV %+.2fR po spreadzie (spread = %.0f%% ryzyka) – pomijam".format(ev, spreadR * 100))
+            return
+        }
+        val order = buildOrder(inst, sig.side, entry, sig.stopPrice, sig.takeProfit, "STRAT ${sig.reason}", pointValue(inst), tier)
             ?: return
-        decisionCard(inst, order, sig)
+        decisionCard(inst, order, sig.copy(tier = tier), ev)
         engine.submit(order)
     }
 
     /** Decyzja w formacie: kondycja • kierunek • poziom agresji i wielkość • wejście/SL/TP (w cenach XTB). */
-    private fun decisionCard(inst: String, o: OrderRequest, sig: Signal) {
+    private fun decisionCard(inst: String, o: OrderRequest, sig: Signal, ev: Double) {
         val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
         val sh = q?.let { basis(inst, it) } ?: 0.0
         val tf = learners[inst]?.championBarMs ?: Learner.M5
         val cond = aggregators["$inst@$tf"]?.closed()?.let { MarketRead.describe(it) } ?: "?"
         msg(
             "📊 $cond\n➡️ ${if (o.side == Side.BUY) "LONG" else "SHORT"} • ${Tier.name(sig.tier)} " +
-                "(%.0f%% ryzyka, %s lota)\n🎯 E %.2f • SL %.2f • TP %s".format(
-                    risk.tierRiskPct(sig.tier) * 100, BigDecimal.valueOf(o.quantity).toPlainString(),
+                "(%.1f%% ryzyka, %s lota, EV %+.2fR)\n🎯 E %.2f • SL %.2f • TP %s".format(
+                    risk.tierRiskPct(sig.tier) * 100, BigDecimal.valueOf(o.quantity).toPlainString(), ev,
                     o.referencePrice + sh, o.stopPrice + sh, o.takeProfit?.let { "%.2f".format(it + sh) } ?: "trailing"
                 )
         )
@@ -442,15 +471,12 @@ class BotOrchestrator(
             msg("✋ $symbol: stop %.2f od ceny – za blisko (min. %.2f)".format(abs(price - stop), minDist))
             return null
         }
-        val qty = risk.sizeFor(price, stop, pv, tier)
-        if (qty <= 0.0) {
-            val step = risk.config.lotStep
-            msg(
-                "✋ $symbol: najmniejsza pozycja (%s) = ryzyko %.2f, limit %.2f (%s)".format(
-                    BigDecimal.valueOf(step).toPlainString(), risk.riskOf(step, price, stop, pv), risk.maxTradeRisk(tier), Tier.name(tier)
-                )
-            )
-            return null
+        val qty = when (val r = risk.sizingFor(price, stop, pv, tier)) {
+            is com.example.algohud.risk.PositionSizer.Result.Ok -> r.lots
+            is com.example.algohud.risk.PositionSizer.Result.Rejected -> {
+                msg("✋ $symbol (${Tier.name(tier)}): ${r.reason}")
+                return null
+            }
         }
         return OrderRequest(symbol, side, qty, price, stop, reason, pointValue = pv, takeProfit = takeProfit, tier = tier)
     }
