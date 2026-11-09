@@ -44,6 +44,8 @@ interface OrderExecutor {
     suspend fun cancelAll()
     /** null = gotowy do prawdziwych zleceń, w przeciwnym razie powód blokady. */
     fun readiness(): String? = null
+    /** Dodatkowy warunek dla trybu AUTO. */
+    fun autoReadiness(): String? = readiness()
 }
 
 private fun formatQty(q: Double): String = BigDecimal.valueOf(q).stripTrailingZeros().toPlainString()
@@ -76,12 +78,18 @@ class ExecutionEngine(
      * Zmienia tryb. CONFIRM i AUTO wymagają gotowego wykonawcy (API z kluczem albo prawdziwy profil UI).
      * @return null przy sukcesie, w przeciwnym razie powód blokady.
      */
-    fun setMode(target: ExecutionMode): String? {
-        if (target != ExecutionMode.DRY_RUN) {
-            executor.readiness()?.let { reason ->
-                log("🔒 $target zablokowany: $reason")
-                return reason
-            }
+    suspend fun setMode(target: ExecutionMode): String? {
+        val blocked = when (target) {
+            ExecutionMode.DRY_RUN -> null
+            ExecutionMode.CONFIRM -> executor.readiness()
+            ExecutionMode.AUTO -> executor.autoReadiness()
+        }
+        if (blocked != null) {
+            log("🔒 $target zablokowany: $blocked")
+            return blocked
+        }
+        if (_mode.value == ExecutionMode.DRY_RUN && target != ExecutionMode.DRY_RUN) {
+            risk.clearPaperPositions() // pozycje papierowe nie istnieją u brokera
         }
         _mode.value = target
         log("Tryb: $target")
@@ -124,11 +132,11 @@ class ExecutionEngine(
 
     private suspend fun execute(order: OrderRequest): ExecutionResult {
         if (_mode.value == ExecutionMode.DRY_RUN) {
-            risk.onFill(order, order.referencePrice, order.quantity)
+            risk.onFill(order, order.referencePrice, order.quantity, paper = true)
             log("🧪 PAPER ${order.side} ${formatQty(order.quantity)} ${order.symbol} @ %.2f".format(order.referencePrice))
             return ExecutionResult.Filled("PAPER-${order.clientOrderId}", order.referencePrice, order.quantity)
         }
-        executor.readiness()?.let { reason ->
+        (if (_mode.value == ExecutionMode.AUTO) executor.autoReadiness() else executor.readiness())?.let { reason ->
             _mode.value = ExecutionMode.DRY_RUN
             log("🔒 Wykonawca niegotowy ($reason) – powrót do DRY_RUN")
             return ExecutionResult.Rejected(reason)
@@ -145,7 +153,9 @@ class ExecutionEngine(
                 risk.onFill(order, order.referencePrice, order.quantity)
                 log("⚠️ ${result.note}")
             }
-            is ExecutionResult.Rejected -> log("❌ Odrzucone przez wykonawcę: ${result.reason}")
+            is ExecutionResult.Rejected ->
+                if (order.reduceOnly) log("🚨 ${order.reason} ${order.symbol}: ${result.reason}")
+                else log("❌ Odrzucone przez wykonawcę: ${result.reason}")
             is ExecutionResult.Failed -> {
                 log("💥 ${result.error.message}")
                 risk.engageKillSwitch("Błąd wykonania: ${result.error.message}")
@@ -248,15 +258,19 @@ data class UiTargetProfile(
     val confirmButton: NodeSelector? = null,
     val priceLabel: NodeSelector? = null,
     /** Odrzuć, jeśli cena na ekranie odbiega od feedu bardziej niż o ten procent. */
-    val maxPriceDriftPct: Double = 0.005
+    val maxPriceDriftPct: Double = 0.005,
+    /** false = przycisk przeciwny otwiera nową pozycję (XTB), więc zamykanie robi człowiek. */
+    val canClosePositions: Boolean = true,
+    /** Przed kliknięciem sprawdź, czy na ekranie jest instrument ze zlecenia. */
+    val verifyInstrument: Boolean = false,
+    val allowAuto: Boolean = true
 )
 
 object UiProfiles {
     /**
-     * XTB – identyfikatory z prawdziwego zrzutu. CELOWO NIEAKTYWNY, dopóki:
-     *  1) wielkość pozycji nie jest liczona w LOTACH (XTB GOLD: 1 lot = 100 uncji, RiskManager liczy w jednostkach),
-     *  2) nie poznamy dialogu potwierdzenia po "Buy"/"Sell",
-     *  3) całość nie przejdzie testów na koncie DEMO.
+     * XTB – identyfikatory z prawdziwego zrzutu. Wielkość pozycji w lotach liczona z "Wartości kontraktu".
+     * Tylko CONFIRM: AUTO zablokowane, dopóki nie sprawdzimy, jak XTB reaguje na kliknięcie.
+     * Zamykanie pozycji – ręcznie w XTB (Sell przy pozycji Buy otwiera NOWĄ pozycję).
      */
     val XTB = UiTargetProfile(
         packageName = ScreenScanner.XTB_PACKAGE,
@@ -264,7 +278,10 @@ object UiProfiles {
         sellButton = NodeSelector(viewId = "TradingSellButton"),
         quantityField = NodeSelector(viewId = "StepperTextField"),
         confirmButton = null,
-        priceLabel = null
+        priceLabel = null,
+        canClosePositions = false,
+        verifyInstrument = true,
+        allowAuto = false
     )
 
     /**
@@ -289,6 +306,9 @@ class AccessibilityExecutor(private val profileProvider: () -> UiTargetProfile?)
         else -> null
     }
 
+    override fun autoReadiness(): String? = readiness()
+        ?: if (profileProvider()?.allowAuto == false) "AUTO wyłączone dla tej aplikacji do czasu testów" else null
+
     override suspend fun submit(order: OrderRequest): ExecutionResult {
         val svc = AutoExecutionService.instance
             ?: return ExecutionResult.Rejected("Usługa ułatwień dostępu jest wyłączona")
@@ -308,6 +328,9 @@ class AutoExecutionService : AccessibilityService() {
         @Volatile var activeProfile: UiTargetProfile? = null
         /** Aplikacje, których ekran HUD odczytuje (dopasowanie po nazwie widocznej w launcherze). */
         @Volatile var targetAppLabels: Set<String> = setOf("XTB")
+        /** Ostatnio widziane "Dostępne środki" w aplikacji brokera. */
+        @Volatile var lastAccountFunds: Double? = null
+        @Volatile var lastAccountCurrency: String? = null
 
         private val _screenQuote = MutableStateFlow<ScreenQuote?>(null)
         /** Instrument i ceny widoczne aktualnie w aplikacji brokera. */
@@ -366,7 +389,10 @@ class AutoExecutionService : AccessibilityService() {
                 ScreenScanner.scan(root, pkg, label, ts)
             }
         }.getOrNull()
-        if (quote != null) _screenQuote.value = quote
+        if (quote != null) {
+            _screenQuote.value = quote
+            quote.availableFunds?.let { lastAccountFunds = it; lastAccountCurrency = quote.accountCurrency }
+        }
         (profilePrice ?: quote?.mid)?.let { _screenPrice.value = it }
     }
 
@@ -412,6 +438,15 @@ class AutoExecutionService : AccessibilityService() {
         val root = rootInActiveWindow ?: return ExecutionResult.Rejected("Brak dostępu do aktywnego okna")
         val pkg = root.packageName?.toString()
         if (pkg != p.packageName) return ExecutionResult.Rejected("Na ekranie jest $pkg zamiast ${p.packageName}")
+        if (order.reduceOnly && !p.canClosePositions) {
+            return ExecutionResult.Rejected("ZAMKNIJ POZYCJĘ RĘCZNIE w aplikacji brokera (tu przycisk przeciwny otwiera nową pozycję)")
+        }
+        if (p.verifyInstrument) {
+            val q = screenQuote.value
+            if (q == null || !q.isFresh() || q.instrument != order.symbol) {
+                return ExecutionResult.Rejected("Na ekranie jest ${q?.instrument ?: "?"}, a zlecenie dotyczy ${order.symbol}")
+            }
+        }
 
         screenPrice.value?.let { sp ->
             val drift = abs(sp - order.referencePrice) / order.referencePrice
@@ -428,7 +463,12 @@ class AutoExecutionService : AccessibilityService() {
             if (!field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
                 return ExecutionResult.Rejected("Nie udało się wpisać ilości")
             }
-            delay(200)
+            delay(250)
+            // Sprawdź, czy aplikacja przyjęła wolumen – inaczej NIE klikamy.
+            val typed = awaitNode(sel, 1_000)?.text?.toString()?.let { ScreenScanner.parseNumber(it) }
+            if (typed == null || abs(typed - order.quantity) > 1e-9 + order.quantity * 1e-6) {
+                return ExecutionResult.Rejected("Aplikacja nie przyjęła wolumenu (jest $typed, miało być ${formatQty(order.quantity)})")
+            }
         }
 
         val btnSel = if (order.side == Side.BUY) p.buyButton else p.sellButton
@@ -443,7 +483,7 @@ class AutoExecutionService : AccessibilityService() {
                 return ExecutionResult.Failed(IllegalStateException("Nie kliknięto potwierdzenia – stan NIEZNANY"))
             }
         }
-        return ExecutionResult.Submitted("Kliknięto ${order.side} ${formatQty(order.quantity)} w ${p.packageName} – zweryfikuj w aplikacji")
+        return ExecutionResult.Submitted("Kliknięto ${order.side} ${formatQty(order.quantity)} ${order.symbol} – sprawdź w aplikacji i ustaw tam SL")
     }
 
     private suspend fun awaitNode(sel: NodeSelector, timeoutMs: Long): AccessibilityNodeInfo? =

@@ -104,23 +104,57 @@ object ScreenScanner {
 
     const val XTB_PACKAGE = "com.xtb.xmobile2"
 
+    private val XTB_IDS = setOf(
+        "ElementTitleHorizontalText", "ButtonTradeBottomText", "TradingSellButton", "TradingBuyButton",
+        "AvailableFundsValue", "ValueTextText", "StepperTextField", "TicketDetailsRowDoubleSecondValue"
+    )
+    private val currencyRe = Regex("\\b[A-Z]{3}\\b")
+
+    private class Hit(val node: AccessibilityNodeInfo, val rect: Rect) {
+        val text: String? get() = node.text?.toString()
+    }
+
+    /** Jedno przejście po drzewie: wszystkie widoczne węzły o podanych ID (z położeniem). */
+    private fun index(root: AccessibilityNodeInfo, ids: Set<String>, limit: Int = 3000): Map<String, List<Hit>> {
+        val out = HashMap<String, MutableList<Hit>>()
+        val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+        var visited = 0
+        while (queue.isNotEmpty() && visited < limit) {
+            val n = queue.removeFirst()
+            visited++
+            val short = n.viewIdResourceName?.substringAfter(":id/")?.substringAfterLast('/')
+            if (short != null && short in ids && n.isVisibleToUser) {
+                out.getOrPut(short) { mutableListOf() } += Hit(n, Rect().also { n.getBoundsInScreen(it) })
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+        return out
+    }
+
     /** null = to nie jest ekran instrumentu (brak tytułu). */
     fun scanXtb(root: AccessibilityNodeInfo, pkg: String, label: String, now: Long): ScreenQuote? {
-        val title = findById(root, "ElementTitleHorizontalText").firstOrNull()?.text?.toString() ?: return null
+        val idx = index(root, XTB_IDS)
+        val title = idx["ElementTitleHorizontalText"]?.firstOrNull()?.text ?: return null
         // "GOLD Rynek otwarty" → "GOLD"
         val instrument = title.trim().split(Regex("\\s+")).firstOrNull()?.takeIf { it.isNotBlank() } ?: return null
-        val prices = findById(root, "ButtonTradeBottomText")
-        // Cena jest rodzeństwem przycisku, nie dzieckiem – dopasowujemy po położeniu wewnątrz przycisku.
-        fun priceInside(buttonId: String): Double? {
-            val btn = findById(root, buttonId).firstOrNull() ?: return null
-            val area = Rect().also { btn.getBoundsInScreen(it) }
-            val r = Rect()
-            return prices.firstOrNull { p ->
-                p.getBoundsInScreen(r)
-                area.contains(r.centerX(), r.centerY())
-            }?.text?.toString()?.let(::parseNumber)
+        // W XTB wartości są rodzeństwem kontenera, nie dziećmi – dopasowanie po położeniu.
+        fun inside(containerId: String, childId: String): String? {
+            val c = idx[containerId]?.firstOrNull() ?: return null
+            return idx[childId]?.firstOrNull { c.rect.contains(it.rect.centerX(), it.rect.centerY()) }?.text
         }
-        return ScreenQuote(pkg, label, instrument, priceInside("TradingSellButton"), priceInside("TradingBuyButton"), now)
+        val fundsText = inside("AvailableFundsValue", "ValueTextText")
+        return ScreenQuote(
+            packageName = pkg,
+            appLabel = label,
+            instrument = instrument,
+            bid = inside("TradingSellButton", "ButtonTradeBottomText")?.let { parseNumber(it) },
+            ask = inside("TradingBuyButton", "ButtonTradeBottomText")?.let { parseNumber(it) },
+            timestamp = now,
+            availableFunds = fundsText?.let { parseNumber(it) },
+            accountCurrency = fundsText?.let { currencyRe.find(it)?.value },
+            volume = idx["StepperTextField"]?.firstOrNull()?.text?.let { parseNumber(it) },
+            contractValueAcct = inside("TicketDetailsRowDoubleSecondValue", "ValueTextText")?.let { parseNumber(it) }
+        )
     }
 
     /** Dopasowanie ID niezależne od prefiksu pakietu ("x" albo "pkg:id/x"). */

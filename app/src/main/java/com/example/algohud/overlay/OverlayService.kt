@@ -143,7 +143,7 @@ class OverlayService : LifecycleService() {
         )
 
         // Wariant B (UI): wymaga włączonej usługi ułatwień dostępu i poprawnego profilu.
-        AutoExecutionService.activeProfile = UiProfiles.EXAMPLE_BROKER
+        AutoExecutionService.activeProfile = UiProfiles.XTB
         val executor: OrderExecutor = AccessibilityExecutor { AutoExecutionService.activeProfile }
         // Wariant A (API) – preferowany, gdy broker ma API:
         // val executor = BinanceSpotExecutor(http, apiKey, apiSecret, risk.config.allowedSymbols)
@@ -155,7 +155,14 @@ class OverlayService : LifecycleService() {
             news = news,
             risk = risk,
             engine = engine,
-            equityProvider = { 10_000.0 } // TODO: saldo z API brokera
+            equityProvider = {
+                val funds = AutoExecutionService.lastAccountFunds
+                when {
+                    funds != null -> funds to "XTB:${AutoExecutionService.lastAccountCurrency ?: "?"}"
+                    engine.mode.value == ExecutionMode.DRY_RUN -> 10_000.0 to "PAPER" // bez XTB: konto papierowe
+                    else -> null
+                }
+            }
         )
         bot.start()
     }
@@ -178,12 +185,23 @@ class OverlayService : LifecycleService() {
         tvScreen = TextView(this).apply { setTextColor(0xFFFFE082.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 3 }
         // Dotknięcie: DRY_RUN ⇄ CONFIRM. Przytrzymanie: AUTO. Oba wymagają gotowego wykonawcy.
         btnMode = actionButton("Tryb", 0xFF455A64.toInt()) {
-            val target = if (engine.mode.value == ExecutionMode.DRY_RUN) ExecutionMode.CONFIRM else ExecutionMode.DRY_RUN
-            engine.setMode(target)?.let { toast("🔒 $target zablokowany: $it") }
+            botScope.launch {
+                val target = if (engine.mode.value == ExecutionMode.DRY_RUN) ExecutionMode.CONFIRM else ExecutionMode.DRY_RUN
+                val blocked = engine.setMode(target)
+                toast(
+                    when {
+                        blocked != null -> "🔒 $target zablokowany: $blocked"
+                        target == ExecutionMode.CONFIRM -> "⚠️ CONFIRM: zlecenia trafią do XTB po Twoim potwierdzeniu"
+                        else -> "DRY_RUN: handel papierowy"
+                    }
+                )
+            }
         }.apply {
             setOnLongClickListener {
-                val blocked = engine.setMode(ExecutionMode.AUTO)
-                toast(if (blocked != null) "🔒 AUTO zablokowane: $blocked" else "⚠️ AUTO włączone – bot sam składa zlecenia")
+                botScope.launch {
+                    val blocked = engine.setMode(ExecutionMode.AUTO)
+                    toast(if (blocked != null) "🔒 AUTO zablokowane: $blocked" else "⚠️ AUTO włączone – bot sam składa zlecenia")
+                }
                 true
             }
         }
@@ -218,6 +236,12 @@ class OverlayService : LifecycleService() {
         val toolsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(actionButton("📋 Zrzut ekranu", 0xFF5D4037.toInt()) { dumpScreen() })
+            addView(actionButton("✔ Zamknąłem w XTB", 0xFF37474F.toInt(), longPress = true) {
+                botScope.launch {
+                    val n = risk.markClosedManually()
+                    toast(if (n > 0) "Zaksięgowano zamknięcie $n poz." else "Brak otwartych pozycji w księdze bota")
+                }
+            })
         }
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL

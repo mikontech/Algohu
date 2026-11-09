@@ -16,6 +16,7 @@ import java.time.ZoneId
 import kotlin.math.abs
 import kotlin.math.floor
 import kotlin.math.min
+import java.math.BigDecimal
 
 /**
  * Bezpiecznik. KAŻDE zlecenie (bot, ręczne, stop) przechodzi przez evaluate().
@@ -30,17 +31,17 @@ class RiskManager(
     private val zone: ZoneId = ZoneId.systemDefault()
 ) {
     data class Config(
-        val maxDailyLossPct: Double = 0.02,          // twardy limit dziennej straty: 2% kapitału z początku dnia
-        val riskPerTradePct: Double = 0.005,         // 0,5% kapitału ryzyka na transakcję (do stop-lossa)
-        val maxPositionNotionalPct: Double = 0.25,   // maks. 25% kapitału w jednej pozycji
+        val maxDailyLossPct: Double = 0.05,          // twardy limit dziennej straty: 5% kapitału z początku dnia
+        val riskPerTradePct: Double = 0.02,          // 2% kapitału ryzyka na transakcję (do stop-lossa)
+        val maxNotionalToEquity: Double = 5.0,       // wartość kontraktu maks. 5× kapitał (dźwignia CFD)
         val maxOpenPositions: Int = 1,
         val maxOrdersPerMinute: Int = 3,
         val minStopDistancePct: Double = 0.002,      // stop bliżej niż 0,2% = szum, odrzucamy
         val cooldownAfterLossMs: Long = 10 * 60_000L,
-        val allowShort: Boolean = false,             // spot: sprzedaż tylko do zamknięcia pozycji
+        val allowShort: Boolean = true,              // CFD: krótka sprzedaż dozwolona
         val allowPyramiding: Boolean = false,
         val allowedSymbols: Set<String> = emptySet(),   // pusta = każdy symbol
-        val lotStep: Double = 0.00001
+        val lotStep: Double = 0.001                  // krok wolumenu (XTB: loty)
     )
 
     sealed interface Decision {
@@ -73,26 +74,42 @@ class RiskManager(
 
     // ── Kapitał i wielkość pozycji ──
 
-    suspend fun updateEquity(value: Double) = mutex.withLock {
+    /** @param source np. "XTB:PLN" albo "PAPER" – zmiana źródła = nowy punkt odniesienia dla limitu dziennego. */
+    suspend fun updateEquity(value: Double, source: String) = mutex.withLock {
         equity = value
         rolloverLocked()
+        if (source != equitySource) {
+            equitySource = source
+            dayStartEquity = value
+            prefs.edit().putString(K_SOURCE, source).apply()
+            persistLocked()
+        }
         if (dayStartEquity <= 0.0 && value > 0.0) { dayStartEquity = value; persistLocked() }
         recomputePnlLocked()
     }
+
+    private var equitySource: String? = prefs.getString(K_SOURCE, null)
+
+    fun riskOf(qty: Double, entry: Double, stop: Double, pointValue: Double) = abs(entry - stop) * qty * pointValue
+
+    suspend fun maxTradeRisk(): Double = mutex.withLock { equity * config.riskPerTradePct }
 
     /**
      * Fixed-fractional: qty = (kapitał × ryzyko%) / |wejście − stop|,
      * przycięte limitem ekspozycji i zaokrąglone W DÓŁ do kroku lota.
      */
-    fun positionSize(equity: Double, entry: Double, stop: Double): Double {
+    fun positionSize(equity: Double, entry: Double, stop: Double, pointValue: Double = 1.0): Double {
         val dist = abs(entry - stop)
-        if (equity <= 0 || entry <= 0 || dist < entry * config.minStopDistancePct) return 0.0
-        val byRisk = equity * config.riskPerTradePct / dist
-        val byNotional = equity * config.maxPositionNotionalPct / entry
-        return floor(min(byRisk, byNotional) / config.lotStep) * config.lotStep
+        if (equity <= 0 || entry <= 0 || pointValue <= 0 || dist < entry * config.minStopDistancePct) return 0.0
+        val byRisk = equity * config.riskPerTradePct / (dist * pointValue)
+        val byNotional = equity * config.maxNotionalToEquity / (entry * pointValue)
+        val steps = floor(min(byRisk, byNotional) / config.lotStep + 1e-9).toLong()
+        // BigDecimal: 0.001 × 3 = 0.003 (a nie 0.0030000000000000005)
+        return BigDecimal.valueOf(config.lotStep).multiply(BigDecimal.valueOf(steps)).toDouble()
     }
 
-    suspend fun sizeFor(entry: Double, stop: Double): Double = mutex.withLock { positionSize(equity, entry, stop) }
+    suspend fun sizeFor(entry: Double, stop: Double, pointValue: Double = 1.0): Double =
+        mutex.withLock { positionSize(equity, entry, stop, pointValue) }
 
     // ── Bramka zleceń ──
 
@@ -131,13 +148,13 @@ class RiskManager(
         val dist = abs(ref - order.stopPrice)
         if (dist < ref * config.minStopDistancePct) return@withLock reject("Stop-loss zbyt blisko ceny")
 
-        val tradeRisk = dist * order.quantity
+        val tradeRisk = dist * order.quantity * order.pointValue
         val maxTradeRisk = equity * config.riskPerTradePct
         if (tradeRisk > maxTradeRisk * 1.05) {
             return@withLock reject("Ryzyko %.2f > limit %.2f".format(tradeRisk, maxTradeRisk))
         }
-        if (order.quantity * ref > equity * config.maxPositionNotionalPct * 1.01) {
-            return@withLock reject("Zbyt duża ekspozycja")
+        if (order.quantity * ref * order.pointValue > equity * config.maxNotionalToEquity * 1.01) {
+            return@withLock reject("Zbyt duża ekspozycja (dźwignia > %.0f×)".format(config.maxNotionalToEquity))
         }
         val dailyLimit = dayStartEquity * config.maxDailyLossPct
         val currentLoss = (-_dailyPnl.value).coerceAtLeast(0.0)
@@ -151,12 +168,12 @@ class RiskManager(
 
     // ── Księgowanie ──
 
-    suspend fun onFill(order: OrderRequest, price: Double, qty: Double) = mutex.withLock {
+    suspend fun onFill(order: OrderRequest, price: Double, qty: Double, paper: Boolean = false) = mutex.withLock {
         val existing = positions[order.symbol]
         when {
             existing != null && existing.side != order.side -> {
                 val closedQty = min(qty, existing.quantity)
-                val pnl = (price - existing.entryPrice) * closedQty * existing.side.sign
+                val pnl = (price - existing.entryPrice) * closedQty * existing.side.sign * existing.pointValue
                 realizedToday += pnl
                 if (pnl < 0) lastLossAt = clock()
                 val remaining = existing.quantity - closedQty
@@ -174,7 +191,8 @@ class RiskManager(
                     entryPrice = (existing.entryPrice * existing.quantity + price * qty) / newQty
                 )
             }
-            else -> positions[order.symbol] = Position(order.symbol, order.side, qty, price, order.stopPrice)
+            else -> positions[order.symbol] =
+                Position(order.symbol, order.side, qty, price, order.stopPrice, order.pointValue, paper)
         }
         recomputePnlLocked()
         persistLocked()
@@ -191,20 +209,45 @@ class RiskManager(
         val hit = if (p.side == Side.BUY) price <= p.stopPrice else price >= p.stopPrice
         if (!hit || symbol in pendingStops) return@withLock null
         pendingStops += symbol
-        OrderRequest(symbol, p.side.opposite(), p.quantity, price, stopPrice = price, reason = "SOFT-STOP")
+        OrderRequest(symbol, p.side.opposite(), p.quantity, price, stopPrice = price, reason = "SOFT-STOP",
+            pointValue = p.pointValue, reduceOnly = true)
     }
 
     suspend fun closingOrder(symbol: String, side: Side, price: Double): OrderRequest? = mutex.withLock {
         val p = positions[symbol] ?: return@withLock null
         if (p.side == side) null
-        else OrderRequest(symbol, side, p.quantity, price, stopPrice = price, reason = "CLOSE")
+        else OrderRequest(symbol, side, p.quantity, price, stopPrice = price, reason = "CLOSE",
+            pointValue = p.pointValue, reduceOnly = true)
     }
 
     suspend fun flattenOrders(): List<OrderRequest> = mutex.withLock {
         positions.values.map { p ->
             val px = marks[p.symbol] ?: p.entryPrice
-            OrderRequest(p.symbol, p.side.opposite(), p.quantity, px, stopPrice = px, reason = "FLATTEN")
+            OrderRequest(p.symbol, p.side.opposite(), p.quantity, px, stopPrice = px, reason = "FLATTEN",
+                pointValue = p.pointValue, reduceOnly = true)
         }
+    }
+
+    /** Usuwa pozycje papierowe (przy przejściu z DRY_RUN na prawdziwe zlecenia). */
+    suspend fun clearPaperPositions() = mutex.withLock {
+        positions.values.removeAll { it.paper }
+        recomputePnlLocked()
+    }
+
+    /** Użytkownik zamknął pozycje ręcznie u brokera – księgujemy wynik po bieżącej cenie i czyścimy. */
+    suspend fun markClosedManually(): Int = mutex.withLock {
+        val real = positions.values.filter { !it.paper }
+        for (p in real) {
+            val px = marks[p.symbol] ?: p.entryPrice
+            val pnl = (px - p.entryPrice) * p.quantity * p.side.sign * p.pointValue
+            realizedToday += pnl
+            if (pnl < 0) lastLossAt = clock()
+            positions.remove(p.symbol)
+            pendingStops.remove(p.symbol)
+        }
+        recomputePnlLocked()
+        persistLocked()
+        real.size
     }
 
     // ── Kill-switch ──
@@ -238,7 +281,7 @@ class RiskManager(
     private fun recomputePnlLocked() {
         val unrealized = positions.values.sumOf { p ->
             val m = marks[p.symbol] ?: p.entryPrice
-            (m - p.entryPrice) * p.quantity * p.side.sign
+            (m - p.entryPrice) * p.quantity * p.side.sign * p.pointValue
         }
         _dailyPnl.value = realizedToday + unrealized
         if (dayStartEquity > 0 && !_killSwitch.value &&
@@ -271,5 +314,6 @@ class RiskManager(
         private const val K_DAY = "day"
         private const val K_DAY_EQUITY = "day_equity"
         private const val K_REALIZED = "realized"
+        private const val K_SOURCE = "equity_source"
     }
 }

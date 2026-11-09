@@ -37,6 +37,10 @@ data class OrderRequest(
     val referencePrice: Double,
     val stopPrice: Double,
     val reason: String,
+    /** Zmiana wartości (w walucie konta) przy ruchu ceny o 1,0 dla ilości 1 (dla CFD: 1 lot). */
+    val pointValue: Double = 1.0,
+    /** Zlecenie zamykające – nie może otworzyć nowej pozycji. */
+    val reduceOnly: Boolean = false,
     val clientOrderId: String = "hud" + UUID.randomUUID().toString().replace("-", "").take(16)
 )
 
@@ -54,7 +58,10 @@ data class Position(
     val side: Side,
     val quantity: Double,
     val entryPrice: Double,
-    val stopPrice: Double
+    val stopPrice: Double,
+    val pointValue: Double = 1.0,
+    /** Pozycja papierowa (DRY_RUN) – nie istnieje u brokera. */
+    val paper: Boolean = false
 )
 
 /** Co jest teraz widoczne w aplikacji brokera (odczytane przez AccessibilityService). */
@@ -64,10 +71,24 @@ data class ScreenQuote(
     val instrument: String?,
     val bid: Double?,
     val ask: Double?,
-    val timestamp: Long
+    val timestamp: Long,
+    val availableFunds: Double? = null,
+    val accountCurrency: String? = null,
+    val volume: Double? = null,
+    /** "Wartość kontraktu" w walucie konta dla wolumenu z pola [volume]. */
+    val contractValueAcct: Double? = null
 ) {
     val mid: Double?
         get() = if (bid != null && ask != null) (bid + ask) / 2 else bid ?: ask
+
+    /** Ile (w walucie konta) zmienia się wartość 1 lota przy ruchu ceny o 1,0. */
+    val pointValuePerLot: Double?
+        get() {
+            val v = volume ?: return null
+            val c = contractValueAcct ?: return null
+            val m = mid ?: return null
+            return if (v > 0 && m > 0) c / v / m else null
+        }
 
     fun isFresh(now: Long = System.currentTimeMillis(), maxAgeMs: Long = 5_000) = now - timestamp <= maxAgeMs
 }
