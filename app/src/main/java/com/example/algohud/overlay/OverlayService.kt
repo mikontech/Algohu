@@ -377,6 +377,16 @@ class OverlayService : LifecycleService() {
         panel.visibility = if (expanded) View.VISIBLE else View.GONE
     }
 
+    /** W trybie AUTO okno HUD trzyma ekran włączony (tylko gdy HUD jest widoczny; nie wymaga uprawnień). */
+    private fun setKeepScreenOn(on: Boolean) {
+        val root = rootView ?: return
+        val has = params.flags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON != 0
+        if (has == on) return
+        params.flags = if (on) params.flags or WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+        else params.flags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON.inv()
+        wm.updateViewLayout(root, params)
+    }
+
     /** Na czas gestu wykonawcy HUD znika i przepuszcza dotyk, żeby nie zasłonić przycisku brokera. */
     private fun setPassThrough(on: Boolean) {
         val root = rootView ?: return
@@ -433,6 +443,7 @@ class OverlayService : LifecycleService() {
         tvStatus.text = "${s.symbol} • ${if (s.feedConnected) "● LIVE" else "○ offline"} • PnL dnia: %+.2f"
             .format(s.dailyPnl)
         tvMessage.text = s.lastMessage
+        setKeepScreenOn(s.mode == ExecutionMode.AUTO && !s.killSwitch)
         tvStats.text = listOf(s.learning, s.paperStats).filter { it.isNotBlank() }.joinToString("\n")
         btnMode.text = "Tryb: ${s.mode.name}"
 
