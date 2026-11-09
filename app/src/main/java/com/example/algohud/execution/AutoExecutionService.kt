@@ -562,14 +562,38 @@ class AutoExecutionService : AccessibilityService() {
         val close = rootInActiveWindow?.let { ScreenScanner.findById(it, "CloseVolumeButton").firstOrNull() }
             ?: return ExecutionResult.Rejected("brak przycisku Zamknij pozycję")
         if (!click(close)) return ExecutionResult.Rejected("nie udało się dotknąć Zamknij pozycję")
-        delay(1_500)
-        // Jeśli ekran pozycji nadal jest widoczny, XTB pokazało coś jeszcze (np. wybór wolumenu) – nie zgadujemy.
-        val stillThere = rootInActiveWindow?.let { ScreenScanner.findById(it, "CloseVolumeButton").isNotEmpty() } ?: true
-        return if (stillThere) {
-            ExecutionResult.Rejected("XTB pokazało dodatkowe okno – dokończ zamknięcie ręcznie i wyślij mi 📋 zrzut tego okna")
-        } else {
-            ExecutionResult.Submitted("Zamknięto pozycję $instrument w XTB – sprawdź listę pozycji")
+
+        // XTB otwiera arkusz "Zamknij pozycję" z wolumenem i drugim przyciskiem (CloseButton).
+        val sheetBtn = awaitById("CloseButton", 3_000)
+            ?: return ExecutionResult.Failed(IllegalStateException("po 'Zamknij pozycję' nie pojawił się arkusz – sprawdź pozycję w XTB"))
+        val root = rootInActiveWindow ?: return ExecutionResult.Failed(IllegalStateException("brak okna arkusza"))
+        val title = ScreenScanner.findById(root, "BottomSheetHeaderTitle").firstOrNull()?.text?.toString()
+        if (title?.contains("Zamknij", ignoreCase = true) != true) {
+            return ExecutionResult.Failed(IllegalStateException("nieoczekiwany arkusz: ${title ?: "?"} – dokończ ręcznie"))
         }
+        // Zamykamy CAŁY wolumen: "Pozostały wolumen" musi wynosić 0.
+        val remaining = valueInside(root, "RemainingVolumeValue")?.let { ScreenScanner.parseNumber(it) ?: if (it.trim() == "0") 0.0 else null }
+        if (remaining == null || remaining > 1e-9) {
+            return ExecutionResult.Failed(IllegalStateException("arkusz zamyka tylko część pozycji (pozostało $remaining) – dokończ ręcznie"))
+        }
+        if (!click(sheetBtn)) return ExecutionResult.Failed(IllegalStateException("nie udało się potwierdzić zamknięcia w arkuszu"))
+
+        // Sukces dopiero, gdy arkusz zniknie.
+        val gone = withTimeoutOrNull(5_000) {
+            while (rootInActiveWindow?.let { ScreenScanner.findById(it, "CloseButton").isNotEmpty() } != false) delay(200)
+            true
+        } ?: false
+        return if (gone) ExecutionResult.Submitted("Zamknięto pozycję $instrument w XTB")
+        else ExecutionResult.Failed(IllegalStateException("arkusz zamknięcia nadal otwarty – sprawdź XTB"))
+    }
+
+    private fun valueInside(root: AccessibilityNodeInfo, containerId: String): String? {
+        val area = ScreenScanner.findById(root, containerId).firstOrNull()?.let { n -> Rect().also { n.getBoundsInScreen(it) } }
+            ?: return null
+        val r = Rect()
+        return ScreenScanner.findById(root, "ValueTextText").firstOrNull { n ->
+            n.getBoundsInScreen(r); area.contains(r.centerX(), r.centerY())
+        }?.text?.toString()
     }
 
     /** Włącza (jeśli trzeba) sekcję SL/TP, wpisuje cenę i sprawdza, czy XTB ją przyjęło. null = OK. */
