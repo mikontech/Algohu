@@ -36,6 +36,7 @@ import com.example.algohud.core.HudState
 import com.example.algohud.core.Side
 import com.example.algohud.data.KeywordSentimentScorer
 import com.example.algohud.data.MarketNewsEngine
+import com.example.algohud.data.PythFeed
 import com.example.algohud.execution.AccessibilityExecutor
 import com.example.algohud.execution.AutoExecutionService
 import com.example.algohud.execution.ExecutionEngine
@@ -174,6 +175,7 @@ class OverlayService : LifecycleService() {
             engine = engine,
             journal = journal,
             prefs = getSharedPreferences("instruments", MODE_PRIVATE),
+            pyth = PythFeed(botScope, http),
             equityProvider = {
                 val funds = AutoExecutionService.lastAccountFunds
                 when {

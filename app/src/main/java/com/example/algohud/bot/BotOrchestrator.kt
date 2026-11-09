@@ -10,6 +10,7 @@ import com.example.algohud.core.ScreenQuote
 import com.example.algohud.core.Side
 import com.example.algohud.core.Tick
 import com.example.algohud.data.MarketNewsEngine
+import com.example.algohud.data.PythFeed
 import com.example.algohud.execution.AutoExecutionService
 import com.example.algohud.execution.ExecutionEngine
 import com.example.algohud.risk.RiskManager
@@ -101,6 +102,7 @@ class BotOrchestrator(
     private val engine: ExecutionEngine,
     private val journal: TradeJournal,
     private val prefs: SharedPreferences,
+    private val pyth: PythFeed,
     /** (kapitał, źródło) – np. (631.27, "XTB:PLN"); null = brak danych. */
     private val equityProvider: suspend () -> Pair<Double, String>?,
     private val manualStopPct: Double = 0.005,
@@ -142,6 +144,23 @@ class BotOrchestrator(
                     }
             }
         }
+        // Towary z Pyth (ropa, kawa, kakao…): dynamiczne wyszukanie feedu, historia do nauki, ceny co 2 s.
+        pyth.start(PYTH_FEEDS.map { (inst, q) -> PythFeed.Spec(inst, q) }) { r ->
+            for (tf in Learner.TIMEFRAMES) {
+                runCatching { pyth.history(r, (tf / 60_000).toInt(), 1000) }
+                    .onSuccess { h ->
+                        lock.withLock {
+                            agg(r.instrument, tf).seed(h)
+                            learner(r.instrument).backtest(tf, h, spreadOf(r.instrument))
+                        }
+                    }
+                    .onFailure { msg("Historia ${r.instrument} (${tfLabel(tf)}): ${it.message}") }
+            }
+            updateLearningHud()
+        }
+        scope.launch { pyth.ticks.collect { t -> lock.withLock { processPrice(t.symbol, t.price, t.timestamp) } } }
+        scope.launch { pyth.status.collect { updateLearningHud() } }
+
         scope.launch {
             while (isActive) {
                 runCatching { equityProvider()?.let { (eq, src) -> risk.updateEquity(eq, src) } }
@@ -216,7 +235,7 @@ class BotOrchestrator(
     private fun basis(inst: String, q: ScreenQuote): Double {
         val mid = q.mid ?: return 0.0
         val (px, ts) = lastPx[inst] ?: return 0.0
-        if (inst !in FEEDS || System.currentTimeMillis() - ts > 30_000) return 0.0
+        if (!hasBackground(inst) || System.currentTimeMillis() - ts > 30_000) return 0.0
         return mid - px
     }
 
@@ -241,7 +260,7 @@ class BotOrchestrator(
         q.pointValuePerLot?.let { rememberPointValue(inst, it) }
         if (q.bid != null && q.ask != null && q.ask >= q.bid) rememberSpread(inst, q.ask - q.bid)
         // Instrumenty bez feedu w tle – liczone z ekranu XTB (tylko gdy jest widoczny).
-        if (inst !in FEEDS) q.mid?.let { px -> lock.withLock { processPrice(inst, px, q.timestamp) } }
+        if (!hasBackground(inst)) q.mid?.let { px -> lock.withLock { processPrice(inst, px, q.timestamp) } }
     }
 
     // ───────────── Rdzeń: wyjścia, świece, sygnały ─────────────
@@ -302,11 +321,13 @@ class BotOrchestrator(
         else o.copy(referencePrice = o.referencePrice + spreadOf(inst) / 2 * o.side.sign)
 
     private fun refPrice(inst: String, side: Side): Double? {
-        if (inst !in FEEDS) return null
+        if (!hasBackground(inst)) return null
         val (px, ts) = lastPx[inst] ?: return null
         if (System.currentTimeMillis() - ts > 30_000) return null
         return px + spreadOf(inst) / 2 * side.sign
     }
+
+    private fun hasBackground(inst: String) = inst in FEEDS || pyth.resolvedFor(inst) != null
 
     private fun agg(inst: String, tf: Long) = aggregators.getOrPut("$inst@$tf") { BarAggregator(tf) }
     private fun learner(inst: String) = learners.getOrPut(inst) { Learner(inst, Learner.defaultVariants()) }
@@ -319,9 +340,11 @@ class BotOrchestrator(
             // Nie pokazuj wyników innego instrumentu (wcześniej zostawała linijka GOLD).
             _hud.update {
                 it.copy(
-                    learning = "🧠 $inst: brak danych" +
-                        if (inst in FEEDS) " – wczytuję historię…"
-                        else " – brak cen w tle; uczę się tylko, gdy $inst jest otwarty w XTB (potrzeba ~50 świec)"
+                    learning = "🧠 $inst: " + when {
+                        hasBackground(inst) -> "wczytuję historię…"
+                        inst in PYTH_FEEDS -> "${pyth.status.value[inst] ?: "szukam źródła cen…"}; uczę się tylko, gdy $inst jest otwarty w XTB"
+                        else -> "brak cen w tle; uczę się tylko, gdy $inst jest otwarty w XTB (potrzeba ~50 świec)"
+                    }
                 )
             }
             return
@@ -358,6 +381,15 @@ class BotOrchestrator(
         val FEEDS = mapOf("GOLD" to "PAXGUSDT", "BITCOIN" to "BTCUSDT", "ETHEREUM" to "ETHUSDT")
         val FEED_TO_INSTRUMENT = FEEDS.entries.associate { (k, v) -> v to k }
 
+        /** Instrument XTB → fraza symbolu w Pyth (darmowy Hermes). OIL w XTB = Brent, OIL.WTI = WTI. */
+        val PYTH_FEEDS = mapOf(
+            "OIL" to "UKOILSPOT",
+            "OIL.WTI" to "USOILSPOT",
+            "SILVER" to "XAG/USD",
+            "COFFEE" to "COFFEE",
+            "COCOA" to "COCOA"
+        )
+
         /** Słowa w nagłówkach newsów powiązane z instrumentem (EN + PL). */
         val ALIASES = mapOf(
             "BITCOIN" to listOf("bitcoin", "btc", "crypto", "kryptowalut"),
@@ -365,6 +397,8 @@ class BotOrchestrator(
             "GOLD" to listOf("gold", "złoto", "zloto", "bullion"),
             "SILVER" to listOf("silver", "srebro"),
             "OIL" to listOf("oil", "crude", "brent", "wti", "opec", "ropa"),
+            "COFFEE" to listOf("coffee", "arabica", "robusta", "kawa", "kawy"),
+            "COCOA" to listOf("cocoa", "kakao", "chocolate"),
             "NATGAS" to listOf("natural gas", "lng", "gaz"),
             "US500" to listOf("s&p", "wall street", "stocks", "equities"),
             "US100" to listOf("nasdaq", "big tech"),
