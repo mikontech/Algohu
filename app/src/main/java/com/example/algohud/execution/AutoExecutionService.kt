@@ -253,6 +253,21 @@ data class UiTargetProfile(
 
 object UiProfiles {
     /**
+     * XTB – identyfikatory z prawdziwego zrzutu. CELOWO NIEAKTYWNY, dopóki:
+     *  1) wielkość pozycji nie jest liczona w LOTACH (XTB GOLD: 1 lot = 100 uncji, RiskManager liczy w jednostkach),
+     *  2) nie poznamy dialogu potwierdzenia po "Buy"/"Sell",
+     *  3) całość nie przejdzie testów na koncie DEMO.
+     */
+    val XTB = UiTargetProfile(
+        packageName = ScreenScanner.XTB_PACKAGE,
+        buyButton = NodeSelector(viewId = "TradingBuyButton"),
+        sellButton = NodeSelector(viewId = "TradingSellButton"),
+        quantityField = NodeSelector(viewId = "StepperTextField"),
+        confirmButton = null,
+        priceLabel = null
+    )
+
+    /**
      * PRZYKŁAD z wymyślonymi ID. Prawdziwe odczytasz poleceniem
      * `adb shell uiautomator dump` lub w Layout Inspectorze, z otwartą aplikacją brokera.
      * Aplikacje w Compose/Flutter często nie mają resource-id – wtedy selektor po tekście/opisie.
@@ -342,7 +357,15 @@ class AutoExecutionService : AccessibilityService() {
 
         val profile = activeProfile?.takeIf { it.packageName == pkg }
         val profilePrice = profile?.priceLabel?.let { sel -> find(root, sel)?.text?.toString()?.let(::parsePrice) }
-        val quote = runCatching { ScreenScanner.scan(root, pkg, label, System.currentTimeMillis()) }.getOrNull()
+        val ts = System.currentTimeMillis()
+        val quote = runCatching {
+            if (pkg == ScreenScanner.XTB_PACKAGE) {
+                // XTB: odczyt po identyfikatorach; poza ekranem instrumentu brak instrumentu – bez zgadywania.
+                ScreenScanner.scanXtb(root, pkg, label, ts) ?: ScreenQuote(pkg, label, null, null, null, ts)
+            } else {
+                ScreenScanner.scan(root, pkg, label, ts)
+            }
+        }.getOrNull()
         if (quote != null) _screenQuote.value = quote
         (profilePrice ?: quote?.mid)?.let { _screenPrice.value = it }
     }
@@ -435,7 +458,8 @@ class AutoExecutionService : AccessibilityService() {
 
     private fun find(root: AccessibilityNodeInfo, sel: NodeSelector): AccessibilityNodeInfo? {
         sel.viewId?.let { id ->
-            root.findAccessibilityNodeInfosByViewId(id).firstOrNull { it.isVisibleToUser }?.let { return it }
+            val byId = if (':' in id) root.findAccessibilityNodeInfosByViewId(id) else ScreenScanner.findById(root, id)
+            byId.firstOrNull { it.isVisibleToUser }?.let { return it }
         }
         sel.text?.let { t ->
             root.findAccessibilityNodeInfosByText(t).firstOrNull {

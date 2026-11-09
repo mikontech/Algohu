@@ -348,8 +348,8 @@ class OverlayService : LifecycleService() {
             else -> "$arrow %+.2f".format(s.sentiment) + (s.lastPrice?.let { "  %.2f".format(it) } ?: "")
         }
         tvScreen.text = when {
-            q == null -> "XTB: niewidoczne – otwórz instrument w XTB"
-            q.instrument == null -> "${q.appLabel}: nie rozpoznano instrumentu"
+            q == null -> "XTB: niewidoczne"
+            q.instrument == null -> "${q.appLabel}: otwórz ekran instrumentu"
             else -> buildString {
                 append(q.appLabel).append(": ").append(q.instrument)
                 q.bid?.let { append("  S ").append(fmtPrice(it)) }

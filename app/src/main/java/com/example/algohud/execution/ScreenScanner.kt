@@ -74,7 +74,9 @@ object ScreenScanner {
     }
 
     private fun normalizeInstrument(text: String): String? {
-        val t = text.replace("/", "").replace(" ", "")
+        // "GOLD Rynek otwarty" → "GOLD"; "EUR/USD" → "EURUSD"
+        val first = text.trim().split(Regex("\\s+")).firstOrNull() ?: return null
+        val t = first.replace("/", "")
         if (t.length !in 3..14) return null
         if (t != t.uppercase()) return null          // tickery w XTB są pisane wielkimi literami
         if (!instrumentRe.matches(t) || t in uiWords) return null
@@ -89,11 +91,55 @@ object ScreenScanner {
             val neighbours = ((i - 3)..(i + 3)).filter { it != i && it in nodes.indices }
                 .sortedBy { abs(it - i) }
             for (j in neighbours) {
-                if (abs(nodes[j].top - n.top) > 250) continue
-                parseNumber(nodes[j].text)?.let { return it }
+                val m = nodes[j]
+                // tylko ta sama kolumna i pod napisem – żeby nie złapać np. "Dostępne środki" nad przyciskiem
+                if (m.top < n.top - 10 || m.top - n.top > 250 || abs(m.left - n.left) > 250) continue
+                parseNumber(m.text)?.let { return it }
             }
         }
         return null
+    }
+
+    // ───────── Profil XTB (com.xtb.xmobile2) – identyfikatory z rzeczywistego zrzutu ekranu ─────────
+
+    const val XTB_PACKAGE = "com.xtb.xmobile2"
+
+    /** null = to nie jest ekran instrumentu (brak tytułu). */
+    fun scanXtb(root: AccessibilityNodeInfo, pkg: String, label: String, now: Long): ScreenQuote? {
+        val title = findById(root, "ElementTitleHorizontalText").firstOrNull()?.text?.toString() ?: return null
+        // "GOLD Rynek otwarty" → "GOLD"
+        val instrument = title.trim().split(Regex("\\s+")).firstOrNull()?.takeIf { it.isNotBlank() } ?: return null
+        val prices = findById(root, "ButtonTradeBottomText")
+        // Cena jest rodzeństwem przycisku, nie dzieckiem – dopasowujemy po położeniu wewnątrz przycisku.
+        fun priceInside(buttonId: String): Double? {
+            val btn = findById(root, buttonId).firstOrNull() ?: return null
+            val area = Rect().also { btn.getBoundsInScreen(it) }
+            val r = Rect()
+            return prices.firstOrNull { p ->
+                p.getBoundsInScreen(r)
+                area.contains(r.centerX(), r.centerY())
+            }?.text?.toString()?.let(::parseNumber)
+        }
+        return ScreenQuote(pkg, label, instrument, priceInside("TradingSellButton"), priceInside("TradingBuyButton"), now)
+    }
+
+    /** Dopasowanie ID niezależne od prefiksu pakietu ("x" albo "pkg:id/x"). */
+    fun idMatches(n: AccessibilityNodeInfo, id: String): Boolean {
+        val v = n.viewIdResourceName ?: return false
+        return v == id || v.endsWith(":id/$id") || v.endsWith("/$id")
+    }
+
+    fun findById(root: AccessibilityNodeInfo, id: String, limit: Int = 3000): List<AccessibilityNodeInfo> {
+        val out = ArrayList<AccessibilityNodeInfo>()
+        val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+        var visited = 0
+        while (queue.isNotEmpty() && visited < limit) {
+            val n = queue.removeFirst()
+            visited++
+            if (n.isVisibleToUser && idMatches(n, id)) out += n
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+        return out
     }
 
     fun parseNumber(text: String): Double? {
