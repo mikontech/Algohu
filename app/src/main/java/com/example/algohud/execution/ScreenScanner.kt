@@ -163,14 +163,14 @@ object ScreenScanner {
         return v == id || v.endsWith(":id/$id") || v.endsWith("/$id")
     }
 
-    fun findById(root: AccessibilityNodeInfo, id: String, limit: Int = 3000): List<AccessibilityNodeInfo> {
+    fun findById(root: AccessibilityNodeInfo, id: String, limit: Int = 3000, visibleOnly: Boolean = true): List<AccessibilityNodeInfo> {
         val out = ArrayList<AccessibilityNodeInfo>()
         val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
         var visited = 0
         while (queue.isNotEmpty() && visited < limit) {
             val n = queue.removeFirst()
             visited++
-            if (n.isVisibleToUser && idMatches(n, id)) out += n
+            if ((!visibleOnly || n.isVisibleToUser) && idMatches(n, id)) out += n
             for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
         }
         return out

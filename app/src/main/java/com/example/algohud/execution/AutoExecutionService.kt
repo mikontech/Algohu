@@ -277,9 +277,9 @@ data class UiTargetProfile(
 
 object UiProfiles {
     /**
-     * XTB – identyfikatory z prawdziwego zrzutu. Wielkość pozycji w lotach liczona z "Wartości kontraktu".
-     * Tylko CONFIRM: AUTO zablokowane, dopóki nie sprawdzimy, jak XTB reaguje na kliknięcie.
-     * Zamykanie pozycji – ręcznie w XTB (Sell przy pozycji Buy otwiera NOWĄ pozycję).
+     * XTB – identyfikatory z prawdziwych zrzutów. Wejście: wolumen + SL + TP w bilecie, potem Buy/Sell.
+     * Zamknięcie: Otwarte pozycje → PositionRow0 → Zamknij pozycję (Sell przy Buy otwiera NOWĄ pozycję!).
+     * AUTO dodatkowo wymaga dodatniego wyniku papierowego (bramka w ExecutionEngine).
      */
     val XTB = UiTargetProfile(
         packageName = ScreenScanner.XTB_PACKAGE,
@@ -291,7 +291,7 @@ object UiProfiles {
         maxPriceDriftPct = 0.02, // ceny w tle z PAXG różnią się lekko od XTB
         canClosePositions = false,
         verifyInstrument = true,
-        allowAuto = false
+        allowAuto = true
     )
 
     /**
@@ -450,10 +450,11 @@ class AutoExecutionService : AccessibilityService() {
         if (pkg != p.packageName) return ExecutionResult.Rejected("Na ekranie jest $pkg zamiast ${p.packageName}")
         if (order.reduceOnly && !p.canClosePositions) {
             // Przycisk przeciwny otworzyłby NOWĄ pozycję. Zamykamy przez ekran pozycji, jeśli jest otwarty.
-            if (pkg == ScreenScanner.XTB_PACKAGE && positionScreenProblem(root, order.symbol) == null) {
+            if (pkg == ScreenScanner.XTB_PACKAGE) {
+                openPositionScreen(order.symbol)?.let { return ExecutionResult.Rejected("ZAMKNIJ ${order.symbol}: $it") }
                 return doClosePosition(order.symbol)
             }
-            return ExecutionResult.Rejected("ZAMKNIJ POZYCJĘ ${order.symbol} w XTB – otwórz jej ekran, a bot zamknie ją sam, albo zamknij ręcznie")
+            return ExecutionResult.Rejected("ZAMKNIJ POZYCJĘ ${order.symbol} ręcznie w aplikacji brokera")
         }
         if (p.verifyInstrument) {
             val q = screenQuote.value
@@ -461,6 +462,8 @@ class AutoExecutionService : AccessibilityService() {
                 return ExecutionResult.Rejected("Na ekranie jest ${q?.instrument ?: "?"}, a zlecenie dotyczy ${order.symbol}")
             }
         }
+
+        if (pkg == ScreenScanner.XTB_PACKAGE) return performXtbEntry(order)
 
         screenPrice.value?.let { sp ->
             val drift = abs(sp - order.referencePrice) / order.referencePrice
@@ -541,7 +544,7 @@ class AutoExecutionService : AccessibilityService() {
     }
 
     private suspend fun doSetProtection(instrument: String, sl: Double?, tp: Double?): ExecutionResult {
-        positionScreenProblem(rootInActiveWindow, instrument)?.let { return ExecutionResult.Rejected(it) }
+        openPositionScreen(instrument)?.let { return ExecutionResult.Rejected(it) }
         tp?.let { price -> setPriceIn("TakeProfitInput", "TakeProfitToggle", price)?.let { return ExecutionResult.Rejected("TP: $it") } }
         sl?.let { price -> setPriceIn("StopLossInput", "StopLossToggle", price)?.let { return ExecutionResult.Rejected("SL: $it") } }
         val modify = rootInActiveWindow?.let { ScreenScanner.findById(it, "ModifyPositionButton").firstOrNull() }
@@ -555,7 +558,7 @@ class AutoExecutionService : AccessibilityService() {
     }
 
     private suspend fun doClosePosition(instrument: String): ExecutionResult {
-        positionScreenProblem(rootInActiveWindow, instrument)?.let { return ExecutionResult.Rejected(it) }
+        openPositionScreen(instrument)?.let { return ExecutionResult.Rejected(it) }
         val close = rootInActiveWindow?.let { ScreenScanner.findById(it, "CloseVolumeButton").firstOrNull() }
             ?: return ExecutionResult.Rejected("brak przycisku Zamknij pozycję")
         if (!click(close)) return ExecutionResult.Rejected("nie udało się dotknąć Zamknij pozycję")
@@ -571,6 +574,7 @@ class AutoExecutionService : AccessibilityService() {
 
     /** Włącza (jeśli trzeba) sekcję SL/TP, wpisuje cenę i sprawdza, czy XTB ją przyjęło. null = OK. */
     private suspend fun setPriceIn(containerId: String, toggleId: String, price: Double): String? {
+        revealById(containerId) ?: return "nie znaleziono sekcji"
         var field = fieldIn(containerId)
         if (field == null) {
             val root = rootInActiveWindow ?: return "brak okna"
@@ -603,6 +607,122 @@ class AutoExecutionService : AccessibilityService() {
         return ScreenScanner.findById(root, "StepperTextField").firstOrNull { n ->
             n.getBoundsInScreen(r); area.contains(r.centerX(), r.centerY())
         }
+    }
+
+
+    // ───────────── Nawigacja po XTB: przewijanie, wejście w pozycję, bilet z SL/TP ─────────────
+
+    /** Największy przewijalny element ekranu. */
+    private fun findScrollable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+        var best: AccessibilityNodeInfo? = null
+        var bestArea = 0
+        val r = Rect()
+        var visited = 0
+        while (queue.isNotEmpty() && visited < 3000) {
+            val n = queue.removeFirst()
+            visited++
+            if (n.isScrollable) {
+                n.getBoundsInScreen(r)
+                val area = r.width() * r.height()
+                if (area > bestArea) { best = n; bestArea = area }
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+        return best
+    }
+
+    /** Doprowadza element o danym ID na ekran (SHOW_ON_SCREEN albo przewijanie). */
+    private suspend fun revealById(id: String): AccessibilityNodeInfo? {
+        val plan = listOf(0, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1) // 0 = sprawdź, 1 = w dół, -1 = w górę
+        for (step in plan) {
+            val root = rootInActiveWindow ?: return null
+            ScreenScanner.findById(root, id).firstOrNull()?.let { return it }
+            val hidden = ScreenScanner.findById(root, id, visibleOnly = false).firstOrNull()
+            if (hidden != null &&
+                hidden.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id)
+            ) {
+                delay(400)
+                ScreenScanner.findById(rootInActiveWindow ?: return null, id).firstOrNull()?.let { return it }
+            }
+            if (step == 0) continue
+            val scroller = findScrollable(root) ?: return null
+            scroller.performAction(
+                if (step > 0) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+            )
+            delay(450)
+        }
+        return null
+    }
+
+    private suspend fun awaitById(id: String, timeoutMs: Long): AccessibilityNodeInfo? = withTimeoutOrNull(timeoutMs) {
+        var found: AccessibilityNodeInfo? = null
+        while (found == null) {
+            found = rootInActiveWindow?.let { ScreenScanner.findById(it, id).firstOrNull() }
+            if (found == null) delay(150)
+        }
+        found
+    }
+
+    private fun xtbTitle(root: AccessibilityNodeInfo?): String? =
+        root?.let { ScreenScanner.findById(it, "ElementTitleHorizontalText").firstOrNull() }
+            ?.text?.toString()?.trim()?.substringBefore(' ')
+
+    /** Z ekranu instrumentu wchodzi w (jedyną) otwartą pozycję. null = jesteśmy na ekranie pozycji. */
+    private suspend fun openPositionScreen(instrument: String): String? {
+        val root = rootInActiveWindow ?: return "brak dostępu do okna"
+        if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) return "XTB nie jest na ekranie"
+        if (xtbTitle(root) != instrument) return "otwórz w XTB instrument $instrument"
+        if (ScreenScanner.findById(root, "ModifyPositionButton").isNotEmpty()) return null
+        if (ScreenScanner.findById(root, "PositionRow1", visibleOnly = false).isNotEmpty()) {
+            return "masz kilka pozycji $instrument – bot nie wie, którą wybrać; zamknij ręcznie"
+        }
+        val row = revealById("PositionRow0") ?: return "nie znaleziono otwartej pozycji $instrument w XTB"
+        if (!click(row)) return "nie udało się otworzyć pozycji"
+        awaitById("ModifyPositionButton", 3_000) ?: return "ekran pozycji się nie otworzył"
+        return null
+    }
+
+    /**
+     * Wejście w XTB: wolumen → Stop Loss → Take Profit (w bilecie, PRZED kliknięciem) → Buy/Sell.
+     * Bez poprawnie ustawionego SL zlecenie NIE jest wysyłane.
+     */
+    private suspend fun performXtbEntry(order: OrderRequest): ExecutionResult {
+        val q = screenQuote.value
+        val sidePx = q?.let { if (order.side == Side.BUY) it.ask else it.bid }
+            ?: return ExecutionResult.Rejected("brak ceny Buy/Sell na ekranie XTB")
+        // Ceny bota mogą pochodzić z feedu w tle (PAXG) – przesuwamy SL/TP o różnicę do ceny XTB.
+        val shift = sidePx - order.referencePrice
+        val sl = order.stopPrice + shift
+        val tp = order.takeProfit?.plus(shift)
+
+        revealById("MarketSizeInput") ?: return ExecutionResult.Rejected("nie znaleziono pola wolumenu")
+        val vol = fieldIn("MarketSizeInput") ?: return ExecutionResult.Rejected("nie znaleziono pola wolumenu")
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, formatQty(order.quantity))
+        }
+        if (!vol.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return ExecutionResult.Rejected("nie udało się wpisać wolumenu")
+        delay(300)
+        val typed = fieldIn("MarketSizeInput")?.text?.toString()?.let { ScreenScanner.parseNumber(it) }
+        if (typed == null || abs(typed - order.quantity) > 1e-9 + order.quantity * 1e-6) {
+            return ExecutionResult.Rejected("XTB nie przyjęło wolumenu (jest $typed, miało być ${formatQty(order.quantity)})")
+        }
+
+        revealById("StopLossContainer") ?: return ExecutionResult.Rejected("nie znaleziono Stop Loss w bilecie")
+        setPriceIn("StopLossContainer", "StopLossToggle", sl)?.let { return ExecutionResult.Rejected("SL: $it – nie otwieram bez stopu") }
+        if (tp != null) {
+            revealById("TakeProfitContainer") ?: return ExecutionResult.Rejected("nie znaleziono Take Profit w bilecie")
+            setPriceIn("TakeProfitContainer", "TakeProfitToggle", tp)?.let { return ExecutionResult.Rejected("TP: $it") }
+        }
+
+        val btn = revealById(if (order.side == Side.BUY) "TradingBuyButton" else "TradingSellButton")
+            ?: return ExecutionResult.Rejected("nie znaleziono przycisku ${order.side}")
+        if (!click(btn)) return ExecutionResult.Rejected("kliknięcie ${order.side} nie powiodło się")
+        delay(1_500)
+        return ExecutionResult.Submitted(
+            "XTB: ${order.side} ${formatQty(order.quantity)} ${order.symbol}, SL %.2f".format(sl) +
+                (tp?.let { ", TP %.2f".format(it) } ?: "") + " – sprawdź pozycję"
+        )
     }
 
     private suspend fun awaitNode(sel: NodeSelector, timeoutMs: Long): AccessibilityNodeInfo? =
