@@ -51,7 +51,7 @@ class RiskManager(
         /** Godzina rozliczenia swapu (czas lokalny telefonu). Sprawdź w specyfikacji instrumentu w XTB. */
         val rolloverHour: Int = 23,
         /** Brak nowych wejść tyle minut przed rozliczeniem swapu (pozycje intraday – bez swapu). */
-        val noEntryBeforeRolloverMin: Int = 60,
+        val noEntryBeforeRolloverMin: Int = 15,
         /** Zamknięcie otwartych pozycji tyle minut przed rozliczeniem swapu. */
         val closeBeforeRolloverMin: Int = 3
     )

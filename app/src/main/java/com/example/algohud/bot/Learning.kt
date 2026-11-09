@@ -404,7 +404,9 @@ class Learner(
                 Variant("Cofnięcie w trendzie", tf) { PullbackStrategy(barMs = tf) },
                 Variant("Zawężenie→wybicie", tf) { SqueezeStrategy(barMs = tf) },
                 Variant("Price action", tf) { PriceActionStrategy(withTrend = false, barMs = tf) },
-                Variant("Price action z trendem", tf) { PriceActionStrategy(withTrend = true, barMs = tf) }
+                Variant("Price action z trendem", tf) { PriceActionStrategy(withTrend = true, barMs = tf) },
+                Variant("Impuls 2×ATR", tf) { MomentumBurstStrategy(minRangeAtr = 2.0, barMs = tf) },
+                Variant("Impuls 3×ATR", tf) { MomentumBurstStrategy(minRangeAtr = 3.0, barMs = tf) }
             )
         }
     }
@@ -571,5 +573,48 @@ class PriceActionStrategy(
         val atr = Indicators.atr(bars) ?: return null
         return "ODCZEKAJ – czekam na formację (objęcie, młot/gwiazda, marubozu, wyższe dołki/niższe szczyty); " +
             "ostatnia świeca: ${Candles.describeLast(bars, atr)}"
+    }
+}
+
+/**
+ * "Impuls": pojedyncza świeca o sile ≥ [minRangeAtr]×ATR z pełnym korpusem (Impulse.STRONG) – wejście w jej kierunku
+ * NIEZALEŻNIE od trendu i RSI (gonienie momentum). Stop w połowie świecy impulsu, TP = [rewardR]×ryzyko.
+ * Turniej sprawdzi, czy takie wejścia na danym instrumencie się opłacają.
+ */
+class MomentumBurstStrategy(
+    private val minRangeAtr: Double = 2.0,
+    private val rewardR: Double = 2.0,
+    private val newsVeto: Double = 0.5,
+    private val cooldownBars: Int = 3,
+    private val barMs: Long = 5 * 60_000L
+) : Strategy {
+    private var lastSignalBar = 0L
+
+    override fun onBar(bars: List<Bar>, sentiment: Double): Signal? {
+        if (bars.size < 30) return null
+        val last = bars.last()
+        if (last.start - lastSignalBar < cooldownBars * barMs) return null
+        val atr = Indicators.atr(bars.dropLast(1))?.takeIf { it > 0 } ?: return null // ATR sprzed impulsu
+        val ev = CandleEvaluator.evaluate(last, atr)
+        if (ev.impulse != Impulse.STRONG || ev.rangeToAtr < minRangeAtr) return null
+        val dir = ev.direction
+        if (dir > 0 && sentiment <= -newsVeto || dir < 0 && sentiment >= newsVeto) return null
+        val entry = last.close
+        val stop = (last.high + last.low) / 2 // połowa świecy impulsu – głębsze cofnięcie = impuls się nie udał
+        val risk = abs(entry - stop)
+        if (risk <= 0) return null
+        lastSignalBar = last.start
+        return Signal(
+            side = if (dir > 0) Side.BUY else Side.SELL,
+            stopPrice = stop,
+            takeProfit = entry + dir * rewardR * risk,
+            reason = "impuls %.1f×ATR (korpus %.0f%% świecy)".format(ev.rangeToAtr, ev.bodyToRange * 100),
+            tier = Tier.AGGRESSIVE
+        )
+    }
+
+    override fun describeWait(bars: List<Bar>): String? {
+        val atr = Indicators.atr(bars)?.takeIf { it > 0 } ?: return null
+        return "czekam na świecę-impuls ≥ %.1f×ATR (zasięg ≥ %.2f) z pełnym korpusem".format(minRangeAtr, minRangeAtr * atr)
     }
 }
