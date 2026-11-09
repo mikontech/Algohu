@@ -130,24 +130,39 @@ class PythFeed(
 
     /** Historia świec z Pyth Benchmarks. @param resolutionMin 1 albo 5. */
     suspend fun history(r: Resolved, resolutionMin: Int, bars: Int): List<Bar> = withContext(Dispatchers.IO) {
-        val to = System.currentTimeMillis() / 1000
-        // Rynki towarowe mają przerwy – bierzemy szersze okno, a potem ostatnie [bars] świec.
-        val from = to - resolutionMin * 60L * bars * 3
+        // Partiami wstecz (po ~2000 świec), bo rynki towarowe mają przerwy i API może ograniczać zakres.
+        val out = ArrayList<Bar>()
+        var to = System.currentTimeMillis() / 1000
+        val chunk = resolutionMin * 60L * 2000
+        var emptyInRow = 0
+        repeat(25) {
+            if (out.size >= bars || emptyInRow >= 3) return@repeat
+            val part = runCatching { historyChunk(r, resolutionMin, to - chunk, to) }.getOrElse { e ->
+                if (out.isEmpty()) throw e else emptyList()
+            }
+            if (part.isEmpty()) emptyInRow++ else { emptyInRow = 0; out.addAll(0, part) }
+            to -= chunk
+        }
+        out.distinctBy { it.start }.sortedBy { it.start }.dropLast(1).takeLast(bars)
+    }
+
+    private fun historyChunk(r: Resolved, resolutionMin: Int, from: Long, to: Long): List<Bar> {
         val url = "https://benchmarks.pyth.network/v1/shims/tradingview/history".toHttpUrl().newBuilder()
             .addQueryParameter("symbol", r.symbol)
             .addQueryParameter("resolution", resolutionMin.toString())
             .addQueryParameter("from", from.toString())
             .addQueryParameter("to", to.toString())
             .build()
-        http.newCall(Request.Builder().url(url).build()).execute().use { resp ->
+        return http.newCall(Request.Builder().url(url).build()).execute().use { resp ->
             if (!resp.isSuccessful) error("HTTP ${resp.code}")
             val o = JSONObject(resp.body!!.string())
+            if (o.optString("s") == "no_data") return emptyList()
             if (o.optString("s") != "ok") error("brak danych (${o.optString("s")})")
             val t = o.getJSONArray("t"); val op = o.getJSONArray("o"); val h = o.getJSONArray("h")
             val l = o.getJSONArray("l"); val c = o.getJSONArray("c")
             (0 until t.length()).map { i ->
                 Bar(t.getLong(i) * 1000, op.getDouble(i), h.getDouble(i), l.getDouble(i), c.getDouble(i))
-            }.dropLast(1).takeLast(bars)
+            }
         }
     }
 

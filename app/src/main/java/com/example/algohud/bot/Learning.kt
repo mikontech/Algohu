@@ -5,6 +5,7 @@ import com.example.algohud.core.Side
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
@@ -74,37 +75,187 @@ class ReversalStrategy(
 }
 
 /**
- * Wirtualny trader: gra jednym wariantem strategii na świecach (bez pieniędzy, wynik w R).
+ * "Cofnięcie w trendzie": w trendzie (EMA20 > EMA50, EMA50 rośnie) czeka na cofnięcie do EMA20
+ * i wzrostową świecę odbicia – wejście z trendem po lepszej cenie. Short lustrzanie.
+ */
+class PullbackStrategy(
+    private val fast: Int = 20,
+    private val slow: Int = 50,
+    private val stopAtr: Double = 0.5,
+    private val rewardR: Double = 2.0,
+    private val newsVeto: Double = 0.3,
+    private val cooldownBars: Int = 3,
+    private val barMs: Long = 5 * 60_000L
+) : Strategy {
+    private var lastSignalBar = 0L
+
+    private fun trend(closes: List<Double>): Int? {
+        val f = Indicators.ema(closes, fast) ?: return null
+        val sNow = Indicators.ema(closes, slow) ?: return null
+        val sPrev = Indicators.ema(closes.dropLast(5), slow) ?: return null
+        val last = closes.last()
+        return when {
+            f > sNow && sNow > sPrev && last > sNow -> 1
+            f < sNow && sNow < sPrev && last < sNow -> -1
+            else -> 0
+        }
+    }
+
+    override fun onBar(bars: List<Bar>, sentiment: Double): Signal? {
+        if (bars.size < slow + 12) return null
+        val last = bars.last()
+        if (last.start - lastSignalBar < cooldownBars * barMs) return null
+        val closes = bars.map { it.close }
+        val t = trend(closes) ?: return null
+        val emaF = Indicators.ema(closes, fast) ?: return null
+        val atr = Indicators.atr(bars)?.takeIf { it > 0 } ?: return null
+        val recent = bars.takeLast(5)
+        val entry = last.close
+        val sig = when {
+            t == 1 && last.low <= emaF && last.close > emaF && last.close > last.open && sentiment > -newsVeto -> {
+                val stop = recent.minOf { it.low } - stopAtr * atr
+                Signal(Side.BUY, stop, entry + rewardR * (entry - stop), "cofnięcie do EMA%d w trendzie ↑".format(fast))
+            }
+            t == -1 && last.high >= emaF && last.close < emaF && last.close < last.open && sentiment < newsVeto -> {
+                val stop = recent.maxOf { it.high } + stopAtr * atr
+                Signal(Side.SELL, stop, entry - rewardR * (stop - entry), "cofnięcie do EMA%d w trendzie ↓".format(fast))
+            }
+            else -> null
+        } ?: return null
+        if (abs(entry - sig.stopPrice) <= 0) return null
+        lastSignalBar = last.start
+        return sig
+    }
+
+    override fun describeWait(bars: List<Bar>): String? {
+        if (bars.size < slow + 12) return null
+        val closes = bars.map { it.close }
+        val emaF = Indicators.ema(closes, fast) ?: return null
+        return when (trend(closes)) {
+            1 -> "LONG po cofnięciu do EMA%d (%.2f) i świecy odbicia".format(fast, emaF)
+            -1 -> "SHORT po podejściu do EMA%d (%.2f) i świecy zawrócenia".format(fast, emaF)
+            else -> "brak wyraźnego trendu – czekam"
+        }
+    }
+}
+
+/**
+ * "Zawężenie → wybicie": gdy zmienność (szerokość wstęg Bollingera) jest najniższa od [lookback] świec,
+ * rynek "sprężynuje"; wejście w kierunku wybicia poza wstęgę. Stop na środku wstęg.
+ */
+class SqueezeStrategy(
+    private val period: Int = 20,
+    private val k: Double = 2.0,
+    private val lookback: Int = 100,
+    private val rewardR: Double = 2.0,
+    private val cooldownBars: Int = 3,
+    private val barMs: Long = 5 * 60_000L
+) : Strategy {
+    private var lastSignalBar = 0L
+
+    private data class Bands(val mid: Double, val up: Double, val low: Double) {
+        val width get() = if (mid != 0.0) (up - low) / mid else 0.0
+    }
+
+    private fun bands(closes: List<Double>, end: Int): Bands? {
+        if (end + 1 < period) return null
+        val w = closes.subList(end + 1 - period, end + 1)
+        val m = w.average()
+        val sd = sqrt(w.sumOf { (it - m) * (it - m) } / w.size)
+        return Bands(m, m + k * sd, m - k * sd)
+    }
+
+    /** Czy świeca [end] była w zawężeniu (szerokość ≤ 110% minimum z [lookback] świec). */
+    private fun squeezed(closes: List<Double>, end: Int): Boolean? {
+        val now = bands(closes, end)?.width ?: return null
+        var min = Double.MAX_VALUE
+        for (j in end - lookback + 1..end) min = min(min, bands(closes, j)?.width ?: return null)
+        return now <= min * 1.1
+    }
+
+    override fun onBar(bars: List<Bar>, sentiment: Double): Signal? {
+        if (bars.size < lookback + period + 2) return null
+        val last = bars.last()
+        if (last.start - lastSignalBar < cooldownBars * barMs) return null
+        val closes = bars.map { it.close }
+        val prev = closes.size - 2
+        if (squeezed(closes, prev) != true) return null
+        val b = bands(closes, prev) ?: return null
+        val entry = last.close
+        val sig = when {
+            entry > b.up -> Signal(Side.BUY, b.mid, entry + rewardR * (entry - b.mid), "wybicie po zawężeniu ↑")
+            entry < b.low -> Signal(Side.SELL, b.mid, entry - rewardR * (b.mid - entry), "wybicie po zawężeniu ↓")
+            else -> null
+        } ?: return null
+        lastSignalBar = last.start
+        return sig
+    }
+
+    override fun describeWait(bars: List<Bar>): String? {
+        if (bars.size < lookback + period + 2) return null
+        val closes = bars.map { it.close }
+        val end = closes.size - 1
+        val b = bands(closes, end) ?: return null
+        return if (squeezed(closes, end) == true)
+            "zawężenie! LONG > %.2f • SHORT < %.2f".format(b.up, b.low)
+        else "czekam na zawężenie zmienności"
+    }
+}
+
+/** Statystyki z wagą świeżości: nowsze transakcje liczą się bardziej. */
+data class LearnStats(val trades: Int, val nEff: Double, val avgR: Double, val winRate: Double, val tStat: Double)
+
+/**
+ * Wirtualny trader: gra jednym wariantem strategii na świecach (bez pieniędzy, wynik w R, ze spreadem).
  * Wyjścia jak w prawdziwym bocie: SL, TP, stop na wejście po +1R, potem trailing 1R; sygnał przeciwny = odwrócenie.
  * Gdy w jednej świecy padłby i SL, i TP – zakładamy SL (ostrożnie).
  */
 class ShadowTrader(
     val name: String,
     private val strategy: Strategy,
-    private val maxResults: Int = 300,
+    private val maxResults: Int = 3000,
     /** Jak w RiskManager: zbyt ciasne stopy są odrzucane, więc wirtualnie też ich nie gramy. */
-    private val minStopPct: Double = 0.001
+    private val minStopPct: Double = 0.001,
+    /** Okres półtrwania wagi wyniku (ms): transakcja sprzed 2 tygodni waży połowę świeżej. */
+    private val halfLifeMs: Long = 14L * 24 * 3_600_000
 ) {
     private data class Sim(val side: Side, val entry: Double, var stop: Double, val initStop: Double, val tp: Double, var best: Double)
 
     private var pos: Sim? = null
+    private val results = ArrayDeque<Pair<Long, Double>>() // (czas wyjścia, R)
+    private var lastBarTime = 0L
     var errors = 0
         private set
-    private val results = ArrayDeque<Double>()
 
-    val trades: Int get() = results.size
-    val avgR: Double get() = if (results.isEmpty()) 0.0 else results.average()
-    val winRate: Double get() = if (results.isEmpty()) 0.0 else results.count { it > 0 }.toDouble() / results.size
-
-    /** @param cost koszt transakcji w jednostkach ceny (spread). Zwraca sygnał, jeśli otworzył pozycję. */
-    fun describeWait(bars: List<Bar>): String? = runCatching { strategy.describeWait(bars) }.getOrNull()
-
-    /** Kierunek otwartej pozycji wirtualnej (null = brak). */
     val openSide: Side? get() = pos?.side
 
+    fun stats(): LearnStats {
+        if (results.isEmpty()) return LearnStats(0, 0.0, 0.0, 0.0, 0.0)
+        var sw = 0.0; var sw2 = 0.0; var swr = 0.0; var swWin = 0.0
+        for ((t, r) in results) {
+            val w = 0.5.pow((lastBarTime - t).coerceAtLeast(0L).toDouble() / halfLifeMs)
+            sw += w; sw2 += w * w; swr += w * r
+            if (r > 0) swWin += w
+        }
+        val mean = swr / sw
+        var sv = 0.0
+        for ((t, r) in results) {
+            val w = 0.5.pow((lastBarTime - t).coerceAtLeast(0L).toDouble() / halfLifeMs)
+            sv += w * (r - mean) * (r - mean)
+        }
+        val variance = sv / sw
+        val nEff = sw * sw / sw2
+        val t = if (variance > 0) mean / sqrt(variance / nEff) else 0.0
+        return LearnStats(results.size, nEff, mean, swWin / sw, t)
+    }
+
+    fun describeWait(bars: List<Bar>): String? = runCatching { strategy.describeWait(bars) }.getOrNull()
+
+    /** @param cost koszt transakcji w jednostkach ceny (spread). Zwraca sygnał, jeśli otworzył pozycję. */
     fun onBar(bars: List<Bar>, sentiment: Double, cost: Double): Signal? {
         val bar = bars.last()
-        pos?.let { p -> exitOnBar(p, bar, cost)?.let { r -> record(r); pos = null } }
+        lastBarTime = bar.start
+        pos?.let { p -> exitOnBar(p, bar, cost)?.let { r -> record(bar.start, r); pos = null } }
         // Błąd jednego wariantu nie może zatrzymać nauki pozostałych.
         val sig = try {
             strategy.onBar(bars, sentiment)
@@ -115,7 +266,7 @@ class ShadowTrader(
         if (abs(bar.close - sig.stopPrice) < bar.close * minStopPct) return null
         val p = pos
         if (p != null && p.side == sig.side) return null
-        if (p != null) { record(rAt(p, bar.close, cost)); pos = null }
+        if (p != null) { record(bar.start, rAt(p, bar.close, cost)); pos = null }
         pos = Sim(sig.side, bar.close, sig.stopPrice, sig.stopPrice, sig.takeProfit, bar.close)
         return sig
     }
@@ -142,8 +293,8 @@ class ShadowTrader(
         return if (risk <= 0) 0.0 else ((exit - p.entry) * p.side.sign - cost) / risk
     }
 
-    private fun record(r: Double) {
-        results.addLast(r)
+    private fun record(time: Long, r: Double) {
+        results.addLast(time to r)
         while (results.size > maxResults) results.removeFirst()
     }
 }
@@ -153,20 +304,22 @@ data class Variant(val name: String, val barMs: Long, val factory: () -> Strateg
 fun tfLabel(barMs: Long) = "${barMs / 60_000}m"
 
 /**
- * "Uczenie" = turniej wariantów na kilku interwałach (5m, 1m): każdy gra wirtualnie na historii i na żywo
- * (ze spreadem), bot handluje wariantem z najlepszym wynikiem (min. [minTrades] transakcji i E > [minEdge]).
- * Brak zwycięzcy = bot nie handluje.
+ * "Uczenie" = turniej wariantów (6 rodzin strategii × interwały 5m i 1m) na długiej historii i na żywo.
+ * Zwycięzca musi mieć: ≥ [minTrades] transakcji, dodatni wynik ze świeżą wagą (E > [minEdge])
+ * i "pewność" t ≥ [minT] – czyli wynik, który trudno wytłumaczyć przypadkiem. Brak zwycięzcy = brak handlu.
  */
 class Learner(
     val instrument: String,
     variants: List<Variant>,
-    private val minTrades: Int = 15,
+    private val minTrades: Int = 30,
     private val minEdge: Double = 0.05,
+    private val minT: Double = 1.0,
     private val minStopPct: Double = 0.001
 ) {
     private val shadows = variants.map { v -> v to ShadowTrader("${v.name} • ${tfLabel(v.barMs)}", v.factory(), minStopPct = minStopPct) }
     var champion: ShadowTrader? = null
         private set
+    private var championStats: LearnStats? = null
     val championBarMs: Long? get() = shadows.firstOrNull { it.second === champion }?.first?.barMs
     private val learned = HashMap<Long, Int>()
 
@@ -196,7 +349,11 @@ class Learner(
     }
 
     private fun pick() {
-        champion = shadows.map { it.second }.filter { it.trades >= minTrades && it.avgR > minEdge }.maxByOrNull { it.avgR }
+        val scored = shadows.map { it.second to it.second.stats() }
+        val best = scored.filter { (_, st) -> st.trades >= minTrades && st.avgR > minEdge && st.tStat >= minT }
+            .maxByOrNull { (_, st) -> st.avgR }
+        champion = best?.first
+        championStats = best?.second
     }
 
     fun describeWait(barsFor: (Long) -> List<Bar>?): String? {
@@ -207,12 +364,18 @@ class Learner(
     }
 
     fun summary(): String {
+        val n = learned.entries.sortedByDescending { it.key }.joinToString(" + ") { (tf, k) -> "$k×${tfLabel(tf)}" }
         val c = champion
-        if (c != null) return "🧠 $instrument: ${c.name} • %d tr. • %.0f%% • E=%+.2fR".format(c.trades, c.winRate * 100, c.avgR)
-        val best = shadows.map { it.second }.maxByOrNull { if (it.trades > 0) it.avgR else -9.0 }
-        val n = learned.entries.joinToString(", ") { (tf, k) -> "$k×${tfLabel(tf)}" }
-        return if (best == null || best.trades == 0) "🧠 $instrument: uczę się… ($n)"
-        else "🧠 $instrument: brak przewagi – najlepszy ${best.name} E=%+.2fR (%d tr.), nie handluję".format(best.avgR, best.trades)
+        val cs = championStats
+        if (c != null && cs != null) {
+            return "🧠 $instrument: ${c.name} • %d tr. • %.0f%% • E=%+.2fR • pewność t=%.1f\n📚 %s".format(
+                cs.trades, cs.winRate * 100, cs.avgR, cs.tStat, n
+            )
+        }
+        val best = shadows.map { it.second to it.second.stats() }.filter { it.second.trades > 0 }.maxByOrNull { it.second.avgR }
+        return if (best == null) "🧠 $instrument: uczę się… ($n)"
+        else "🧠 $instrument: brak pewnej przewagi – najlepszy ${best.first.name} E=%+.2fR, t=%.1f (%d tr.), nie handluję\n📚 %s"
+            .format(best.second.avgR, best.second.tStat, best.second.trades, n)
     }
 
     companion object {
@@ -220,12 +383,17 @@ class Learner(
         const val M1 = 60_000L
         val TIMEFRAMES = listOf(M5, M1)
 
+        /** Ile świec historii pobierać: 5m ≈ 30 dni, 1m ≈ 7 dni. */
+        fun historyBars(tf: Long) = if (tf == M5) 8_640 else 10_080
+
         fun defaultVariants(): List<Variant> = TIMEFRAMES.flatMap { tf ->
             listOf(
                 Variant("Wybicie 20", tf) { TrendBreakoutStrategy(donchian = 20, barMs = tf) },
                 Variant("Wybicie 55", tf) { TrendBreakoutStrategy(donchian = 55, barMs = tf) },
                 Variant("Odbicie BB2.0", tf) { ReversalStrategy(k = 2.0, barMs = tf) },
-                Variant("Odbicie BB2.5", tf) { ReversalStrategy(k = 2.5, rsiLow = 25.0, rsiHigh = 75.0, barMs = tf) }
+                Variant("Odbicie BB2.5", tf) { ReversalStrategy(k = 2.5, rsiLow = 25.0, rsiHigh = 75.0, barMs = tf) },
+                Variant("Cofnięcie w trendzie", tf) { PullbackStrategy(barMs = tf) },
+                Variant("Zawężenie→wybicie", tf) { SqueezeStrategy(barMs = tf) }
             )
         }
     }

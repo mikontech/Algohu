@@ -103,6 +103,7 @@ class BotOrchestrator(
     private val journal: TradeJournal,
     private val prefs: SharedPreferences,
     private val pyth: PythFeed,
+    private val barStore: BarStore,
     /** (kapitał, źródło) – np. (631.27, "XTB:PLN"); null = brak danych. */
     private val equityProvider: suspend () -> Pair<Double, String>?,
     private val manualStopPct: Double = 0.005,
@@ -128,7 +129,7 @@ class BotOrchestrator(
         // Rozgrzewka strategii historią świec.
         for ((inst, feed) in FEEDS) for (tf in Learner.TIMEFRAMES) {
             scope.launch {
-                runCatching { news.history(feed, tfLabel(tf), 1000) } // 5m ≈ 3,5 dnia, 1m ≈ 16 h
+                runCatching { news.historyPaged(feed, tfLabel(tf), Learner.historyBars(tf)) } // 5m ≈ 30 dni, 1m ≈ 7 dni
                     .onSuccess { h ->
                         lock.withLock {
                             agg(inst, tf).seed(h)
@@ -147,7 +148,7 @@ class BotOrchestrator(
         // Towary z Pyth (ropa, kawa, kakao…): dynamiczne wyszukanie feedu, historia do nauki, ceny co 2 s.
         pyth.start(PYTH_FEEDS.map { (inst, q) -> PythFeed.Spec(inst, q) }) { r ->
             for (tf in Learner.TIMEFRAMES) {
-                runCatching { pyth.history(r, (tf / 60_000).toInt(), 1000) }
+                runCatching { pyth.history(r, (tf / 60_000).toInt(), Learner.historyBars(tf)) }
                     .onSuccess { h ->
                         lock.withLock {
                             agg(r.instrument, tf).seed(h)
@@ -273,7 +274,9 @@ class BotOrchestrator(
         }
         for (tf in Learner.TIMEFRAMES) {
             val a = agg(inst, tf)
-            a.onTick(px, ts) ?: continue
+            val closed = a.onTick(px, ts) ?: continue
+            // Instrumenty bez cen w tle: zapisujemy świece, żeby nauka rosła z każdym dniem i przetrwała restart.
+            if (!hasBackground(inst)) runCatching { barStore.append(inst, tf, closed) }
             val (sent, _) = news.sentimentFor(aliasesFor(inst))
             val sig = learner(inst).onBar(tf, a.closed(), sent, spreadOf(inst))
             updateLearningHud()
@@ -330,7 +333,20 @@ class BotOrchestrator(
     private fun hasBackground(inst: String) = inst in FEEDS || pyth.resolvedFor(inst) != null
 
     private fun agg(inst: String, tf: Long) = aggregators.getOrPut("$inst@$tf") { BarAggregator(tf) }
-    private fun learner(inst: String) = learners.getOrPut(inst) { Learner(inst, Learner.defaultVariants()) }
+    private fun learner(inst: String) = learners.getOrPut(inst) {
+        Learner(inst, Learner.defaultVariants()).also { l ->
+            if (!hasBackground(inst)) {
+                // Wczytaj świece zebrane wcześniej z ekranu XTB i naucz się na nich od razu.
+                for (tf in Learner.TIMEFRAMES) {
+                    val saved = runCatching { barStore.load(inst, tf) }.getOrDefault(emptyList())
+                    if (saved.isNotEmpty()) {
+                        agg(inst, tf).seed(saved)
+                        l.backtest(tf, saved, spreadOf(inst))
+                    }
+                }
+            }
+        }
+    }
 
     @Volatile private var hudLearningInstrument: String = "GOLD"
 

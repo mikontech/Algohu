@@ -245,6 +245,30 @@ class MarketNewsEngine(
         Tick(o.getString("s"), o.getString("p").toDouble(), o.optLong("T", System.currentTimeMillis()))
     }.getOrNull()
 
+    /** Długa historia: kolejne partie po 1000 świec wstecz (Binance pozwala na endTime). */
+    suspend fun historyPaged(symbol: String, interval: String, totalBars: Int): List<Bar> = withContext(Dispatchers.IO) {
+        val out = ArrayList<Bar>()
+        var endTime: Long? = null
+        repeat(30) {
+            if (out.size >= totalBars) return@repeat
+            val url = "https://api.binance.com/api/v3/klines?symbol=$symbol&interval=$interval&limit=1000" +
+                (endTime?.let { "&endTime=$it" } ?: "")
+            val batch = http.newCall(Request.Builder().url(url).build()).execute().use { r ->
+                if (!r.isSuccessful) error("HTTP ${r.code}")
+                val arr = JSONArray(r.body!!.string())
+                (0 until arr.length()).map { i ->
+                    val k = arr.getJSONArray(i)
+                    Bar(k.getLong(0), k.getString(1).toDouble(), k.getString(2).toDouble(),
+                        k.getString(3).toDouble(), k.getString(4).toDouble())
+                }
+            }
+            if (batch.isEmpty()) return@repeat
+            out.addAll(0, batch)
+            endTime = batch.first().start - 1
+        }
+        out.distinctBy { it.start }.sortedBy { it.start }.dropLast(1).takeLast(totalBars)
+    }
+
     /** Historia świec z Binance REST (bez trwającej świecy). */
     suspend fun history(symbol: String, interval: String, limit: Int): List<Bar> = withContext(Dispatchers.IO) {
         val url = "https://api.binance.com/api/v3/klines?symbol=$symbol&interval=$interval&limit=$limit"
