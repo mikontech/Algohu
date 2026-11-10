@@ -366,6 +366,16 @@ class AutoExecutionService : AccessibilityService() {
         val gestureActive: StateFlow<Boolean> = _gestureActive.asStateFlow()
 
         private const val TAG = "AutoExecutionService"
+
+        /** Diagnostyka: ostatnio widziane okno nagrywania (do skopiowania z aplikacji, gdy auto-akceptacja nie trafi). */
+        @Volatile var lastCaptureDump: String? = null
+        private val CAPTURE_HINTS = listOf("nagrywa", "przesyła", "udostępni", "record", "cast", "share")
+        private val CAPTURE_SINGLE = listOf("jedna aplikacj", "jedną aplikacj", "pojedyncz", "single app", "one app")
+        private val CAPTURE_ENTIRE = listOf("cały ekran", "caly ekran", "entire screen")
+        private val CAPTURE_START = listOf(
+            "Rozpocznij", "Rozpocznij teraz", "Zacznij teraz", "Udostępnij ekran", "Udostępnij", "Dalej",
+            "Start now", "Start", "Share screen", "Share", "Next"
+        )
         private val numberRegex = Regex("[0-9]+([.,][0-9]+)?")
     }
 
@@ -390,6 +400,58 @@ class AutoExecutionService : AccessibilityService() {
 
     override fun onInterrupt() = Unit
 
+    // ───────────── Auto-akceptacja systemowego okna nagrywania ekranu – TYLKO dla AnyDesk ─────────────
+    private var lastCaptureAttempt = 0L
+
+    /**
+     * Android przy każdym połączeniu zdalnym pyta "Rozpocząć nagrywanie lub przesyłanie przez AnyDesk?".
+     * Na telefonie z uszkodzonym dotykiem nie da się tego kliknąć, więc (po włączeniu opcji w aplikacji)
+     * robimy to za użytkownika: wybór "Cały ekran" → "Rozpocznij". Okna innych aplikacji są ignorowane.
+     */
+    private fun maybeAcceptCapture(pkg: String) {
+        if (!getSharedPreferences("ui", MODE_PRIVATE).getBoolean("auto_capture", false)) return
+        val now = SystemClock.uptimeMillis()
+        if (now - lastCaptureAttempt < 700) return
+        lastCaptureAttempt = now
+        val roots = runCatching { windows.mapNotNull { it.root }.filter { it.packageName?.toString() == pkg } }.getOrDefault(emptyList())
+        for (root in roots) {
+            val nodes = textNodes(root)
+            val texts = nodes.map { it.second }
+            if (texts.none { it.contains("AnyDesk", ignoreCase = true) }) continue
+            if (texts.none { t -> CAPTURE_HINTS.any { t.contains(it, ignoreCase = true) } }) continue
+            lastCaptureDump = ScreenScanner.dump(root)
+            fun find(options: List<String>, exact: Boolean) = nodes.firstOrNull { (_, t) ->
+                options.any { o -> if (exact) t.equals(o, ignoreCase = true) else t.contains(o, ignoreCase = true) }
+            }?.first
+            val single = find(CAPTURE_SINGLE, exact = false)
+            val entire = find(CAPTURE_ENTIRE, exact = false)
+            val target = when {
+                single != null && entire == null -> single      // rozwiń wybór zakresu
+                single != null && entire != null -> entire      // lista otwarta → "Cały ekran"
+                else -> find(CAPTURE_START, exact = true)        // zatwierdź
+            } ?: return
+            var n: AccessibilityNodeInfo? = target
+            while (n != null && !n.isClickable) n = n.parent
+            (n ?: target).performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            Log.i(TAG, "Okno nagrywania AnyDesk: kliknięto element")
+            return
+        }
+    }
+
+    private fun textNodes(root: AccessibilityNodeInfo, limit: Int = 400): List<Pair<AccessibilityNodeInfo, String>> {
+        val out = ArrayList<Pair<AccessibilityNodeInfo, String>>()
+        val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+        var visited = 0
+        while (queue.isNotEmpty() && visited < limit) {
+            val n = queue.removeFirst()
+            visited++
+            val t = (n.text ?: n.contentDescription)?.toString()?.trim()
+            if (!t.isNullOrEmpty()) out += n to t
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+        return out
+    }
+
     private val volPresses = ArrayDeque<Long>()
 
     override fun onKeyEvent(event: android.view.KeyEvent): Boolean {
@@ -404,6 +466,7 @@ class AutoExecutionService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val pkg = event?.packageName?.toString() ?: return
+        if (pkg == "com.android.systemui" || pkg == "android") { maybeAcceptCapture(pkg); return }
         val label = targetLabel(pkg) ?: return // inne aplikacje odrzucamy od razu – nic z nich nie czytamy
         val now = SystemClock.uptimeMillis()
         if (now - lastScan < 300) return // throttling – drzewo widoków jest drogie

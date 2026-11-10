@@ -71,6 +71,26 @@ class MainActivity : ComponentActivity() {
         button("Reset KILL (nie działa po dziennym limicie)") { OverlayService.command(this, OverlayService.ACTION_RESET_KILL) }
         button("🛡 Tarcza dotyku: WŁĄCZ (w AUTO ekran ignoruje dotyk)") { OverlayService.command(this, OverlayService.ACTION_SHIELD, "on") }
         button("Tarcza dotyku: wyłącz") { OverlayService.command(this, OverlayService.ACTION_SHIELD, "off") }
+
+        TextView(this).apply { text = "\nZdalny dostęp (AnyDesk)"; textSize = 18f }.also { layout.addView(it) }
+        fun ui() = getSharedPreferences("ui", MODE_PRIVATE)
+        button("AnyDesk: auto-akceptuj „Rozpocząć nagrywanie?” – WŁĄCZ") {
+            ui().edit().putBoolean("auto_capture", true).apply()
+            Toast.makeText(this, "Włączone – działa tylko dla okna AnyDesk", Toast.LENGTH_LONG).show()
+        }
+        button("AnyDesk: auto-akceptacja – wyłącz") {
+            ui().edit().putBoolean("auto_capture", false).apply()
+            Toast.makeText(this, "Wyłączone", Toast.LENGTH_SHORT).show()
+        }
+        button("Skopiuj diagnostykę okna nagrywania") {
+            val d = AutoExecutionService.lastCaptureDump
+            if (d == null) Toast.makeText(this, "Brak – najpierw włącz auto-akceptację i połącz się przez AnyDesk", Toast.LENGTH_LONG).show()
+            else {
+                getSystemService(android.content.ClipboardManager::class.java)
+                    .setPrimaryClip(android.content.ClipData.newPlainText("capture dialog", d))
+                Toast.makeText(this, "Skopiowano – wklej w czacie", Toast.LENGTH_SHORT).show()
+            }
+        }
         val scroll = ScrollView(this).apply { addView(layout) }
         // Odsunięcie od paska stanu, wycięcia aparatu i paska nawigacji.
         ViewCompat.setOnApplyWindowInsetsListener(scroll) { v, insets ->
