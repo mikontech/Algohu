@@ -1,0 +1,77 @@
+name: Apply recovery to main
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/apply-recovery.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: apply-recovery
+  cancel-in-progress: false
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Restore complete sources and apply settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE=e91d85d76674869ed900c0a5c7d14652f24ad0a6
+          D=app/src/main/java/com/example/algohud
+          git restore --source="$BASE" -- $D/risk/RiskManager.kt $D/risk/PositionSizer.kt $D/overlay/OverlayService.kt $D/execution/AutoExecutionService.kt $D/execution/ScreenScanner.kt
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+          p = Path('app/src/main/java/com/example/algohud/risk/RiskManager.kt')
+          s = p.read_text()
+          changes = {
+              'val maxDailyLossPct: Double = 0.05,': 'val maxDailyLossPct: Double = Double.POSITIVE_INFINITY,',
+              'val maxOrdersPerMinute: Int = 3,': 'val maxOrdersPerMinute: Int = Int.MAX_VALUE,',
+              'val cooldownAfterLossMs: Long = 10 * 60_000L,': 'val cooldownAfterLossMs: Long = 0L,',
+              'fun cooldownLeftMs(): Long = (cooldownAfterLossMs - (clock() - lastLossAt)).coerceAtLeast(0L)': 'fun cooldownLeftMs(): Long = if (config.cooldownAfterLossMs == 0L) 0L else (cooldownAfterLossMs - (clock() - lastLossAt)).coerceAtLeast(0L)',
+              'if (now - lastLossAt < cooldownAfterLossMs) {': 'if (config.cooldownAfterLossMs > 0L && now - lastLossAt < cooldownAfterLossMs) {',
+              'if (killReason == REASON_DAILY_LOSS) return@withLock false': 'if (config.maxDailyLossPct.isFinite() && killReason == REASON_DAILY_LOSS) return@withLock false'
+          }
+          for old, new in changes.items():
+              if s.count(old) != 1:
+                  raise SystemExit('Unexpected source: ' + old)
+              s = s.replace(old, new)
+          p.write_text(s)
+          o = Path('app/src/main/java/com/example/algohud/overlay/OverlayService.kt')
+          t = o.read_text()
+          t2, n = re.subn(r'autoGate = \{\s*val s = journal\.stats\.value\s*when \{.*?else -> null\s*\}\s*\}', 'autoGate = { null }', t, count=1, flags=re.S)
+          if n != 1:
+              raise SystemExit('autoGate block not found')
+          o.write_text(t2)
+          PY
+      - name: Compile (gate before writing to main)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --stacktrace
+      - name: Commit verified sources to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java
+          if git diff --cached --quiet; then echo "Nothing to commit"; exit 0; fi
+          git commit -m "Restore complete sources truncated by web edits; remove AUTO gate; apply agreed risk settings (compiled OK)"
+          git push origin HEAD:main
+      - uses: actions/upload-artifact@v4
+        with:
+          name: algohud-applied-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
