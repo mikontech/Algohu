@@ -751,6 +751,20 @@ class AutoExecutionService : AccessibilityService() {
         if (tp != null) {
             revealById("TakeProfitContainer") ?: return ExecutionResult.Rejected("nie znaleziono Take Profit w bilecie")
             setPriceIn("TakeProfitContainer", "TakeProfitToggle", tp)?.let { return ExecutionResult.Rejected("TP: $it") }
+        } else {
+            // Zlecenie bez TP: wyłącz ewentualnie pozostawiony (ręcznie) Take Profit ze starą ceną.
+            revealById("TakeProfitContainer")
+            if (fieldIn("TakeProfitContainer") != null) {
+                val root = rootInActiveWindow ?: return ExecutionResult.Rejected("brak okna")
+                val area = ScreenScanner.findById(root, "TakeProfitToggle").firstOrNull()?.let { n -> Rect().also { n.getBoundsInScreen(it) } }
+                val r = Rect()
+                val sw = area?.let { a ->
+                    ScreenScanner.findById(root, "ToggleRowSwitch").firstOrNull { n -> n.getBoundsInScreen(r); a.contains(r.centerX(), r.centerY()) }
+                }
+                if (sw == null || !click(sw)) return ExecutionResult.Rejected("nie udało się wyłączyć starego Take Profit")
+                delay(400)
+                if (fieldIn("TakeProfitContainer") != null) return ExecutionResult.Rejected("Take Profit nadal włączony – nie wysyłam zlecenia")
+            }
         }
 
         val btn = revealById(if (order.side == Side.BUY) "TradingBuyButton" else "TradingSellButton")
