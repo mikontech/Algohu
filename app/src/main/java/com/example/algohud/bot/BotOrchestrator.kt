@@ -286,11 +286,11 @@ class BotOrchestrator(
         if (why != null) {
             // Raz na świecę i powód (żeby HUD nie migał przy każdym ticku).
             val key = "$inst@${cur.start}:${why.substringBefore(' ')}"
-            if (rtNotes.add(key)) msg("$head – pominięta: $why")
+            if (rtNotes.add(key) && inst == AutoExecutionService.screenQuote.value?.instrument) msg("$head – pominięta: $why")
             return
         }
         rtLastBar[inst] = cur.start
-        msg("$head – WCHODZĘ")
+        if (inst == AutoExecutionService.screenQuote.value?.instrument) msg("$head – WCHODZĘ")
         // Stop: tuż za bazą świecy impulsu albo 0,8×ATR – ciaśniejszy z dwóch, ale nie bliżej niż 3× spread / min. dystans.
         val base = if (dir > 0) cur.low - 0.1 * atr else cur.high + 0.1 * atr
         val atrStop = px - dir * 0.8 * atr
