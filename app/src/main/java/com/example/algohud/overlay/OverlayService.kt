@@ -31,6 +31,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import com.example.algohud.bot.BotOrchestrator
+import com.example.algohud.bot.BotProfile
 import com.example.algohud.core.ExecutionMode
 import com.example.algohud.core.HudState
 import com.example.algohud.core.Side
@@ -65,6 +66,15 @@ class OverlayService : LifecycleService() {
         const val ACTION_START = "com.example.algohud.START"
         const val ACTION_STOP = "com.example.algohud.STOP"
         const val ACTION_KILL = "com.example.algohud.KILL"
+        const val ACTION_MODE = "com.example.algohud.MODE"
+        const val ACTION_PROFILE = "com.example.algohud.PROFILE"
+        const val ACTION_RESET_KILL = "com.example.algohud.RESET_KILL"
+        const val EXTRA_VALUE = "value"
+
+        /** Polecenie z aplikacji (uruchamia usługę, jeśli nie działa). */
+        fun command(ctx: Context, action: String, value: String? = null) = ContextCompat.startForegroundService(
+            ctx, Intent(ctx, OverlayService::class.java).setAction(action).apply { value?.let { putExtra(EXTRA_VALUE, it) } }
+        )
         private const val CHANNEL_ID = "algo_hud"
         private const val NOTIF_ID = 1001
         private const val MIN_PAPER_TRADES = 30
@@ -113,6 +123,7 @@ class OverlayService : LifecycleService() {
         buildTradingStack()
         createOverlay()
         observeState()
+        restoreMode()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -120,6 +131,22 @@ class OverlayService : LifecycleService() {
         when (intent?.action) {
             ACTION_STOP -> stopSelf()
             ACTION_KILL -> if (::engine.isInitialized) botScope.launch { engine.flattenAll("KILL z powiadomienia") }
+            ACTION_MODE -> if (::engine.isInitialized) {
+                val m = runCatching { ExecutionMode.valueOf(intent.getStringExtra(EXTRA_VALUE)!!) }.getOrNull()
+                if (m != null) {
+                    uiPrefs().edit().putString("mode", m.name).apply()
+                    botScope.launch {
+                        val blocked = engine.setMode(m, overrideGate = true)
+                        toast(if (blocked != null) "🔒 $m zablokowany: $blocked" else "Tryb: $m")
+                    }
+                }
+            }
+            ACTION_PROFILE -> if (::bot.isInitialized) {
+                runCatching { BotProfile.valueOf(intent.getStringExtra(EXTRA_VALUE)!!) }.getOrNull()?.let { bot.setProfile(it); toast(it.label) }
+            }
+            ACTION_RESET_KILL -> if (::risk.isInitialized) botScope.launch {
+                toast(if (risk.resetKillSwitch()) "Kill-switch zdjęty" else "Blokada dziennego limitu – do jutra")
+            }
         }
         return START_STICKY
     }
@@ -189,6 +216,22 @@ class OverlayService : LifecycleService() {
         bot.start()
     }
 
+    private fun uiPrefs() = getSharedPreferences("ui", MODE_PRIVATE)
+
+    /** Po starcie wraca tryb wybrany w aplikacji (np. AUTO) – ponawia, dopóki ułatwienia dostępu nie będą gotowe. */
+    private fun restoreMode() {
+        val saved = runCatching { ExecutionMode.valueOf(uiPrefs().getString("mode", ExecutionMode.DRY_RUN.name)!!) }
+            .getOrDefault(ExecutionMode.DRY_RUN)
+        if (saved == ExecutionMode.DRY_RUN) return
+        botScope.launch {
+            repeat(60) {
+                if (uiPrefs().getString("mode", null) != saved.name) return@launch // użytkownik zmienił w międzyczasie
+                if (engine.setMode(saved, overrideGate = true) == null) return@launch
+                kotlinx.coroutines.delay(5_000)
+            }
+        }
+    }
+
     // ───────────── Nakładka ─────────────
 
     private fun createOverlay() {
@@ -206,88 +249,16 @@ class OverlayService : LifecycleService() {
         }
         tvStats = TextView(this).apply { setTextColor(0xFF90CAF9.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 8 }
         tvScreen = TextView(this).apply { setTextColor(0xFFFFE082.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 3 }
-        // Dotknięcie: DRY_RUN ⇄ CONFIRM. Przytrzymanie: AUTO. Oba wymagają gotowego wykonawcy.
-        btnMode = actionButton("Tryb", 0xFF455A64.toInt()) {
-            botScope.launch {
-                val target = if (engine.mode.value == ExecutionMode.DRY_RUN) ExecutionMode.CONFIRM else ExecutionMode.DRY_RUN
-                val blocked = engine.setMode(target)
-                toast(
-                    when {
-                        blocked != null -> "🔒 $target zablokowany: $blocked"
-                        target == ExecutionMode.CONFIRM -> "⚠️ CONFIRM: zlecenia trafią do XTB po Twoim potwierdzeniu"
-                        else -> "DRY_RUN: handel papierowy"
-                    }
-                )
-            }
-        }.apply {
-            // Przytrzymanie: AUTO. Gdy brakuje tylko wyników papierowych – drugie przytrzymanie w ciągu 10 s
-            // włącza AUTO na odpowiedzialność użytkownika (limity ryzyka i SL nadal obowiązują).
-            setOnLongClickListener {
-                botScope.launch {
-                    val now = System.currentTimeMillis()
-                    val second = now - lastAutoAsk < 10_000
-                    if (!second && engine.autoBlockedOnlyByGate()) {
-                        lastAutoAsk = now
-                        toast("⚠️ Brak potwierdzonych wyników. Przytrzymaj „Tryb” jeszcze raz w ciągu 10 s, aby włączyć AUTO na własne ryzyko")
-                        return@launch
-                    }
-                    lastAutoAsk = 0L
-                    val blocked = engine.setMode(ExecutionMode.AUTO, overrideGate = second)
-                    toast(if (blocked != null) "🔒 AUTO zablokowane: $blocked" else "⚠️ AUTO włączone – bot sam składa zlecenia")
-                }
-                true
-            }
-        }
         btnConfirm = actionButton("✔ Potwierdź", 0xFF1565C0.toInt()) {
             botScope.launch { engine.confirmPending() }
         }.apply { visibility = View.GONE }
-
-        val tradeRow = LinearLayout(this).apply {
+        // HUD bez przycisków sterowania – bot działa sam. Zostaje tylko awaryjny KILL (sterowanie: aplikacja Algo HUD).
+        val killRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(actionButton("KUP", 0xFF2E7D32.toInt(), longPress = true) {
-                botScope.launch { bot.manualOrder(Side.BUY) }
-            })
-            addView(actionButton("SPRZEDAJ", 0xFFC62828.toInt(), longPress = true) {
-                botScope.launch { bot.manualOrder(Side.SELL) }
-            })
-            // KILL celowo jednym dotknięciem – akcja bezpieczeństwa ma być najłatwiejsza.
-            addView(actionButton("⛔ KILL", 0xFF7F0000.toInt()) {
+            addView(actionButton("⛔ KILL", 0xFF7F0000.toInt(), longPress = true) {
                 botScope.launch { engine.flattenAll("KILL ręczny z HUD") }
             })
-        }
-        val controlRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(btnMode)
             addView(btnConfirm)
-            addView(actionButton("Reset KILL", 0xFF37474F.toInt(), longPress = true) {
-                botScope.launch {
-                    val ok = risk.resetKillSwitch()
-                    toast(if (ok) "Kill-switch zdjęty" else "Blokada dziennego limitu – do jutra")
-                }
-            })
-        }
-        val toolsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(actionButton("📋 Zrzut ekranu", 0xFF5D4037.toInt()) { dumpScreen() })
-            addView(actionButton("🛡 SL/TP", 0xFF1565C0.toInt(), longPress = true) {
-                botScope.launch { bot.applyProtectionOnScreen() }
-            })
-            addView(actionButton("⚡ Profil", 0xFFE65100.toInt(), longPress = true) {
-                val on = bot.toggleProfile()
-                toast(if (on) "⚡ Profil AGRESYWNY: wejścia w trakcie świecy (RT) i Open Breakout" else "Profil STANDARD: tylko zwycięzca turnieju")
-            })
-        }
-        val positionRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(actionButton("✖ Zamknij", 0xFF7F0000.toInt(), longPress = true) {
-                botScope.launch { bot.closeOnScreen() }
-            })
-            addView(actionButton("✔ Zamknąłem w XTB", 0xFF37474F.toInt(), longPress = true) {
-                botScope.launch {
-                    val n = risk.markClosedManually()
-                    toast(if (n > 0) "Zaksięgowano zamknięcie $n poz." else "Brak otwartych pozycji w księdze bota")
-                }
-            })
         }
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -298,10 +269,7 @@ class OverlayService : LifecycleService() {
             addView(tvScreen)
             addView(tvStats)
             addView(tvMessage)
-            addView(tradeRow, wrap().apply { topMargin = dp(6) })
-            addView(controlRow, wrap().apply { topMargin = dp(6) })
-            addView(toolsRow, wrap().apply { topMargin = dp(6) })
-            addView(positionRow, wrap().apply { topMargin = dp(6) })
+            addView(killRow, wrap().apply { topMargin = dp(6) })
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -452,8 +420,7 @@ class OverlayService : LifecycleService() {
         tvMessage.text = s.lastMessage
         setKeepScreenOn(s.mode == ExecutionMode.AUTO && !s.killSwitch)
         tvStats.text = listOf(s.learning, s.paperStats).filter { it.isNotBlank() }.joinToString("\n")
-        btnMode.text = "Tryb: ${s.mode.name}"
-        if (s.profile.isNotEmpty()) tvStatus.text = tvStatus.text.toString() + "\n" + s.profile
+        tvStatus.text = tvStatus.text.toString() + "\nTryb: ${s.mode.name}" + (if (s.profile.isNotEmpty()) " • ${s.profile}" else "")
 
         val key = "${s.mode}|${s.killSwitch}|${s.feedConnected}"
         if (key != lastNotifKey) { // nie aktualizuj powiadomienia przy każdym ticku

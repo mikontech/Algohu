@@ -57,6 +57,18 @@ class MainActivity : ComponentActivity() {
             else Toast.makeText(this, "Najpierw krok 1", Toast.LENGTH_SHORT).show()
         }
         button("■ Zatrzymaj") { stopService(Intent(this, OverlayService::class.java)) }
+
+        TextView(this).apply { text = "\nTryb handlu"; textSize = 18f }.also { layout.addView(it) }
+        button("🤖 AUTO – bot sam handluje w XTB") { OverlayService.command(this, OverlayService.ACTION_MODE, "AUTO") }
+        button("🧪 DRY_RUN – tylko symulacja") { OverlayService.command(this, OverlayService.ACTION_MODE, "DRY_RUN") }
+
+        TextView(this).apply { text = "\nStrategia"; textSize = 18f }.also { layout.addView(it) }
+        button("📈 ZAKRES – kup na dole, sprzedaj na górze") { OverlayService.command(this, OverlayService.ACTION_PROFILE, "RANGE") }
+        button("⚡ AGRESYWNY – impulsy i otwarcia sesji") { OverlayService.command(this, OverlayService.ACTION_PROFILE, "AGGRESSIVE") }
+        button("🧠 STANDARD – zwycięzca turnieju") { OverlayService.command(this, OverlayService.ACTION_PROFILE, "STANDARD") }
+
+        TextView(this).apply { text = "\nBezpieczeństwo"; textSize = 18f }.also { layout.addView(it) }
+        button("Reset KILL (nie działa po dziennym limicie)") { OverlayService.command(this, OverlayService.ACTION_RESET_KILL) }
         val scroll = ScrollView(this).apply { addView(layout) }
         // Odsunięcie od paska stanu, wycięcia aparatu i paska nawigacji.
         ViewCompat.setOnApplyWindowInsetsListener(scroll) { v, insets ->

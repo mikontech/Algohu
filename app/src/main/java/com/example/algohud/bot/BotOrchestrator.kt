@@ -26,6 +26,13 @@ import kotlinx.coroutines.sync.withLock
 import java.math.BigDecimal
 import kotlin.math.abs
 
+/** Profil działania bota. ZAKRES = kup przy dole zakresu po odbiciu, sprzedaj przy górze (i lustrzanie). */
+enum class BotProfile(val label: String) {
+    RANGE("📈 ZAKRES (dół → góra)"),
+    AGGRESSIVE("⚡ AGRESYWNY (RT+ORB)"),
+    STANDARD("STANDARD (turniej)")
+}
+
 data class Signal(val side: Side, val stopPrice: Double, val takeProfit: Double, val reason: String, val tier: Int = 1)
 
 interface Strategy {
@@ -142,7 +149,9 @@ class BotOrchestrator(
     private val learners = HashMap<String, Learner>()
 
     // ───────────── Profil agresywny: impuls w czasie rzeczywistym (RT) + Open Range Breakout (ORB) ─────────────
-    private val aggressive = MutableStateFlow(prefs.getBoolean("profile_aggressive", true))
+    private val profile = MutableStateFlow(
+        runCatching { BotProfile.valueOf(prefs.getString("profile", BotProfile.RANGE.name)!!) }.getOrDefault(BotProfile.RANGE)
+    )
     private val rtLastBar = HashMap<String, Long>()
     private val rtNotes = object : LinkedHashSet<String>() {
         override fun add(element: String): Boolean {
@@ -154,19 +163,84 @@ class BotOrchestrator(
     private val orbs = HashMap<String, Orb>()
 
     private fun applyProfile() {
-        risk.cooldownAfterLossMs = if (aggressive.value) AGGRESSIVE_COOLDOWN_MS else risk.config.cooldownAfterLossMs
+        risk.cooldownAfterLossMs = if (profile.value == BotProfile.STANDARD) risk.config.cooldownAfterLossMs else AGGRESSIVE_COOLDOWN_MS
     }
 
-    fun toggleProfile(): Boolean {
-        val v = !aggressive.value
-        aggressive.value = v
+    fun setProfile(p: BotProfile) {
+        profile.value = p
+        prefs.edit().putString("profile", p.name).apply()
         applyProfile()
-        prefs.edit().putBoolean("profile_aggressive", v).apply()
         _hud.update { it.copy(profile = profileLabel()) }
-        return v
+        msg("Profil: ${p.label}")
     }
 
-    private fun profileLabel() = if (aggressive.value) "⚡ AGRESYWNY (RT+ORB)" else "STANDARD"
+    private fun profileLabel() = profile.value.label
+
+    // ───────────── ZAKRES: wejście przy dole zakresu po odbiciu, wyjście przy górze ─────────────
+    private class RangeState(var lowSeen: Double = Double.MAX_VALUE, var highSeen: Double = -Double.MAX_VALUE, var lastEntryBar: Long = 0L)
+    private val rangeStates = HashMap<String, RangeState>()
+    @Volatile private var rangeInfo: Pair<String, String>? = null // (instrument, opis do HUD)
+
+    /**
+     * on_tick: zakres = High/Low ostatnich [RANGE_LOOKBACK] świec 1m.
+     *  LONG: cena zeszła do dolnych 20% zakresu, potem odbiła o ≥ 0,3×ATR od najniższego punktu (potwierdzenie dołka)
+     *        → wejście; SL pod dołkiem (−0,3×ATR); TP przy górze zakresu (górne 20%).
+     *  SHORT: lustrzanie przy górze. Silny trend (|EMA20−EMA50| > 1×ATR) = brak gry w zakresie (zakres się "rozjeżdża").
+     */
+    private suspend fun rangeCheck(inst: String, px: Double, ts: Long) {
+        val a = aggregators["$inst@${Learner.M1}"] ?: return
+        val bars = a.closed()
+        if (bars.size < 60) return
+        val atr = Indicators.atr(bars)?.takeIf { it > 0 } ?: return
+        val look = bars.takeLast(RANGE_LOOKBACK)
+        val hi = look.maxOf { it.high }
+        val lo = look.minOf { it.low }
+        val width = hi - lo
+        val spread = spreadOf(inst)
+        val closes = bars.map { it.close }
+        val e20 = Indicators.ema(closes, 20) ?: return
+        val e50 = Indicators.ema(closes, 50) ?: return
+        val st = rangeStates.getOrPut(inst) { RangeState() }
+        val bottom = lo + RANGE_ZONE * width
+        val top = hi - RANGE_ZONE * width
+        val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
+        val sh = q?.let { basis(inst, it) } ?: 0.0
+        val trendStrong = abs(e20 - e50) > RANGE_MAX_TREND_ATR * atr
+        val tooNarrow = width < maxOf(RANGE_MIN_WIDTH_ATR * atr, 8 * spread)
+        rangeInfo = inst to when {
+            trendStrong -> "ZAKRES: silny trend ${if (e20 > e50) "↑" else "↓"} – czekam, aż rynek się uspokoi"
+            tooNarrow -> "ZAKRES: zakres za wąski (%.2f) – zysk nie pokryłby spreadu".format(width)
+            else -> "ZAKRES %.2f–%.2f: KUPIĘ po odbiciu < %.2f • SPRZEDAM przy > %.2f".format(lo + sh, hi + sh, bottom + sh, top + sh)
+        }
+        if (trendStrong || tooNarrow) { st.lowSeen = Double.MAX_VALUE; st.highSeen = -Double.MAX_VALUE; return }
+        if (risk.position(inst) != null) return // jedna pozycja; wyjście: TP przy przeciwnej krawędzi, SL, BE/trailing
+        val curBar = a.current()?.start ?: 0L
+        if (st.lastEntryBar == curBar) return
+
+        // Śledzenie dołka/szczytu w strefach
+        if (px <= bottom) st.lowSeen = minOf(st.lowSeen, px)
+        if (px >= top) st.highSeen = maxOf(st.highSeen, px)
+        if (px > lo + 0.5 * width) st.lowSeen = Double.MAX_VALUE   // wyszło z dołu bez sygnału – reset
+        if (px < hi - 0.5 * width) st.highSeen = -Double.MAX_VALUE
+
+        val bounceUp = st.lowSeen != Double.MAX_VALUE && px - st.lowSeen >= RANGE_CONFIRM_ATR * atr && px <= lo + 0.4 * width
+        val bounceDown = st.highSeen != -Double.MAX_VALUE && st.highSeen - px >= RANGE_CONFIRM_ATR * atr && px >= hi - 0.4 * width
+        if (!bounceUp && !bounceDown) return
+        val dir = if (bounceUp) 1 else -1
+        val stop = if (dir > 0) minOf(st.lowSeen, lo) - 0.3 * atr else maxOf(st.highSeen, hi) + 0.3 * atr
+        val target = if (dir > 0) top else bottom
+        val entry = px + spread / 2 * dir
+        if ((target - entry) * dir < RANGE_MIN_REWARD_R * abs(entry - stop)) {
+            msg("📈 $inst: odbicie od ${if (dir > 0) "dołu" else "góry"}, ale do celu za blisko względem stopu – pomijam")
+            st.lowSeen = Double.MAX_VALUE; st.highSeen = -Double.MAX_VALUE
+            return
+        }
+        st.lastEntryBar = curBar
+        st.lowSeen = Double.MAX_VALUE; st.highSeen = -Double.MAX_VALUE
+        val why = if (dir > 0) "ZAKRES odbicie od dołka %.2f → cel góra %.2f".format(lo + sh, target + sh)
+        else "ZAKRES odbicie od szczytu %.2f → cel dół %.2f".format(hi + sh, target + sh)
+        enterAggressive(inst, dir, px, stop, why, ts, tp = target, tier = Tier.MODERATE)
+    }
 
     /** Reguły sesji: null = wolno otwierać; inaczej powód blokady. */
     private fun sessionBlock(inst: String, ts: Long): String? {
@@ -242,20 +316,23 @@ class BotOrchestrator(
         enterAggressive(inst, dir, px, stop, "ORB wybicie zasięgu otwarcia %.2f–%.2f".format(o.lo, o.hi), ts)
     }
 
-    private suspend fun enterAggressive(inst: String, dir: Int, px: Double, rawStop: Double, why: String, ts: Long) {
+    private suspend fun enterAggressive(
+        inst: String, dir: Int, px: Double, rawStop: Double, why: String, ts: Long,
+        tp: Double? = null, tier: Int = Tier.AGGRESSIVE
+    ) {
         sessionBlock(inst, ts)?.let { msg("✋ $inst: $why – pominięte: $it"); return }
         val spread = spreadOf(inst)
         val entry = px + spread / 2 * dir
         val minDist = maxOf(3 * spread, entry * risk.config.minStopDistancePct)
         val stop = if (abs(entry - rawStop) < minDist) entry - dir * minDist else rawStop
-        val tp = entry + dir * 2.0 * abs(entry - stop)
+        val takeProfit = tp ?: (entry + dir * 2.0 * abs(entry - stop))
         val side = if (dir > 0) Side.BUY else Side.SELL
         risk.closingOrder(inst, side, px)?.let { close ->
             val r = engine.submit(withSpread(close.copy(reason = "ODWRÓCENIE (impuls)"), inst), bypassConfirmation = true)
             if (r !is ExecutionResult.Filled && r !is ExecutionResult.Submitted) return
         }
-        val order = buildOrder(inst, side, entry, stop, tp, why, pointValue(inst), Tier.AGGRESSIVE) ?: return
-        decisionCard(inst, order, Signal(side, stop, tp, why, Tier.AGGRESSIVE), ev = Double.NaN)
+        val order = buildOrder(inst, side, entry, stop, takeProfit, why, pointValue(inst), tier) ?: return
+        decisionCard(inst, order, Signal(side, stop, takeProfit, why, tier), ev = Double.NaN)
         engine.submit(order)
     }
     private val binanceFallback = java.util.Collections.synchronizedSet(HashSet<String>())
@@ -406,10 +483,14 @@ class BotOrchestrator(
         }
         scope.launch {
             journal.stats.collect { s ->
-                val rt = journal.statsWhere { it.reason.startsWith("RT") || it.reason.startsWith("ORB") }
-                val rtLine = if (rt.trades == 0) "⚡ RT/ORB: brak zamkniętych transakcji"
-                else "⚡ RT/ORB: %d tr. • %.0f%% • E=%+.2fR • %+.2f".format(rt.trades, rt.winRate * 100, rt.avgR, rt.pnl)
-                _hud.update { it.copy(paperStats = s.summary() + "\n" + rtLine) }
+                fun line(label: String, pred: (com.example.algohud.risk.ClosedTrade) -> Boolean): String {
+                    val st = journal.statsWhere(pred)
+                    return if (st.trades == 0) "$label: brak zamkniętych transakcji"
+                    else "$label: %d tr. • %.0f%% • E=%+.2fR • %+.2f".format(st.trades, st.winRate * 100, st.avgR, st.pnl)
+                }
+                val rtLine = line("⚡ RT/ORB") { it.reason.startsWith("RT") || it.reason.startsWith("ORB") }
+                val rangeLine = line("📈 ZAKRES") { it.reason.startsWith("ZAKRES") }
+                _hud.update { it.copy(paperStats = s.summary() + "\n" + rangeLine + "\n" + rtLine) }
             }
         }
         scope.launch {
@@ -540,13 +621,15 @@ class BotOrchestrator(
             updateLearningHud()
             if (sig != null) handleSignal(inst, sig, px)
         }
-        if (aggressive.value) {
-            orbCheck(inst, px, ts)
-            realtimeCheck(inst, px, ts)
+        when (profile.value) {
+            BotProfile.AGGRESSIVE -> { orbCheck(inst, px, ts); realtimeCheck(inst, px, ts) }
+            BotProfile.RANGE -> rangeCheck(inst, px, ts)
+            BotProfile.STANDARD -> Unit
         }
     }
 
     private suspend fun handleSignal(inst: String, sig: Signal, px: Double) {
+        if (profile.value != BotProfile.STANDARD) return // turniej się uczy, ale handluje tylko w profilu STANDARD
         val learner = learner(inst)
         sessionBlock(inst, System.currentTimeMillis())?.let { msg("✋ $inst: sygnał pominięty – $it"); return }
         msg("📈 $inst ${sig.side} [${learner.champion?.name}]: ${sig.reason}")
@@ -685,6 +768,11 @@ class BotOrchestrator(
                 b.copy(open = b.open + shift, high = b.high + shift, low = b.low + shift, close = b.close + shift)
             }
         }
+        if (profile.value == BotProfile.RANGE) {
+            val info = rangeInfo?.takeIf { it.first == inst }?.second ?: "ZAKRES: zbieram świece 1m…"
+            _hud.update { it.copy(learning = "📈 $info\n" + l.summary().substringBefore('\n')) }
+            return
+        }
         val readTf = l.championBarMs ?: Learner.M5
         val read = aggregators["$inst@$readTf"]?.closed()?.let { MarketRead.describe(it) }
         _hud.update {
@@ -718,7 +806,14 @@ class BotOrchestrator(
 
         // Profil agresywny – progi wejść w czasie rzeczywistym
         const val RT_RANGE_ATR = 1.2      // zasięg bieżącej świecy ≥ 1,2 × ATR14
-        const val AGGRESSIVE_COOLDOWN_MS = 3 * 60_000L // przerwa po stracie w profilu agresywnym
+        const val AGGRESSIVE_COOLDOWN_MS = 3 * 60_000L // przerwa po stracie w profilu agresywnym / zakres
+        // ZAKRES (dół → góra)
+        const val RANGE_LOOKBACK = 30          // zakres = High/Low ostatnich 30 świec 1m
+        const val RANGE_ZONE = 0.20            // dolne/górne 20% zakresu
+        const val RANGE_CONFIRM_ATR = 0.3      // odbicie o ≥ 0,3×ATR od dołka/szczytu = potwierdzenie
+        const val RANGE_MAX_TREND_ATR = 1.0    // silny trend → nie gramy zakresu
+        const val RANGE_MIN_WIDTH_ATR = 2.0    // zakres musi mieć ≥ 2×ATR
+        const val RANGE_MIN_REWARD_R = 1.2     // cel ≥ 1,2× ryzyko
         const val RT_BODY_RATIO = 0.70    // korpus ≥ 70% zasięgu
         const val RT_MAX_WICK = 0.15      // knot po stronie ruchu ≤ 15% zasięgu
         const val RT_LOOKBACK = 10        // wybicie High/Low ostatnich 10 świec 1m
