@@ -30,7 +30,7 @@ class RiskManager(
     private val ioScope: CoroutineScope = CoroutineScope(Dispatchers.IO)
 ) {
     data class Config(
-        val maxDailyLossPct: Double = 0.05,
+        val maxDailyLossPct: Double = Double.POSITIVE_INFINITY,
         val riskPerTradePct: Double = 0.02,
         val maxNotionalToEquity: Double = 5.0,
         val tierRiskPct: List<Double> = listOf(0.005, 0.01, 0.025),
@@ -154,12 +154,6 @@ class RiskManager(
             return@withLock reject("Ryzyko przekracza limit (%.2f > %.2f)".format(tradeRisk, maxTradeRisk))
         }
 
-        val dailyLimit = dayStartEquity * config.maxDailyLossPct
-        val currentLoss = (-_dailyPnl.value).coerceAtLeast(0.0)
-        if (currentLoss + tradeRisk > dailyLimit) {
-            return@withLock reject("Realizacja SL naruszyłaby dzienny limit straty")
-        }
-
         orderTimes.addLast(now)
         Decision.Approved(order)
     }
@@ -251,9 +245,6 @@ class RiskManager(
         }
         _dailyPnl.value = realizedToday + unreal(false)
         _dailyPnlPaper.value = realizedPaperToday + unreal(true)
-        if (dayStartEquity > 0 && !_killSwitch.value && _dailyPnl.value <= -dayStartEquity * config.maxDailyLossPct) {
-            setKillLocked(true, REASON_DAILY_LOSS)
-        }
     }
 
     private fun setKillLocked(on: Boolean, reason: String?) {
@@ -290,7 +281,7 @@ class RiskManager(
         private const val K_DAY = "day"
         private const val K_DAY_EQUITY = "day_equity"
         private const val K_REALIZED = "realized"
-        private const val K_SOURCE = "equity_source"
         private const val K_REALIZED_PAPER = "realized_paper"
+        private const val K_SOURCE = "equity_source"
     }
 }
