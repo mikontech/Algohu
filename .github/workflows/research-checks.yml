@@ -1,0 +1,88 @@
+name: Research tests and build
+
+on:
+  push:
+    branches: [feature/research-lab]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare Gradle
+        run: chmod +x gradlew
+
+      - name: Unit tests
+        id: tests
+        continue-on-error: true
+        shell: bash
+        run: ./gradlew :app:testDebugUnitTest --stacktrace --console=plain 2>&1 | tee research-tests.log
+
+      - name: Android Lint
+        id: lint
+        continue-on-error: true
+        shell: bash
+        run: ./gradlew :app:lintDebug --stacktrace --console=plain 2>&1 | tee research-lint.log
+
+      - name: Compile debug APK
+        id: build
+        continue-on-error: true
+        shell: bash
+        run: ./gradlew :app:assembleDebug --stacktrace --console=plain 2>&1 | tee research-build.log
+
+      - name: Upload logs and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            research-*.log
+            app/build/reports/tests/
+            app/build/test-results/
+            app/build/reports/lint-results-debug.*
+
+      - name: Upload debug APK
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-debug-apk-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 7
+          path: app/build/outputs/apk/debug/*.apk
+
+      - name: Summarize and enforce results
+        if: always()
+        shell: bash
+        env:
+          TESTS: ${{ steps.tests.outcome }}
+          LINT: ${{ steps.lint.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+        run: |
+          {
+            echo '## Research verification'
+            echo "Unit tests: $TESTS"
+            echo "Android Lint: $LINT"
+            echo "Debug APK build: $BUILD"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$TESTS" != success || "$LINT" != success || "$BUILD" != success ]]; then
+            exit 1
+          fi
