@@ -25,7 +25,8 @@ jobs:
         run: |
           set -euo pipefail
           BASE=e91d85d76674869ed900c0a5c7d14652f24ad0a6
-          git restore --source="$BASE" -- app/src/main/java/com/example/algohud/risk/RiskManager.kt app/src/main/java/com/example/algohud/overlay/OverlayService.kt
+          D=app/src/main/java/com/example/algohud
+          git restore --source="$BASE" -- $D/risk/RiskManager.kt $D/risk/PositionSizer.kt $D/overlay/OverlayService.kt $D/execution/AutoExecutionService.kt $D/execution/ScreenScanner.kt
           python3 - <<'PY'
           from pathlib import Path
           p = Path('app/src/main/java/com/example/algohud/risk/RiskManager.kt')
