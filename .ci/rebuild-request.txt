@@ -1,0 +1,5 @@
+Requested: 2026-11-10 23:32 Europe/Warsaw
+Branch: feature/research-lab
+Source baseline: 1b0a14eae2622e786ae411be0d92da8c78dce54a
+Purpose: rerun unit tests, lint, and debug APK build using research-checks.yml.
+Scope: committed HUD probability panel; chat-only StateFlow integration is not included.
