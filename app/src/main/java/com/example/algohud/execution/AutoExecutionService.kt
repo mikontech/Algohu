@@ -408,7 +408,7 @@ class AutoExecutionService : AccessibilityService() {
         val now = SystemClock.uptimeMillis()
         if (now - lastScan < 300) return // throttling – drzewo widoków jest drogie
         lastScan = now
-        val root = rootInActiveWindow ?: return
+        val root = appRoot() ?: return
         if (root.packageName?.toString() != pkg) return
 
         val profile = activeProfile?.takeIf { it.packageName == pkg }
@@ -427,6 +427,19 @@ class AutoExecutionService : AccessibilityService() {
             quote.availableFunds?.let { lastAccountFunds = it; lastAccountCurrency = quote.accountCurrency }
         }
         (profilePrice ?: quote?.mid)?.let { _screenPrice.value = it }
+    }
+
+    /**
+     * Okno aplikacji brokera. NIE polegamy na "aktywnym oknie": gdy tarcza dotyku albo HUD przechwyci dotknięcie,
+     * aktywnym oknem staje się nasza nakładka i bot przestawał widzieć XTB.
+     */
+    private fun appRoot(): AccessibilityNodeInfo? {
+        val active = getRootInActiveWindow()
+        if (active != null && active.packageName?.toString()?.let { targetLabel(it) } != null) return active
+        val other = runCatching {
+            windows.mapNotNull { it.root }.firstOrNull { r -> r.packageName?.toString()?.let { targetLabel(it) } != null }
+        }.getOrNull()
+        return other ?: active
     }
 
     /** Etykieta aplikacji, jeśli to aplikacja docelowa (np. "XTB"); dla pozostałych null. */
@@ -448,7 +461,7 @@ class AutoExecutionService : AccessibilityService() {
      */
     fun dumpTargetWindow(): String? {
         val roots = buildList {
-            rootInActiveWindow?.let { add(it) }
+            appRoot()?.let { add(it) }
             runCatching { windows }.getOrNull()?.forEach { w -> w.root?.let { add(it) } }
         }
         val target = roots.firstOrNull { r -> r.packageName?.toString()?.let { targetLabel(it) } != null }
@@ -468,7 +481,7 @@ class AutoExecutionService : AccessibilityService() {
         }
 
     private suspend fun performOrder(order: OrderRequest, p: UiTargetProfile): ExecutionResult {
-        val root = rootInActiveWindow ?: return ExecutionResult.Rejected("Brak dostępu do aktywnego okna")
+        val root = appRoot() ?: return ExecutionResult.Rejected("Brak dostępu do aktywnego okna")
         val pkg = root.packageName?.toString()
         if (pkg != p.packageName) return ExecutionResult.Rejected("Na ekranie jest $pkg zamiast ${p.packageName}")
         if (order.reduceOnly && !p.canClosePositions) {
@@ -570,7 +583,7 @@ class AutoExecutionService : AccessibilityService() {
         openPositionScreen(instrument)?.let { return ExecutionResult.Rejected(it) }
         tp?.let { price -> setPriceIn("TakeProfitInput", "TakeProfitToggle", price)?.let { return ExecutionResult.Rejected("TP: $it") } }
         sl?.let { price -> setPriceIn("StopLossInput", "StopLossToggle", price)?.let { return ExecutionResult.Rejected("SL: $it") } }
-        val modify = rootInActiveWindow?.let { ScreenScanner.findById(it, "ModifyPositionButton").firstOrNull() }
+        val modify = appRoot()?.let { ScreenScanner.findById(it, "ModifyPositionButton").firstOrNull() }
             ?: return ExecutionResult.Rejected("brak przycisku Modyfikuj pozycję")
         if (!click(modify)) return ExecutionResult.Rejected("nie udało się dotknąć Modyfikuj pozycję")
         delay(1_200)
@@ -582,14 +595,14 @@ class AutoExecutionService : AccessibilityService() {
 
     private suspend fun doClosePosition(instrument: String): ExecutionResult {
         openPositionScreen(instrument)?.let { return ExecutionResult.Rejected(it) }
-        val close = rootInActiveWindow?.let { ScreenScanner.findById(it, "CloseVolumeButton").firstOrNull() }
+        val close = appRoot()?.let { ScreenScanner.findById(it, "CloseVolumeButton").firstOrNull() }
             ?: return ExecutionResult.Rejected("brak przycisku Zamknij pozycję")
         if (!click(close)) return ExecutionResult.Rejected("nie udało się dotknąć Zamknij pozycję")
 
         // XTB otwiera arkusz "Zamknij pozycję" z wolumenem i drugim przyciskiem (CloseButton).
         val sheetBtn = awaitById("CloseButton", 3_000)
             ?: return ExecutionResult.Failed(IllegalStateException("po 'Zamknij pozycję' nie pojawił się arkusz – sprawdź pozycję w XTB"))
-        val root = rootInActiveWindow ?: return ExecutionResult.Failed(IllegalStateException("brak okna arkusza"))
+        val root = appRoot() ?: return ExecutionResult.Failed(IllegalStateException("brak okna arkusza"))
         val title = ScreenScanner.findById(root, "BottomSheetHeaderTitle").firstOrNull()?.text?.toString()
         if (title?.contains("Zamknij", ignoreCase = true) != true) {
             return ExecutionResult.Failed(IllegalStateException("nieoczekiwany arkusz: ${title ?: "?"} – dokończ ręcznie"))
@@ -603,7 +616,7 @@ class AutoExecutionService : AccessibilityService() {
 
         // Sukces dopiero, gdy arkusz zniknie.
         val gone = withTimeoutOrNull(5_000) {
-            while (rootInActiveWindow?.let { ScreenScanner.findById(it, "CloseButton").isNotEmpty() } != false) delay(200)
+            while (appRoot()?.let { ScreenScanner.findById(it, "CloseButton").isNotEmpty() } != false) delay(200)
             true
         } ?: false
         return if (gone) ExecutionResult.Submitted("Zamknięto pozycję $instrument w XTB")
@@ -624,7 +637,7 @@ class AutoExecutionService : AccessibilityService() {
         revealById(containerId) ?: return "nie znaleziono sekcji"
         var field = fieldIn(containerId)
         if (field == null) {
-            val root = rootInActiveWindow ?: return "brak okna"
+            val root = appRoot() ?: return "brak okna"
             val toggleArea = ScreenScanner.findById(root, toggleId).firstOrNull()?.let { n -> Rect().also { n.getBoundsInScreen(it) } }
                 ?: return "nie znaleziono przełącznika"
             val r = Rect()
@@ -647,7 +660,7 @@ class AutoExecutionService : AccessibilityService() {
     }
 
     private fun fieldIn(containerId: String): AccessibilityNodeInfo? {
-        val root = rootInActiveWindow ?: return null
+        val root = appRoot() ?: return null
         val area = ScreenScanner.findById(root, containerId).firstOrNull()?.let { n -> Rect().also { n.getBoundsInScreen(it) } }
             ?: return null
         val r = Rect()
@@ -683,14 +696,14 @@ class AutoExecutionService : AccessibilityService() {
     private suspend fun revealById(id: String): AccessibilityNodeInfo? {
         val plan = listOf(0, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1) // 0 = sprawdź, 1 = w dół, -1 = w górę
         for (step in plan) {
-            val root = rootInActiveWindow ?: return null
+            val root = appRoot() ?: return null
             ScreenScanner.findById(root, id).firstOrNull()?.let { return it }
             val hidden = ScreenScanner.findById(root, id, visibleOnly = false).firstOrNull()
             if (hidden != null &&
                 hidden.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id)
             ) {
                 delay(400)
-                ScreenScanner.findById(rootInActiveWindow ?: return null, id).firstOrNull()?.let { return it }
+                ScreenScanner.findById(appRoot() ?: return null, id).firstOrNull()?.let { return it }
             }
             if (step == 0) continue
             val scroller = findScrollable(root) ?: return null
@@ -705,7 +718,7 @@ class AutoExecutionService : AccessibilityService() {
     private suspend fun awaitById(id: String, timeoutMs: Long): AccessibilityNodeInfo? = withTimeoutOrNull(timeoutMs) {
         var found: AccessibilityNodeInfo? = null
         while (found == null) {
-            found = rootInActiveWindow?.let { ScreenScanner.findById(it, id).firstOrNull() }
+            found = appRoot()?.let { ScreenScanner.findById(it, id).firstOrNull() }
             if (found == null) delay(150)
         }
         found
@@ -724,7 +737,7 @@ class AutoExecutionService : AccessibilityService() {
 
     /** Z ekranu instrumentu wchodzi w (jedyną) otwartą pozycję. null = jesteśmy na ekranie pozycji. */
     private suspend fun openPositionScreen(instrument: String): String? {
-        val root = rootInActiveWindow ?: return "brak dostępu do okna"
+        val root = appRoot() ?: return "brak dostępu do okna"
         if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) return "XTB nie jest na ekranie"
         if (xtbTitle(root) != instrument) return "otwórz w XTB instrument $instrument"
         if (ScreenScanner.findById(root, "ModifyPositionButton").isNotEmpty()) return null
@@ -771,7 +784,7 @@ class AutoExecutionService : AccessibilityService() {
             // Zlecenie bez TP: wyłącz ewentualnie pozostawiony (ręcznie) Take Profit ze starą ceną.
             revealById("TakeProfitContainer")
             if (fieldIn("TakeProfitContainer") != null) {
-                val root = rootInActiveWindow ?: return ExecutionResult.Rejected("brak okna")
+                val root = appRoot() ?: return ExecutionResult.Rejected("brak okna")
                 val area = ScreenScanner.findById(root, "TakeProfitToggle").firstOrNull()?.let { n -> Rect().also { n.getBoundsInScreen(it) } }
                 val r = Rect()
                 val sw = area?.let { a ->
@@ -791,14 +804,14 @@ class AutoExecutionService : AccessibilityService() {
         val confirm = withTimeoutOrNull(3_000) {
             var n: AccessibilityNodeInfo? = null
             while (n == null) {
-                n = rootInActiveWindow?.let { findOrderConfirm(it) }
+                n = appRoot()?.let { findOrderConfirm(it) }
                 if (n == null) delay(150)
             }
             n
         }
         if (confirm != null) {
             // Zabezpieczenie: na ekranie potwierdzenia musi być nasz wolumen.
-            val screenText = rootInActiveWindow?.let { ScreenScanner.collect(it).joinToString(" ") { t -> t.text } }.orEmpty()
+            val screenText = appRoot()?.let { ScreenScanner.collect(it).joinToString(" ") { t -> t.text } }.orEmpty()
             if (!screenText.contains(formatQty(order.quantity))) {
                 return ExecutionResult.Failed(IllegalStateException("ekran potwierdzenia XTB pokazuje inny wolumen – NIE potwierdzam, sprawdź ręcznie"))
             }
@@ -806,7 +819,7 @@ class AutoExecutionService : AccessibilityService() {
                 return ExecutionResult.Failed(IllegalStateException("nie udało się dotknąć 'Potwierdź zlecenie' – stan NIEZNANY, sprawdź XTB"))
             }
             val gone = withTimeoutOrNull(6_000) {
-                while (rootInActiveWindow?.let { findOrderConfirm(it) } != null) delay(200)
+                while (appRoot()?.let { findOrderConfirm(it) } != null) delay(200)
                 true
             } ?: false
             if (!gone) return ExecutionResult.Failed(IllegalStateException("ekran potwierdzenia nadal otwarty – stan NIEZNANY, sprawdź XTB"))
@@ -823,7 +836,7 @@ class AutoExecutionService : AccessibilityService() {
         withTimeoutOrNull(timeoutMs) {
             var found: AccessibilityNodeInfo? = null
             while (found == null) {
-                found = rootInActiveWindow?.let { find(it, sel) }
+                found = appRoot()?.let { find(it, sel) }
                 if (found == null) delay(100)
             }
             found

@@ -179,7 +179,7 @@ class BotOrchestrator(
     // ───────────── ZAKRES: wejście przy dole zakresu po odbiciu, wyjście przy górze ─────────────
     private class RangeState(var lowSeen: Double = Double.MAX_VALUE, var highSeen: Double = -Double.MAX_VALUE, var lastEntryBar: Long = 0L)
     private val rangeStates = HashMap<String, RangeState>()
-    @Volatile private var rangeInfo: Pair<String, String>? = null // (instrument, opis do HUD)
+    private val rangeInfo = java.util.concurrent.ConcurrentHashMap<String, String>() // instrument → opis do HUD
 
     /**
      * on_tick: zakres = High/Low ostatnich [RANGE_LOOKBACK] świec 1m.
@@ -207,7 +207,7 @@ class BotOrchestrator(
         val sh = q?.let { basis(inst, it) } ?: 0.0
         val trendStrong = abs(e20 - e50) > RANGE_MAX_TREND_ATR * atr
         val tooNarrow = width < maxOf(RANGE_MIN_WIDTH_ATR * atr, 8 * spread)
-        rangeInfo = inst to when {
+        rangeInfo[inst] = when {
             trendStrong -> "ZAKRES: silny trend ${if (e20 > e50) "↑" else "↓"} – czekam, aż rynek się uspokoi"
             tooNarrow -> "ZAKRES: zakres za wąski (%.2f) – zysk nie pokryłby spreadu".format(width)
             else -> "ZAKRES %.2f–%.2f: KUPIĘ po odbiciu < %.2f • SPRZEDAM przy > %.2f".format(lo + sh, hi + sh, bottom + sh, top + sh)
@@ -320,6 +320,9 @@ class BotOrchestrator(
         inst: String, dir: Int, px: Double, rawStop: Double, why: String, ts: Long,
         tp: Double? = null, tier: Int = Tier.AGGRESSIVE
     ) {
+        // Bot może złożyć zlecenie tylko na instrumencie otwartym w XTB – pozostałe liczy w tle bez prób wejścia.
+        val onScreen = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() }?.instrument
+        if (onScreen != inst) return
         sessionBlock(inst, ts)?.let { msg("✋ $inst: $why – pominięte: $it"); return }
         val spread = spreadOf(inst)
         val entry = px + spread / 2 * dir
@@ -775,7 +778,7 @@ class BotOrchestrator(
             }
         }
         if (profile.value == BotProfile.RANGE) {
-            val info = rangeInfo?.takeIf { it.first == inst }?.second ?: "ZAKRES: zbieram świece 1m…"
+            val info = rangeInfo[inst] ?: "ZAKRES: zbieram świece 1m (potrzeba 60)…"
             _hud.update { it.copy(learning = "📈 $info\n" + l.summary().substringBefore('\n')) }
             return
         }
