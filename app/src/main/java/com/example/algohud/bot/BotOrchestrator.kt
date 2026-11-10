@@ -144,12 +144,23 @@ class BotOrchestrator(
     // ───────────── Profil agresywny: impuls w czasie rzeczywistym (RT) + Open Range Breakout (ORB) ─────────────
     private val aggressive = MutableStateFlow(prefs.getBoolean("profile_aggressive", true))
     private val rtLastBar = HashMap<String, Long>()
+    private val rtNotes = object : LinkedHashSet<String>() {
+        override fun add(element: String): Boolean {
+            if (size > 200) remove(first())
+            return super.add(element)
+        }
+    }
     private data class Orb(val eventMs: Long, var hi: Double = Double.MIN_VALUE, var lo: Double = Double.MAX_VALUE, var fired: Boolean = false)
     private val orbs = HashMap<String, Orb>()
+
+    private fun applyProfile() {
+        risk.cooldownAfterLossMs = if (aggressive.value) AGGRESSIVE_COOLDOWN_MS else risk.config.cooldownAfterLossMs
+    }
 
     fun toggleProfile(): Boolean {
         val v = !aggressive.value
         aggressive.value = v
+        applyProfile()
         prefs.edit().putBoolean("profile_aggressive", v).apply()
         _hud.update { it.copy(profile = profileLabel()) }
         return v
@@ -181,16 +192,30 @@ class BotOrchestrator(
         if (closed.size < RT_LOOKBACK + 15) return
         val atr = Indicators.atr(closed)?.takeIf { it > 0 } ?: return
         val range = cur.high - cur.low
+        if (range < RT_RANGE_ATR * atr) return // to jeszcze nie jest kandydat na impuls
         val body = abs(cur.close - cur.open)
-        if (range < RT_RANGE_ATR * atr || body < RT_BODY_RATIO * range) return
         val dir = if (cur.close > cur.open) 1 else -1
         // Long: cena przy szczycie (mały górny knot); short: przy dołku (mały dolny knot).
         val wickAgainst = if (dir > 0) cur.high - cur.close else cur.close - cur.low
-        if (wickAgainst > RT_MAX_WICK * range) return
         val look = closed.takeLast(RT_LOOKBACK)
-        val breaks = if (dir > 0) cur.close > look.maxOf { it.high } else cur.close < look.minOf { it.low }
-        if (!breaks) return
+        val level = if (dir > 0) look.maxOf { it.high } else look.minOf { it.low }
+        val breaks = if (dir > 0) cur.close > level else cur.close < level
+        val head = "⚡ RT $inst: świeca %.1f×ATR %s".format(range / atr, if (dir > 0) "↑" else "↓")
+        val why = when {
+            body < RT_BODY_RATIO * range -> "korpus %.0f%% < %.0f%% (warunek może się jeszcze spełnić)".format(body / range * 100, RT_BODY_RATIO * 100)
+            wickAgainst > RT_MAX_WICK * range -> "cena cofnęła się od ekstremum (knot %.0f%%)".format(wickAgainst / range * 100)
+            !breaks -> "nie wybija %s z %d świec (%.2f)".format(if (dir > 0) "szczytu" else "dołka", RT_LOOKBACK, level)
+            risk.cooldownLeftMs() > 0 -> "przerwa po stracie – jeszcze %d s".format(risk.cooldownLeftMs() / 1000)
+            else -> null
+        }
+        if (why != null) {
+            // Raz na świecę i powód (żeby HUD nie migał przy każdym ticku).
+            val key = "$inst@${cur.start}:${why.substringBefore(' ')}"
+            if (rtNotes.add(key)) msg("$head – pominięta: $why")
+            return
+        }
         rtLastBar[inst] = cur.start
+        msg("$head – WCHODZĘ")
         // Stop: tuż za bazą świecy impulsu albo 0,8×ATR – ciaśniejszy z dwóch, ale nie bliżej niż 3× spread / min. dystans.
         val base = if (dir > 0) cur.low - 0.1 * atr else cur.high + 0.1 * atr
         val atrStop = px - dir * 0.8 * atr
@@ -412,6 +437,7 @@ class BotOrchestrator(
                 delay(30_000)
             }
         }
+        applyProfile()
         _hud.update { it.copy(profile = profileLabel()) }
     }
 
@@ -692,6 +718,7 @@ class BotOrchestrator(
 
         // Profil agresywny – progi wejść w czasie rzeczywistym
         const val RT_RANGE_ATR = 1.2      // zasięg bieżącej świecy ≥ 1,2 × ATR14
+        const val AGGRESSIVE_COOLDOWN_MS = 3 * 60_000L // przerwa po stracie w profilu agresywnym
         const val RT_BODY_RATIO = 0.70    // korpus ≥ 70% zasięgu
         const val RT_MAX_WICK = 0.15      // knot po stronie ruchu ≤ 15% zasięgu
         const val RT_LOOKBACK = 10        // wybicie High/Low ostatnich 10 świec 1m

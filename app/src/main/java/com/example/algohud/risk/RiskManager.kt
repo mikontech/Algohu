@@ -63,6 +63,12 @@ class RiskManager(
 
     private val mutex = Mutex()
 
+    /** Przerwa po stratnej transakcji – profil agresywny skraca ją (ustawiane przez orkiestrator). */
+    @Volatile var cooldownAfterLossMs: Long = config.cooldownAfterLossMs
+
+    /** Ile ms przerwy po stracie jeszcze zostało (0 = brak). */
+    fun cooldownLeftMs(): Long = (cooldownAfterLossMs - (clock() - lastLossAt)).coerceAtLeast(0L)
+
     private val _killSwitch = MutableStateFlow(prefs.getBoolean(K_KILL, false))
     val killSwitch: StateFlow<Boolean> = _killSwitch.asStateFlow()
 
@@ -171,7 +177,9 @@ class RiskManager(
         if (existing == null && positions.size >= config.maxOpenPositions) return@withLock reject("Limit otwartych pozycji")
         if (existing != null && !config.allowPyramiding) return@withLock reject("Pozycja już otwarta")
         if (marketBlackout()) return@withLock reject("Okno publikacji makro (blackout)")
-        if (now - lastLossAt < config.cooldownAfterLossMs) return@withLock reject("Cooldown po stratnej transakcji")
+        if (now - lastLossAt < cooldownAfterLossMs) {
+            return@withLock reject("Przerwa po stracie – jeszcze %d s".format((cooldownAfterLossMs - (now - lastLossAt)) / 1000))
+        }
         if (minutesToRollover() < config.noEntryBeforeRolloverMin) {
             return@withLock reject("Za blisko rozliczenia swapu (polityka intraday)")
         }
