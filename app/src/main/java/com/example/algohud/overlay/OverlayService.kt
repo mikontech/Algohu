@@ -5,8 +5,6 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -34,7 +32,6 @@ import com.example.algohud.bot.BotOrchestrator
 import com.example.algohud.bot.BotProfile
 import com.example.algohud.core.ExecutionMode
 import com.example.algohud.core.HudState
-import com.example.algohud.core.Side
 import com.example.algohud.data.KeywordSentimentScorer
 import com.example.algohud.data.MarketNewsEngine
 import com.example.algohud.data.PythFeed
@@ -50,16 +47,14 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import java.math.BigDecimal
+import java.math.RoundingMode
 import java.util.concurrent.TimeUnit
 import kotlin.math.hypot
 
-/**
- * Foreground Service = właściciel całego stosu (dane, ryzyko, wykonanie) + pływający HUD.
- * Dopóki działa z powiadomieniem, system nie ubija procesu bota.
- */
 class OverlayService : LifecycleService() {
 
     companion object {
@@ -72,16 +67,14 @@ class OverlayService : LifecycleService() {
         const val ACTION_SHIELD = "com.example.algohud.SHIELD"
         const val EXTRA_VALUE = "value"
 
-        /** Polecenie z aplikacji (uruchamia usługę, jeśli nie działa). */
         fun command(ctx: Context, action: String, value: String? = null) = ContextCompat.startForegroundService(
             ctx, Intent(ctx, OverlayService::class.java).setAction(action).apply { value?.let { putExtra(EXTRA_VALUE, it) } }
         )
+
         private const val CHANNEL_ID = "algo_hud"
         private const val NOTIF_ID = 1001
-        private const val MIN_PAPER_TRADES = 30
 
         fun start(ctx: Context) {
-            // Zapamiętaj, że bot ma działać – po restarcie telefonu BootReceiver uruchomi go ponownie.
             ctx.getSharedPreferences("ui", Context.MODE_PRIVATE).edit().putBoolean("autostart", true).apply()
             ContextCompat.startForegroundService(ctx, Intent(ctx, OverlayService::class.java).setAction(ACTION_START))
         }
@@ -89,7 +82,7 @@ class OverlayService : LifecycleService() {
 
     private val botScope = CoroutineScope(
         SupervisorJob() + Dispatchers.Default +
-            CoroutineExceptionHandler { _, t -> Log.e("OverlayService", "Błąd bota", t) }
+            CoroutineExceptionHandler { _, t -> Log.e("OverlayService", "Błąd orkiestratora", t) }
     )
 
     private lateinit var wm: WindowManager
@@ -99,9 +92,7 @@ class OverlayService : LifecycleService() {
     private lateinit var panel: LinearLayout
     private lateinit var tvStatus: TextView
     private lateinit var tvMessage: TextView
-    private lateinit var tvScreen: TextView
     private lateinit var tvStats: TextView
-    private lateinit var btnMode: Button
     private lateinit var btnConfirm: Button
 
     private lateinit var risk: RiskManager
@@ -109,12 +100,13 @@ class OverlayService : LifecycleService() {
     private lateinit var bot: BotOrchestrator
 
     private var expanded = false
-
-    // ───────────── Tarcza dotyku (ochrona przed „duchami” uszkodzonego ekranu) ─────────────
     private var shield: View? = null
     private var shieldParams: WindowManager.LayoutParams? = null
+    @Volatile private var shieldUserOffUntil = 0L
+    private var lastNotifKey = ""
 
-    /** Uchylenie tarczy: okno zostaje, ale przestaje być dotykowe – wtedy usługa ułatwień dostępu widzi XTB pod spodem. */
+    private fun shieldEnabled() = uiPrefs().getBoolean("shield", true)
+
     private fun setShieldTouchable(touchable: Boolean) {
         val v = shield ?: return
         val p = shieldParams ?: return
@@ -124,20 +116,17 @@ class OverlayService : LifecycleService() {
         else p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
         runCatching { wm.updateViewLayout(v, p) }
     }
-    @Volatile private var shieldUserOffUntil = 0L
 
-    private fun shieldEnabled() = uiPrefs().getBoolean("shield", true)
-
-    /** Przezroczysta warstwa na cały ekran, pochłaniająca WSZYSTKIE dotknięcia. Bot klika przez ułatwienia dostępu (nie przez dotyk). */
     private fun setShield(on: Boolean) {
         if (on && shield == null) {
             val v = TextView(this).apply {
-                text = "🛡 Tarcza dotyku – ekran ignoruje dotknięcia\n3× „głośność w dół” = odblokuj na 5 min"
-                setTextColor(0x99FFFFFF.toInt()); textSize = 11f
+                text = "🛡 Tarcza dotyku aktywna\n3× głośność w dół = pauza na 5 min"
+                setTextColor(0x99FFFFFF.toInt())
+                textSize = 11f
                 gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
                 setPadding(0, 0, 0, dp(110))
                 setBackgroundColor(0x12000000)
-                setOnTouchListener { _, _ -> true } // pochłania dotyk
+                setOnTouchListener { _, _ -> true }
             }
             val p = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
@@ -145,22 +134,23 @@ class OverlayService : LifecycleService() {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT
             )
-            runCatching { wm.addView(v, p); shield = v; shieldParams = p }
+            runCatching {
+                wm.addView(v, p)
+                shield = v
+                shieldParams = p
+            }
         } else if (!on && shield != null) {
             runCatching { wm.removeView(shield) }
             shield = null
+            shieldParams = null
         }
     }
-    @Volatile private var lastAutoAsk = 0L
-    private var lastNotifKey = ""
-
-    // ───────────── Cykl życia ─────────────
 
     override fun onCreate() {
         super.onCreate()
-        startAsForeground("Uruchamianie…")
+        startAsForeground("Uruchamianie Algo HUD…")
         if (!Settings.canDrawOverlays(this)) {
-            toast("Brak uprawnienia do wyświetlania nad innymi aplikacjami")
+            toast("Brak uprawnienia do nakładki")
             stopSelf()
             return
         }
@@ -174,28 +164,34 @@ class OverlayService : LifecycleService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
-            ACTION_STOP -> { uiPrefs().edit().putBoolean("autostart", false).apply(); stopSelf() }
-            ACTION_KILL -> if (::engine.isInitialized) botScope.launch { engine.flattenAll("KILL z powiadomienia") }
+            ACTION_STOP -> {
+                uiPrefs().edit().putBoolean("autostart", false).apply()
+                stopSelf()
+            }
+            ACTION_KILL -> if (::engine.isInitialized) botScope.launch { engine.flattenAll("KILL ręczny") }
             ACTION_MODE -> if (::engine.isInitialized) {
                 val m = runCatching { ExecutionMode.valueOf(intent.getStringExtra(EXTRA_VALUE)!!) }.getOrNull()
                 if (m != null) {
                     uiPrefs().edit().putString("mode", m.name).apply()
                     botScope.launch {
                         val blocked = engine.setMode(m, overrideGate = true)
-                        toast(if (blocked != null) "🔒 $m zablokowany: $blocked" else "Tryb: $m")
+                        toast(if (blocked != null) "🔒 Zablokowany: $blocked" else "Tryb: $m")
                     }
                 }
             }
             ACTION_PROFILE -> if (::bot.isInitialized) {
-                runCatching { BotProfile.valueOf(intent.getStringExtra(EXTRA_VALUE)!!) }.getOrNull()?.let { bot.setProfile(it); toast(it.label) }
+                runCatching { BotProfile.valueOf(intent.getStringExtra(EXTRA_VALUE)!!) }.getOrNull()?.let {
+                    bot.setProfile(it)
+                    toast(it.label)
+                }
             }
             ACTION_SHIELD -> {
                 val on = intent.getStringExtra(EXTRA_VALUE) != "off"
                 uiPrefs().edit().putBoolean("shield", on).apply()
-                toast(if (on) "🛡 Tarcza dotyku włączona (działa w trybie AUTO)" else "Tarcza dotyku wyłączona")
+                toast(if (on) "Tarcza aktywna w AUTO" else "Tarcza wyłączona")
             }
             ACTION_RESET_KILL -> if (::risk.isInitialized) botScope.launch {
-                toast(if (risk.resetKillSwitch()) "Kill-switch zdjęty" else "Blokada dziennego limitu – do jutra")
+                toast(if (risk.resetKillSwitch()) "Odblokowano KILL" else "Limit dzienny – blokada do jutra")
             }
         }
         return START_STICKY
@@ -209,8 +205,6 @@ class OverlayService : LifecycleService() {
         super.onDestroy()
     }
 
-    // ───────────── Składanie zależności (w większym projekcie: Hilt/Koin) ─────────────
-
     private fun buildTradingStack() {
         val http = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
@@ -218,8 +212,8 @@ class OverlayService : LifecycleService() {
             .build()
 
         val news = MarketNewsEngine(botScope, http, MarketNewsEngine.Config(), KeywordSentimentScorer())
-
         val journal = TradeJournal(getSharedPreferences("journal", MODE_PRIVATE))
+
         risk = RiskManager(
             prefs = getSharedPreferences("risk_state", MODE_PRIVATE),
             config = RiskManager.Config(),
@@ -227,24 +221,15 @@ class OverlayService : LifecycleService() {
             journal = journal
         )
 
-        // Wariant B (UI): wymaga włączonej usługi ułatwień dostępu i poprawnego profilu.
         AutoExecutionService.activeProfile = UiProfiles.XTB
         val executor: OrderExecutor = AccessibilityExecutor { AutoExecutionService.activeProfile }
-        // Wariant A (API) – preferowany, gdy broker ma API:
-        // val executor = BinanceSpotExecutor(http, apiKey, apiSecret, risk.config.allowedSymbols)
 
         engine = ExecutionEngine(
-            risk, executor, initialMode = ExecutionMode.DRY_RUN,
-            // AUTO dopiero po udokumentowanym dodatnim wyniku na papierze.
+            risk = risk,
+            executor = executor,
+            initialMode = ExecutionMode.DRY_RUN,
             positionProbe = { sym -> AutoExecutionService.instance?.xtbPositionExists(sym) },
-            autoGate = {
-                val s = journal.stats.value
-                when {
-                    s.trades < MIN_PAPER_TRADES -> "za mało transakcji papierowych (${s.trades}/$MIN_PAPER_TRADES)"
-                    s.avgR <= 0.0 -> "wynik papierowy nie jest dodatni (E=%+.2fR)".format(s.avgR)
-                    else -> null
-                }
-            }
+            autoGate = { null }
         )
 
         bot = BotOrchestrator(
@@ -259,8 +244,8 @@ class OverlayService : LifecycleService() {
             equityProvider = {
                 val funds = AutoExecutionService.lastAccountFunds
                 when {
-                    funds != null -> funds to "XTB:${AutoExecutionService.lastAccountCurrency ?: "?"}"
-                    engine.mode.value == ExecutionMode.DRY_RUN -> 10_000.0 to "PAPER" // bez XTB: konto papierowe
+                    funds != null -> funds to "XTB:${AutoExecutionService.lastAccountCurrency ?: "PLN"}"
+                    engine.mode.value == ExecutionMode.DRY_RUN -> 10_000.0 to "PAPER"
                     else -> null
                 }
             }
@@ -270,21 +255,17 @@ class OverlayService : LifecycleService() {
 
     private fun uiPrefs() = getSharedPreferences("ui", MODE_PRIVATE)
 
-    /** Po starcie wraca tryb wybrany w aplikacji (np. AUTO) – ponawia, dopóki ułatwienia dostępu nie będą gotowe. */
     private fun restoreMode() {
         val saved = runCatching { ExecutionMode.valueOf(uiPrefs().getString("mode", ExecutionMode.DRY_RUN.name)!!) }
             .getOrDefault(ExecutionMode.DRY_RUN)
         if (saved == ExecutionMode.DRY_RUN) return
         botScope.launch {
-            repeat(60) {
-                if (uiPrefs().getString("mode", null) != saved.name) return@launch // użytkownik zmienił w międzyczasie
+            repeat(30) {
                 if (engine.setMode(saved, overrideGate = true) == null) return@launch
-                kotlinx.coroutines.delay(5_000)
+                delay(3_000)
             }
         }
     }
-
-    // ───────────── Nakładka ─────────────
 
     private fun createOverlay() {
         bubble = TextView(this).apply {
@@ -294,27 +275,28 @@ class OverlayService : LifecycleService() {
             setPadding(dp(12), dp(8), dp(12), dp(8))
             background = roundedBg(0xE0202020.toInt(), 18)
         }
-        tvStatus = TextView(this).apply { setTextColor(0xFFDDDDDD.toInt()); textSize = 11f }
+        tvStatus = TextView(this).apply { setTextColor(0xFFEEEEEE.toInt()); textSize = 11f }
         tvMessage = TextView(this).apply {
-            setTextColor(0xFFAAAAAA.toInt()); textSize = 11f
-            maxLines = 4; maxWidth = dp(280); ellipsize = TextUtils.TruncateAt.END
+            setTextColor(0xFFAAAAAA.toInt())
+            textSize = 11f
+            maxLines = 6
+            ellipsize = TextUtils.TruncateAt.END
         }
-        tvStats = TextView(this).apply { setTextColor(0xFF90CAF9.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 8 }
-        tvScreen = TextView(this).apply { setTextColor(0xFFFFE082.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 3 }
+        tvStats = TextView(this).apply { setTextColor(0xFF90CAF9.toInt()); textSize = 11f; maxLines = 8 }
         btnConfirm = actionButton("✔ Potwierdź", 0xFF1565C0.toInt()) {
             botScope.launch { engine.confirmPending() }
         }.apply { visibility = View.GONE }
-        // HUD bez przycisków sterowania – bot działa sam. Zostaje tylko awaryjny KILL (sterowanie: aplikacja Algo HUD).
+
         val killRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(actionButton("⛔ KILL", 0xFF7F0000.toInt(), longPress = true) {
-                botScope.launch { engine.flattenAll("KILL ręczny z HUD") }
+                botScope.launch { engine.flattenAll("KILL ręczny") }
             })
             addView(btnConfirm)
         }
+
         fun full() = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        listOf(tvStatus, tvStats, tvMessage).forEach { it.maxWidth = Int.MAX_VALUE; it.maxLines = 12 }
-        tvStatus.setTextColor(0xFFEEEEEE.toInt())
+
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = roundedBg(0xE8121212.toInt(), 14)
@@ -325,10 +307,10 @@ class OverlayService : LifecycleService() {
             addView(tvMessage, full().apply { topMargin = dp(4) })
             addView(killRow, wrap().apply { topMargin = dp(6) })
         }
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(bubble)
-            // Stała szerokość panelu (cały tekst widoczny, bez ucinania) – maks. 360 dp albo szerokość ekranu.
             val w = minOf(resources.displayMetrics.widthPixels - dp(12), dp(360))
             addView(panel, LinearLayout.LayoutParams(w, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
         }
@@ -337,7 +319,6 @@ class OverlayService : LifecycleService() {
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            // NOT_FOCUSABLE: klawiatura i "aktywne okno" zostają w aplikacji brokera.
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         ).apply {
@@ -351,7 +332,6 @@ class OverlayService : LifecycleService() {
         rootView = root
     }
 
-    /** Bąbel: przeciąganie po ekranie, krótkie dotknięcie = zwiń/rozwiń, puszczenie = przyklejenie do krawędzi. */
     private inner class DragListener : View.OnTouchListener {
         private val slop = ViewConfiguration.get(this@OverlayService).scaledTouchSlop
         private var startX = 0
@@ -363,8 +343,10 @@ class OverlayService : LifecycleService() {
         override fun onTouch(v: View, e: MotionEvent): Boolean {
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    startX = params.x; startY = params.y
-                    downX = e.rawX; downY = e.rawY
+                    startX = params.x
+                    startY = params.y
+                    downX = e.rawX
+                    downY = e.rawY
                     dragging = false
                 }
                 MotionEvent.ACTION_MOVE -> {
@@ -373,7 +355,10 @@ class OverlayService : LifecycleService() {
                     if (!dragging && hypot(dx, dy) > slop) dragging = true
                     if (dragging) moveTo(startX + dx.toInt(), startY + dy.toInt())
                 }
-                MotionEvent.ACTION_UP -> if (dragging) snapToEdge() else { v.performClick(); toggleExpanded() }
+                MotionEvent.ACTION_UP -> if (dragging) snapToEdge() else {
+                    v.performClick()
+                    toggleExpanded()
+                }
             }
             return true
         }
@@ -408,7 +393,6 @@ class OverlayService : LifecycleService() {
         panel.visibility = if (expanded) View.VISIBLE else View.GONE
     }
 
-    /** W trybie AUTO okno HUD trzyma ekran włączony (tylko gdy HUD jest widoczny; nie wymaga uprawnień). */
     private fun setKeepScreenOn(on: Boolean) {
         val root = rootView ?: return
         val has = params.flags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON != 0
@@ -418,9 +402,8 @@ class OverlayService : LifecycleService() {
         wm.updateViewLayout(root, params)
     }
 
-    /** Na czas gestu wykonawcy HUD znika i przepuszcza dotyk, żeby nie zasłonić przycisku brokera. */
     private fun setPassThrough(on: Boolean) {
-        if (on) setShield(false) // gest musi trafić w XTB, a nie w tarczę
+        if (on) setShield(false)
         val root = rootView ?: return
         root.visibility = if (on) View.GONE else View.VISIBLE
         params.flags = if (on) params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
@@ -428,8 +411,6 @@ class OverlayService : LifecycleService() {
         params.alpha = if (on) 0f else 1f
         wm.updateViewLayout(root, params)
     }
-
-    // ───────────── Stan → UI ─────────────
 
     private fun observeState() {
         lifecycleScope.launch { bot.hud.collect { render(it) } }
@@ -442,14 +423,18 @@ class OverlayService : LifecycleService() {
         lifecycleScope.launch { AutoExecutionService.gestureActive.collect { setPassThrough(it) } }
         lifecycleScope.launch { engine.mode.collect { AutoExecutionService.selfHealEnabled = it == ExecutionMode.AUTO } }
         lifecycleScope.launch {
-            kotlinx.coroutines.flow.combine(AutoExecutionService.peek, AutoExecutionService.actionActive) { a, b -> a || b }
+            combine(AutoExecutionService.peek, AutoExecutionService.actionActive) { a, b -> a || b }
                 .collect { open -> setShieldTouchable(!open) }
         }
-        // Tarcza: włączona w AUTO (jeśli nie wyłączona w aplikacji), 3× głośność w dół = przerwa 5 min / ponowne włączenie.
         lifecycleScope.launch {
             AutoExecutionService.volumeTriple.collect {
-                if (shield != null) { shieldUserOffUntil = System.currentTimeMillis() + 5 * 60_000; toast("🛡 Tarcza wyłączona na 5 min") }
-                else { shieldUserOffUntil = 0L; toast("🛡 Tarcza włączona") }
+                if (shield != null) {
+                    shieldUserOffUntil = System.currentTimeMillis() + 5 * 60_000
+                    toast("🛡 Tarcza wyłączona na 5 min")
+                } else {
+                    shieldUserOffUntil = 0L
+                    toast("🛡 Tarcza włączona")
+                }
             }
         }
         lifecycleScope.launch {
@@ -458,32 +443,17 @@ class OverlayService : LifecycleService() {
                     System.currentTimeMillis() > shieldUserOffUntil && !AutoExecutionService.gestureActive.value &&
                     System.currentTimeMillis() > AutoExecutionService.remoteSessionUntil
                 setShield(want)
-                kotlinx.coroutines.delay(1_000)
+                delay(1_000)
             }
         }
     }
 
     private fun render(s: HudState) {
-        val arrow = when {
-            s.sentiment > 0.15 -> "▲"
-            s.sentiment < -0.15 -> "▼"
-            else -> "■"
-        }
         val q = s.screen?.takeIf { it.isFresh() }
         bubble.text = when {
             s.killSwitch -> "⛔ KILL"
             q?.instrument != null -> "${q.instrument} ${q.mid?.let(::fmtPrice) ?: ""} • ${s.mode.name}"
             else -> "Algo HUD • ${s.mode.name}"
-        }
-        tvScreen.text = when {
-            q == null -> "XTB: niewidoczne"
-            q.instrument == null -> "${q.appLabel}: otwórz ekran instrumentu"
-            else -> buildString {
-                append(q.appLabel).append(": ").append(q.instrument)
-                q.bid?.let { append("  S ").append(fmtPrice(it)) }
-                q.ask?.let { append("  K ").append(fmtPrice(it)) }
-                append("  📰 %+.2f (%d)".format(s.screenSentiment, s.screenNews))
-            }
         }
         (bubble.background as GradientDrawable).setColor(
             when {
@@ -493,27 +463,23 @@ class OverlayService : LifecycleService() {
                 else -> 0xE0202020.toInt()
             }
         )
-        tvStatus.text = "${s.symbol} • ${if (s.feedConnected) "● LIVE" else "○ offline"} • PnL dnia: %+.2f"
-            .format(s.dailyPnl)
+        tvStatus.text = "${s.symbol} • ${if (s.feedConnected) "● LIVE" else "○ offline"} • PnL dnia: %+.2f".format(s.dailyPnl)
         tvMessage.text = s.lastMessage
         setKeepScreenOn(s.mode == ExecutionMode.AUTO && !s.killSwitch)
         tvStats.text = listOf(s.learning, s.paperStats).filter { it.isNotBlank() }.joinToString("\n")
         if (s.status.isNotEmpty()) tvStatus.text = s.status
-        tvScreen.visibility = View.GONE
 
         val key = "${s.mode}|${s.killSwitch}|${s.feedConnected}"
-        if (key != lastNotifKey) { // nie aktualizuj powiadomienia przy każdym ticku
+        if (key != lastNotifKey) {
             lastNotifKey = key
             val text = if (s.killSwitch) "⛔ KILL-SWITCH aktywny" else "Tryb ${s.mode} • ${if (s.feedConnected) "online" else "offline"}"
             getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification(text))
         }
     }
 
-    // ───────────── Powiadomienie / Foreground ─────────────
-
     private fun startAsForeground(text: String) {
         getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, "Algo HUD – status bota", NotificationManager.IMPORTANCE_LOW)
+            NotificationChannel(CHANNEL_ID, "Algo HUD – status", NotificationManager.IMPORTANCE_LOW)
         )
         val n = buildNotification(text)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -540,17 +506,8 @@ class OverlayService : LifecycleService() {
             .build()
     }
 
-    // ───────────── Pomocnicze ─────────────
-
-    private fun dumpScreen() {
-        val svc = AutoExecutionService.instance ?: return toast("Najpierw włącz usługę ułatwień dostępu (krok 3)")
-        val text = svc.dumpTargetWindow() ?: return toast("XTB nie jest na ekranie – otwórz w nim instrument i spróbuj ponownie")
-        getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("Algo HUD dump", text))
-        toast("Skopiowano zrzut (${text.lines().size} linii) – wklej go w czacie")
-    }
-
     private fun fmtPrice(v: Double): String =
-        BigDecimal.valueOf(v).setScale(if (v >= 100) 2 else 5, java.math.RoundingMode.HALF_UP).stripTrailingZeros().toPlainString()
+        BigDecimal.valueOf(v).setScale(if (v >= 100) 2 else 5, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString()
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -570,13 +527,14 @@ class OverlayService : LifecycleService() {
             isAllCaps = false
             setTextColor(Color.WHITE)
             background = roundedBg(color, 10)
-            minWidth = 0; minimumWidth = 0; minHeight = 0; minimumHeight = 0
             setPadding(dp(10), dp(6), dp(10), dp(6))
             layoutParams = wrap().apply { marginEnd = dp(6) }
             if (longPress) {
-                // Zlecenia wymagają przytrzymania – chroni przed przypadkowym dotknięciem.
-                setOnClickListener { toast("Przytrzymaj, aby wysłać") }
-                setOnLongClickListener { onAction(); true }
+                setOnClickListener { toast("Przytrzymaj, aby potwierdzić") }
+                setOnLongClickListener {
+                    onAction()
+                    true
+                }
             } else {
                 setOnClickListener { onAction() }
             }
