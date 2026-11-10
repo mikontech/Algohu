@@ -477,6 +477,12 @@ class BotOrchestrator(
         }
         scope.launch { news.ticks.collect { onFeedTick(it) } }
         scope.launch {
+            while (isActive) {
+                runCatching { buildStatus() }.onSuccess { st -> _hud.update { it.copy(status = st) } }
+                delay(1_000)
+            }
+        }
+        scope.launch {
             combine(news.sentiment, news.connected, risk.killSwitch, risk.dailyPnl, engine.mode) { s, c, k, pnl, m ->
                 _hud.update { it.copy(sentiment = s, feedConnected = c, killSwitch = k, dailyPnl = pnl, mode = m) }
             }.collect()
@@ -793,7 +799,37 @@ class BotOrchestrator(
         if (abs(old - v) > old * 0.1) prefs.edit().putString("sp_$inst", v.toString()).apply()
     }
 
-    private fun msg(text: String) = _hud.update { it.copy(lastMessage = text) }
+    private val clockFmt = java.time.format.DateTimeFormatter.ofPattern("HH:mm")
+    private fun msg(text: String) = _hud.update {
+        it.copy(lastMessage = java.time.LocalTime.now(MarketHours.ZONE).format(clockFmt) + " " + text)
+    }
+
+    private fun f2(v: Double?) = v?.let { "%.2f".format(it) } ?: "—"
+
+    /** Stan do HUD – wyłącznie prawdziwe dane: ekran XTB, konto, księga bota. */
+    private suspend fun buildStatus(): String {
+        val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument != null }
+        val inst = q?.instrument ?: hudLearningInstrument
+        val line1 = if (q != null) {
+            val spr = if (q.bid != null && q.ask != null) " • spread ${f2(q.ask - q.bid)}" else ""
+            "$inst: Sell ${f2(q.bid)} / Buy ${f2(q.ask)}$spr"
+        } else "XTB: otwórz bilet instrumentu (np. GOLD) – bot widzi tylko to, co na ekranie"
+        val kill = if (risk.killSwitch.value) "\n⛔ KILL: ${risk.killReason ?: "aktywny"} – nowe zlecenia zablokowane" else ""
+        val line2 = "Tryb ${engine.mode.value.name} • ${profile.value.label}$kill"
+        val funds = AutoExecutionService.lastAccountFunds?.let { "%.2f %s".format(it, AutoExecutionService.lastAccountCurrency ?: "") } ?: "nieznane (otwórz bilet)"
+        val pv = if (pointValue(inst) != null) "znana ✓" else "NIEZNANA – przewiń bilet do „Wartość kontraktu”"
+        val pos = risk.position(inst)?.let { p ->
+            val sh = q?.let { basis(inst, it) } ?: 0.0
+            "%s %s @ %.2f • SL %.2f%s%s".format(
+                if (p.side == Side.BUY) "LONG" else "SHORT", BigDecimal.valueOf(p.quantity).toPlainString(),
+                p.entryPrice + sh, p.stopPrice + sh, p.takeProfit?.let { " • TP %.2f".format(it + sh) } ?: "",
+                if (p.paper) " (papier)" else " (XTB)"
+            )
+        } ?: "brak"
+        val pnl = "Wynik dnia – XTB: %+.2f • papier: %+.2f".format(risk.dailyPnl.value, risk.dailyPnlPaper.value)
+        return listOf(line1, line2, "Środki: $funds • wartość lota: $pv", "Pozycja bota: $pos", pnl,
+            "(pozycje otwarte ręcznie w XTB nie są w księdze bota)").joinToString("\n")
+    }
 
     private fun aliasesFor(instrument: String): List<String> {
         val base = instrument.substringBefore('.')

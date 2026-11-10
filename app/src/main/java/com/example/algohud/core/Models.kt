@@ -119,6 +119,8 @@ data class HudState(
     val screenNews: Int = 0,
     val paperStats: String = "",
     val profile: String = "",
+    /** Czytelny, wielolinijkowy stan bota (prawdziwe wartości z XTB i księgi bota). */
+    val status: String = "",
     val learning: String = "",
     val lastMessage: String = "Uruchamianie…"
 )

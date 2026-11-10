@@ -69,6 +69,8 @@ class MainActivity : ComponentActivity() {
 
         TextView(this).apply { text = "\nBezpieczeństwo"; textSize = 18f }.also { layout.addView(it) }
         button("Reset KILL (nie działa po dziennym limicie)") { OverlayService.command(this, OverlayService.ACTION_RESET_KILL) }
+        button("🛡 Tarcza dotyku: WŁĄCZ (w AUTO ekran ignoruje dotyk)") { OverlayService.command(this, OverlayService.ACTION_SHIELD, "on") }
+        button("Tarcza dotyku: wyłącz") { OverlayService.command(this, OverlayService.ACTION_SHIELD, "off") }
         val scroll = ScrollView(this).apply { addView(layout) }
         // Odsunięcie od paska stanu, wycięcia aparatu i paska nawigacji.
         ViewCompat.setOnApplyWindowInsetsListener(scroll) { v, insets ->

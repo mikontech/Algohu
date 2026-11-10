@@ -80,7 +80,12 @@ class RiskManager(
 
     private var tradingDay: LocalDate = prefs.getString(K_DAY, null)?.let(LocalDate::parse) ?: today()
     private var dayStartEquity = prefs.getString(K_DAY_EQUITY, null)?.toDoubleOrNull() ?: 0.0
-    private var realizedToday = prefs.getString(K_REALIZED, null)?.toDoubleOrNull() ?: 0.0
+    private var realizedToday = prefs.getString(K_REALIZED, null)?.toDoubleOrNull() ?: 0.0 // tylko prawdziwe (XTB)
+    private var realizedPaperToday = prefs.getString(K_REALIZED_PAPER, null)?.toDoubleOrNull() ?: 0.0
+
+    private val _dailyPnlPaper = MutableStateFlow(0.0)
+    /** Wynik dnia transakcji papierowych (DRY_RUN) – nie wpływa na KILL. */
+    val dailyPnlPaper: StateFlow<Double> = _dailyPnlPaper.asStateFlow()
     private var equity = 0.0
     private var lastLossAt = 0L
 
@@ -219,7 +224,7 @@ class RiskManager(
             existing != null && existing.side != order.side -> {
                 val closedQty = min(qty, existing.quantity)
                 val pnl = (price - existing.entryPrice) * closedQty * existing.side.sign * existing.pointValue
-                realizedToday += pnl
+                if (existing.paper) realizedPaperToday += pnl else realizedToday += pnl
                 journal?.record(closedTradeLocked(existing, closedQty, price, pnl, order.reason))
                 if (pnl < 0) lastLossAt = clock()
                 val remaining = existing.quantity - closedQty
@@ -358,16 +363,18 @@ class RiskManager(
         tradingDay = d
         dayStartEquity = if (equity > 0) equity else 0.0
         realizedToday = 0.0
+        realizedPaperToday = 0.0
         if (killReason == REASON_DAILY_LOSS) setKillLocked(false, null)
         persistLocked()
     }
 
     private fun recomputePnlLocked() {
-        val unrealized = positions.values.sumOf { p ->
+        fun unreal(paper: Boolean) = positions.values.filter { it.paper == paper }.sumOf { p ->
             val m = marks[p.symbol] ?: p.entryPrice
             (m - p.entryPrice) * p.quantity * p.side.sign * p.pointValue
         }
-        _dailyPnl.value = realizedToday + unrealized
+        _dailyPnl.value = realizedToday + unreal(false)          // prawdziwe konto → limit dzienny / KILL
+        _dailyPnlPaper.value = realizedPaperToday + unreal(true)
         if (dayStartEquity > 0 && !_killSwitch.value &&
             _dailyPnl.value <= -dayStartEquity * config.maxDailyLossPct
         ) {
@@ -387,6 +394,7 @@ class RiskManager(
             .putString(K_DAY, tradingDay.toString())
             .putString(K_DAY_EQUITY, dayStartEquity.toString())
             .putString(K_REALIZED, realizedToday.toString())
+            .putString(K_REALIZED_PAPER, realizedPaperToday.toString())
             .apply()
     }
 
@@ -399,5 +407,6 @@ class RiskManager(
         private const val K_DAY_EQUITY = "day_equity"
         private const val K_REALIZED = "realized"
         private const val K_SOURCE = "equity_source"
+        private const val K_REALIZED_PAPER = "realized_paper"
     }
 }

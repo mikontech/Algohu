@@ -69,6 +69,7 @@ class OverlayService : LifecycleService() {
         const val ACTION_MODE = "com.example.algohud.MODE"
         const val ACTION_PROFILE = "com.example.algohud.PROFILE"
         const val ACTION_RESET_KILL = "com.example.algohud.RESET_KILL"
+        const val ACTION_SHIELD = "com.example.algohud.SHIELD"
         const val EXTRA_VALUE = "value"
 
         /** Polecenie z aplikacji (uruchamia usługę, jeśli nie działa). */
@@ -106,6 +107,36 @@ class OverlayService : LifecycleService() {
     private lateinit var bot: BotOrchestrator
 
     private var expanded = false
+
+    // ───────────── Tarcza dotyku (ochrona przed „duchami” uszkodzonego ekranu) ─────────────
+    private var shield: View? = null
+    @Volatile private var shieldUserOffUntil = 0L
+
+    private fun shieldEnabled() = uiPrefs().getBoolean("shield", true)
+
+    /** Przezroczysta warstwa na cały ekran, pochłaniająca WSZYSTKIE dotknięcia. Bot klika przez ułatwienia dostępu (nie przez dotyk). */
+    private fun setShield(on: Boolean) {
+        if (on && shield == null) {
+            val v = TextView(this).apply {
+                text = "🛡 Tarcza dotyku – ekran ignoruje dotknięcia\n3× „głośność w dół” = odblokuj na 5 min"
+                setTextColor(0x99FFFFFF.toInt()); textSize = 11f
+                gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                setPadding(0, 0, 0, dp(110))
+                setBackgroundColor(0x12000000)
+                setOnTouchListener { _, _ -> true } // pochłania dotyk
+            }
+            val p = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT
+            )
+            runCatching { wm.addView(v, p); shield = v }
+        } else if (!on && shield != null) {
+            runCatching { wm.removeView(shield) }
+            shield = null
+        }
+    }
     @Volatile private var lastAutoAsk = 0L
     private var lastNotifKey = ""
 
@@ -144,6 +175,11 @@ class OverlayService : LifecycleService() {
             ACTION_PROFILE -> if (::bot.isInitialized) {
                 runCatching { BotProfile.valueOf(intent.getStringExtra(EXTRA_VALUE)!!) }.getOrNull()?.let { bot.setProfile(it); toast(it.label) }
             }
+            ACTION_SHIELD -> {
+                val on = intent.getStringExtra(EXTRA_VALUE) != "off"
+                uiPrefs().edit().putBoolean("shield", on).apply()
+                toast(if (on) "🛡 Tarcza dotyku włączona (działa w trybie AUTO)" else "Tarcza dotyku wyłączona")
+            }
             ACTION_RESET_KILL -> if (::risk.isInitialized) botScope.launch {
                 toast(if (risk.resetKillSwitch()) "Kill-switch zdjęty" else "Blokada dziennego limitu – do jutra")
             }
@@ -153,6 +189,7 @@ class OverlayService : LifecycleService() {
 
     override fun onDestroy() {
         botScope.cancel()
+        setShield(false)
         rootView?.let { runCatching { wm.removeView(it) } }
         rootView = null
         super.onDestroy()
@@ -260,21 +297,25 @@ class OverlayService : LifecycleService() {
             })
             addView(btnConfirm)
         }
+        fun full() = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        listOf(tvStatus, tvStats, tvMessage).forEach { it.maxWidth = Int.MAX_VALUE; it.maxLines = 12 }
+        tvStatus.setTextColor(0xFFEEEEEE.toInt())
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = roundedBg(0xE0121212.toInt(), 14)
+            background = roundedBg(0xE8121212.toInt(), 14)
             setPadding(dp(10), dp(8), dp(10), dp(8))
             visibility = View.GONE
-            addView(tvStatus)
-            addView(tvScreen)
-            addView(tvStats)
-            addView(tvMessage)
+            addView(tvStatus, full())
+            addView(tvStats, full().apply { topMargin = dp(4) })
+            addView(tvMessage, full().apply { topMargin = dp(4) })
             addView(killRow, wrap().apply { topMargin = dp(6) })
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(bubble)
-            addView(panel, wrap().apply { topMargin = dp(4) })
+            // Stała szerokość panelu (cały tekst widoczny, bez ucinania) – maks. 360 dp albo szerokość ekranu.
+            val w = minOf(resources.displayMetrics.widthPixels - dp(12), dp(360))
+            addView(panel, LinearLayout.LayoutParams(w, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
         }
 
         params = WindowManager.LayoutParams(
@@ -364,6 +405,7 @@ class OverlayService : LifecycleService() {
 
     /** Na czas gestu wykonawcy HUD znika i przepuszcza dotyk, żeby nie zasłonić przycisku brokera. */
     private fun setPassThrough(on: Boolean) {
+        if (on) setShield(false) // gest musi trafić w XTB, a nie w tarczę
         val root = rootView ?: return
         root.visibility = if (on) View.GONE else View.VISIBLE
         params.flags = if (on) params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
@@ -383,6 +425,21 @@ class OverlayService : LifecycleService() {
             }
         }
         lifecycleScope.launch { AutoExecutionService.gestureActive.collect { setPassThrough(it) } }
+        // Tarcza: włączona w AUTO (jeśli nie wyłączona w aplikacji), 3× głośność w dół = przerwa 5 min / ponowne włączenie.
+        lifecycleScope.launch {
+            AutoExecutionService.volumeTriple.collect {
+                if (shield != null) { shieldUserOffUntil = System.currentTimeMillis() + 5 * 60_000; toast("🛡 Tarcza wyłączona na 5 min") }
+                else { shieldUserOffUntil = 0L; toast("🛡 Tarcza włączona") }
+            }
+        }
+        lifecycleScope.launch {
+            while (true) {
+                val want = shieldEnabled() && engine.mode.value == ExecutionMode.AUTO &&
+                    System.currentTimeMillis() > shieldUserOffUntil && !AutoExecutionService.gestureActive.value
+                setShield(want)
+                kotlinx.coroutines.delay(1_000)
+            }
+        }
     }
 
     private fun render(s: HudState) {
@@ -394,8 +451,8 @@ class OverlayService : LifecycleService() {
         val q = s.screen?.takeIf { it.isFresh() }
         bubble.text = when {
             s.killSwitch -> "⛔ KILL"
-            q?.instrument != null -> "$arrow %+.2f  ${q.instrument} ${q.mid?.let(::fmtPrice) ?: ""}".format(s.sentiment)
-            else -> "$arrow %+.2f".format(s.sentiment) + (s.lastPrice?.let { "  %.2f".format(it) } ?: "")
+            q?.instrument != null -> "${q.instrument} ${q.mid?.let(::fmtPrice) ?: ""} • ${s.mode.name}"
+            else -> "Algo HUD • ${s.mode.name}"
         }
         tvScreen.text = when {
             q == null -> "XTB: niewidoczne"
@@ -420,7 +477,8 @@ class OverlayService : LifecycleService() {
         tvMessage.text = s.lastMessage
         setKeepScreenOn(s.mode == ExecutionMode.AUTO && !s.killSwitch)
         tvStats.text = listOf(s.learning, s.paperStats).filter { it.isNotBlank() }.joinToString("\n")
-        tvStatus.text = tvStatus.text.toString() + "\nTryb: ${s.mode.name}" + (if (s.profile.isNotEmpty()) " • ${s.profile}" else "")
+        if (s.status.isNotEmpty()) tvStatus.text = s.status
+        tvScreen.visibility = View.GONE
 
         val key = "${s.mode}|${s.killSwitch}|${s.feedConnected}"
         if (key != lastNotifKey) { // nie aktualizuj powiadomienia przy każdym ticku

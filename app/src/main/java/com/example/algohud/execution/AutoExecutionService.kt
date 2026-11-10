@@ -357,6 +357,10 @@ class AutoExecutionService : AccessibilityService() {
         /** Cena odczytana z ekranu brokera – do weryfikacji spójności z feedem. */
         val screenPrice: StateFlow<Double?> = _screenPrice.asStateFlow()
 
+        private val _volumeTriple = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
+        /** 3× "głośność w dół" w ciągu 2 s – przełącza tarczę dotyku. */
+        val volumeTriple: SharedFlow<Unit> = _volumeTriple.asSharedFlow()
+
         private val _gestureActive = MutableStateFlow(false)
         /** HUD obserwuje to i chowa się na czas gestu, żeby nie przechwycić dotyku. */
         val gestureActive: StateFlow<Boolean> = _gestureActive.asStateFlow()
@@ -385,6 +389,18 @@ class AutoExecutionService : AccessibilityService() {
     }
 
     override fun onInterrupt() = Unit
+
+    private val volPresses = ArrayDeque<Long>()
+
+    override fun onKeyEvent(event: android.view.KeyEvent): Boolean {
+        if (event.keyCode == android.view.KeyEvent.KEYCODE_VOLUME_DOWN && event.action == android.view.KeyEvent.ACTION_DOWN) {
+            val now = SystemClock.uptimeMillis()
+            volPresses.addLast(now)
+            while (volPresses.isNotEmpty() && now - volPresses.first() > 2_000) volPresses.removeFirst()
+            if (volPresses.size >= 3) { volPresses.clear(); _volumeTriple.tryEmit(Unit) }
+        }
+        return false // głośność działa normalnie
+    }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val pkg = event?.packageName?.toString() ?: return
