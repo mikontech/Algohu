@@ -110,6 +110,18 @@ class OverlayService : LifecycleService() {
 
     // ───────────── Tarcza dotyku (ochrona przed „duchami” uszkodzonego ekranu) ─────────────
     private var shield: View? = null
+    private var shieldParams: WindowManager.LayoutParams? = null
+
+    /** Uchylenie tarczy: okno zostaje, ale przestaje być dotykowe – wtedy usługa ułatwień dostępu widzi XTB pod spodem. */
+    private fun setShieldTouchable(touchable: Boolean) {
+        val v = shield ?: return
+        val p = shieldParams ?: return
+        val has = p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE == 0
+        if (has == touchable) return
+        p.flags = if (touchable) p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+        else p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        runCatching { wm.updateViewLayout(v, p) }
+    }
     @Volatile private var shieldUserOffUntil = 0L
 
     private fun shieldEnabled() = uiPrefs().getBoolean("shield", true)
@@ -131,7 +143,7 @@ class OverlayService : LifecycleService() {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT
             )
-            runCatching { wm.addView(v, p); shield = v }
+            runCatching { wm.addView(v, p); shield = v; shieldParams = p }
         } else if (!on && shield != null) {
             runCatching { wm.removeView(shield) }
             shield = null
@@ -425,6 +437,10 @@ class OverlayService : LifecycleService() {
             }
         }
         lifecycleScope.launch { AutoExecutionService.gestureActive.collect { setPassThrough(it) } }
+        lifecycleScope.launch {
+            kotlinx.coroutines.flow.combine(AutoExecutionService.peek, AutoExecutionService.actionActive) { a, b -> a || b }
+                .collect { open -> setShieldTouchable(!open) }
+        }
         // Tarcza: włączona w AUTO (jeśli nie wyłączona w aplikacji), 3× głośność w dół = przerwa 5 min / ponowne włączenie.
         lifecycleScope.launch {
             AutoExecutionService.volumeTriple.collect {

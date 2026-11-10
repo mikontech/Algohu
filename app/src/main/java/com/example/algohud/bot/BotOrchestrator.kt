@@ -179,6 +179,7 @@ class BotOrchestrator(
     // ───────────── ZAKRES: wejście przy dole zakresu po odbiciu, wyjście przy górze ─────────────
     private class RangeState(var lowSeen: Double = Double.MAX_VALUE, var highSeen: Double = -Double.MAX_VALUE, var lastEntryBar: Long = 0L)
     private val rangeStates = HashMap<String, RangeState>()
+    private var lastBlindNote = 0L
     private val rangeInfo = java.util.concurrent.ConcurrentHashMap<String, String>() // instrument → opis do HUD
 
     /**
@@ -322,7 +323,15 @@ class BotOrchestrator(
     ) {
         // Bot może złożyć zlecenie tylko na instrumencie otwartym w XTB – pozostałe liczy w tle bez prób wejścia.
         val onScreen = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() }?.instrument
-        if (onScreen != inst) return
+        if (onScreen != inst && engine.mode.value != ExecutionMode.DRY_RUN) {
+            // Nie po cichu: dla instrumentu głównego powiedz, dlaczego sygnał przepadł (maks. raz na minutę).
+            if (inst == hudLearningInstrument && ts - lastBlindNote > 60_000) {
+                lastBlindNote = ts
+                msg("✋ $inst: sygnał ($why), ale nie widzę $inst w XTB – ${AutoExecutionService.diag}")
+            }
+            return
+        }
+        if (onScreen != inst && inst != hudLearningInstrument) return // papier: tylko instrument główny i ten na ekranie
         sessionBlock(inst, ts)?.let { msg("✋ $inst: $why – pominięte: $it"); return }
         val spread = spreadOf(inst)
         val entry = px + spread / 2 * dir
@@ -816,7 +825,8 @@ class BotOrchestrator(
         val line1 = if (q != null) {
             val spr = if (q.bid != null && q.ask != null) " • spread ${f2(q.ask - q.bid)}" else ""
             "$inst: Sell ${f2(q.bid)} / Buy ${f2(q.ask)}$spr"
-        } else "XTB: otwórz bilet instrumentu (np. GOLD) – bot widzi tylko to, co na ekranie"
+        } else "XTB: ${AutoExecutionService.diag}" +
+            (if (AutoExecutionService.instance == null) " • USŁUGA UŁATWIEŃ DOSTĘPU WYŁĄCZONA" else "")
         val kill = if (risk.killSwitch.value) "\n⛔ KILL: ${risk.killReason ?: "aktywny"} – nowe zlecenia zablokowane" else ""
         val line2 = "Tryb ${engine.mode.value.name} • ${profile.value.label}$kill"
         val funds = AutoExecutionService.lastAccountFunds?.let { "%.2f %s".format(it, AutoExecutionService.lastAccountCurrency ?: "") } ?: "nieznane (otwórz bilet)"
@@ -831,7 +841,7 @@ class BotOrchestrator(
         } ?: "brak"
         val pnl = "Wynik dnia – XTB: %+.2f • papier: %+.2f".format(risk.dailyPnl.value, risk.dailyPnlPaper.value)
         return listOf(line1, line2, "Środki: $funds • wartość lota: $pv", "Pozycja bota: $pos", pnl,
-            "(pozycje otwarte ręcznie w XTB nie są w księdze bota)").joinToString("\n")
+            "(pozycje otwarte ręcznie w XTB nie są w księdze bota) • wersja ${com.example.algohud.BuildConfig.GIT_SHA}").joinToString("\n")
     }
 
     private fun aliasesFor(instrument: String): List<String> {
@@ -852,7 +862,7 @@ class BotOrchestrator(
         const val RANGE_CONFIRM_ATR = 0.3      // odbicie o ≥ 0,3×ATR od dołka/szczytu = potwierdzenie
         const val RANGE_MAX_TREND_ATR = 1.0    // silny trend → nie gramy zakresu
         const val RANGE_MIN_WIDTH_ATR = 2.0    // zakres musi mieć ≥ 2×ATR
-        const val RANGE_MIN_REWARD_R = 1.2     // cel ≥ 1,2× ryzyko
+        const val RANGE_MIN_REWARD_R = 1.0     // cel ≥ 1× ryzyko
         const val RT_BODY_RATIO = 0.70    // korpus ≥ 70% zasięgu
         const val RT_MAX_WICK = 0.15      // knot po stronie ruchu ≤ 15% zasięgu
         const val RT_LOOKBACK = 10        // wybicie High/Low ostatnich 10 świec 1m

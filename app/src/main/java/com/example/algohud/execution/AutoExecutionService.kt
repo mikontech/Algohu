@@ -18,6 +18,8 @@ import com.example.algohud.risk.RiskManager
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
@@ -361,6 +363,16 @@ class AutoExecutionService : AccessibilityService() {
         /** 3× "głośność w dół" w ciągu 2 s – przełącza tarczę dotyku. */
         val volumeTriple: SharedFlow<Unit> = _volumeTriple.asSharedFlow()
 
+        private val _peek = MutableStateFlow(false)
+        /** true = usługa nie widzi XTB i prosi nakładkę o chwilowe uchylenie tarczy dotyku. */
+        val peek: StateFlow<Boolean> = _peek.asStateFlow()
+        private val _actionActive = MutableStateFlow(false)
+        /** true = trwa sekwencja kliknięć w XTB (tarcza musi być uchylona). */
+        val actionActive: StateFlow<Boolean> = _actionActive.asStateFlow()
+        /** Diagnoza odczytu ekranu (do HUD). */
+        @Volatile var diag: String = "usługa jeszcze nie odczytała ekranu"
+        @Volatile private var lastTargetEventAt = 0L
+
         private val _gestureActive = MutableStateFlow(false)
         /** HUD obserwuje to i chowa się na czas gestu, żeby nie przechwycić dotyku. */
         val gestureActive: StateFlow<Boolean> = _gestureActive.asStateFlow()
@@ -387,6 +399,7 @@ class AutoExecutionService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        startPolling()
         Log.i(TAG, "Połączono")
     }
 
@@ -396,6 +409,7 @@ class AutoExecutionService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        pollJob?.cancel()
         instance = null
         super.onDestroy()
     }
@@ -471,13 +485,24 @@ class AutoExecutionService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val pkg = event?.packageName?.toString() ?: return
         if (pkg == "com.android.systemui" || pkg == "android") { maybeAcceptCapture(pkg); return }
-        val label = targetLabel(pkg) ?: return // inne aplikacje odrzucamy od razu – nic z nich nie czytamy
-        val now = SystemClock.uptimeMillis()
-        if (now - lastScan < 300) return // throttling – drzewo widoków jest drogie
-        lastScan = now
-        val root = appRoot() ?: return
-        if (root.packageName?.toString() != pkg) return
+        targetLabel(pkg) ?: return // inne aplikacje odrzucamy od razu – nic z nich nie czytamy
+        lastTargetEventAt = SystemClock.uptimeMillis()
+        scanNow()
+    }
 
+    /** Odczyt okna brokera. Wywoływany przy zdarzeniach XTB ORAZ co sekundę (nie polegamy tylko na zdarzeniach). */
+    private fun scanNow(): Boolean {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastScan < 300) return true // throttling – drzewo widoków jest drogie
+        lastScan = now
+        val root = appRoot()
+        val pkg = root?.packageName?.toString()
+        val label = pkg?.let { targetLabel(it) }
+        if (root == null || pkg == null || label == null) {
+            diag = "nie widzę okna XTB" + (if (root != null) " (na wierzchu: $pkg)" else "") +
+                (if (lastTargetEventAt > 0) ", ostatni sygnał z XTB ${(now - lastTargetEventAt) / 1000} s temu" else ", brak sygnałów z XTB")
+            return false
+        }
         val profile = activeProfile?.takeIf { it.packageName == pkg }
         val profilePrice = profile?.priceLabel?.let { sel -> find(root, sel)?.text?.toString()?.let(::parsePrice) }
         val ts = System.currentTimeMillis()
@@ -494,7 +519,42 @@ class AutoExecutionService : AccessibilityService() {
             quote.availableFunds?.let { lastAccountFunds = it; lastAccountCurrency = quote.accountCurrency }
         }
         (profilePrice ?: quote?.mid)?.let { _screenPrice.value = it }
+        diag = when {
+            quote == null -> "widzę XTB, ale odczyt się nie powiódł"
+            quote.instrument == null -> "widzę XTB, ale to nie ekran instrumentu (brak tytułu instrumentu)"
+            quote.bid == null || quote.ask == null -> "widzę ${quote.instrument}, ale bez cen Sell/Buy – przewiń bilet, żeby przyciski były widoczne"
+            else -> "OK"
+        }
+        return true
     }
+
+    /** Pętla: odczyt co 1 s; gdy okno XTB jest niedostępne (np. zasłonięte tarczą), prosi o chwilowe uchylenie tarczy. */
+    private fun startPolling() {
+        pollJob?.cancel()
+        pollJob = serviceScope.launch {
+            var misses = 0
+            while (isActive) {
+                val ok = runCatching { scanNow() }.getOrDefault(false)
+                if (ok) { misses = 0; _peek.value = false } else if (++misses >= 3) { _peek.value = true; misses = 0 }
+                delay(1_000)
+            }
+        }
+    }
+
+    private val serviceScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + Dispatchers.Main)
+    private var pollJob: kotlinx.coroutines.Job? = null
+
+    /** Na czas klikania w XTB tarcza musi być uchylona. */
+    private suspend fun <T> withAction(block: suspend () -> T): T {
+        _actionActive.value = true
+        try {
+            delay(350) // czas na uchylenie tarczy
+            return block()
+        } finally {
+            _actionActive.value = false
+        }
+    }
+
 
     /**
      * Okno aplikacji brokera. NIE polegamy na "aktywnym oknie": gdy tarcza dotyku albo HUD przechwyci dotknięcie,
@@ -539,7 +599,7 @@ class AutoExecutionService : AccessibilityService() {
     suspend fun executeOnScreen(order: OrderRequest, profile: UiTargetProfile): ExecutionResult =
         withContext(Dispatchers.Main.immediate) {
             try {
-                performOrder(order, profile)
+                withAction { performOrder(order, profile) }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {
@@ -613,7 +673,7 @@ class AutoExecutionService : AccessibilityService() {
     suspend fun setProtection(instrument: String, sl: Double?, tp: Double?): ExecutionResult =
         withContext(Dispatchers.Main.immediate) {
             try {
-                doSetProtection(instrument, sl, tp)
+                withAction { doSetProtection(instrument, sl, tp) }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {
@@ -625,7 +685,7 @@ class AutoExecutionService : AccessibilityService() {
     suspend fun closeXtbPosition(instrument: String): ExecutionResult =
         withContext(Dispatchers.Main.immediate) {
             try {
-                doClosePosition(instrument)
+                withAction { doClosePosition(instrument) }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {

@@ -103,7 +103,7 @@ data class ScreenQuote(
             return if (v > 0 && m > 0) c / v / m else null
         }
 
-    fun isFresh(now: Long = System.currentTimeMillis(), maxAgeMs: Long = 5_000) = now - timestamp <= maxAgeMs
+    fun isFresh(now: Long = System.currentTimeMillis(), maxAgeMs: Long = 8_000) = now - timestamp <= maxAgeMs
 }
 
 data class HudState(
