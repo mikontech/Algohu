@@ -56,7 +56,10 @@ class MainActivity : ComponentActivity() {
             if (Settings.canDrawOverlays(this)) OverlayService.start(this)
             else Toast.makeText(this, "Najpierw krok 1", Toast.LENGTH_SHORT).show()
         }
-        button("■ Zatrzymaj") { stopService(Intent(this, OverlayService::class.java)) }
+        button("■ Zatrzymaj") {
+            getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("autostart", false).apply()
+            stopService(Intent(this, OverlayService::class.java))
+        }
 
         TextView(this).apply { text = "\nTryb handlu"; textSize = 18f }.also { layout.addView(it) }
         button("🤖 AUTO – bot sam handluje w XTB") { OverlayService.command(this, OverlayService.ACTION_MODE, "AUTO") }
@@ -71,6 +74,15 @@ class MainActivity : ComponentActivity() {
         button("Reset KILL (nie działa po dziennym limicie)") { OverlayService.command(this, OverlayService.ACTION_RESET_KILL) }
         button("🛡 Tarcza dotyku: WŁĄCZ (w AUTO ekran ignoruje dotyk)") { OverlayService.command(this, OverlayService.ACTION_SHIELD, "on") }
         button("Tarcza dotyku: wyłącz") { OverlayService.command(this, OverlayService.ACTION_SHIELD, "off") }
+
+        button("XTB wraca samo na wierzch w AUTO: WŁĄCZ") {
+            getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("keep_xtb_front", true).apply()
+            Toast.makeText(this, "Włączone", Toast.LENGTH_SHORT).show()
+        }
+        button("XTB wraca samo na wierzch: wyłącz") {
+            getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("keep_xtb_front", false).apply()
+            Toast.makeText(this, "Wyłączone", Toast.LENGTH_SHORT).show()
+        }
 
         TextView(this).apply { text = "\nZdalny dostęp (AnyDesk)"; textSize = 18f }.also { layout.addView(it) }
         fun ui() = getSharedPreferences("ui", MODE_PRIVATE)

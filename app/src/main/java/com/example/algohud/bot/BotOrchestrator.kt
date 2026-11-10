@@ -145,8 +145,8 @@ class BotOrchestrator(
     val hud: StateFlow<HudState> = _hud.asStateFlow()
 
     private val lock = Mutex()
-    private val aggregators = HashMap<String, BarAggregator>()
-    private val learners = HashMap<String, Learner>()
+    private val aggregators = java.util.concurrent.ConcurrentHashMap<String, BarAggregator>()
+    private val learners = java.util.concurrent.ConcurrentHashMap<String, Learner>()
 
     // ───────────── Profil agresywny: impuls w czasie rzeczywistym (RT) + Open Range Breakout (ORB) ─────────────
     private val profile = MutableStateFlow(
@@ -399,7 +399,7 @@ class BotOrchestrator(
         if (text == null) loading.remove(inst) else loading[inst] = text
         updateLearningHud()
     }
-    private val lastPx = HashMap<String, Pair<Double, Long>>()
+    private val lastPx = java.util.concurrent.ConcurrentHashMap<String, Pair<Double, Long>>()
     private val warned = HashSet<String>()
     @Volatile private var lastTick: Tick? = null
     private var lastFeedHud = 0L
@@ -409,6 +409,7 @@ class BotOrchestrator(
         if (started) return
         started = true
         news.start()
+        scope.launch { reconcileLoop() }
 
         // Rozgrzewka strategii historią świec.
         for ((inst, feed) in FEEDS) for (tf in Learner.TIMEFRAMES) {
@@ -463,7 +464,7 @@ class BotOrchestrator(
                 else setLoading(inst, "Pyth nie podaje cen na żywo – uczę się tylko przy otwartym XTB")
             }
         }
-        scope.launch { pyth.ticks.collect { t -> lock.withLock { processPrice(t.symbol, t.price, t.timestamp) } } }
+        scope.launch { pyth.ticks.collect { t -> guarded("cena ${t.symbol}") { lock.withLock { processPrice(t.symbol, t.price, t.timestamp) } } } }
         scope.launch {
             pyth.status.collect { st ->
                 // Zapas: jeśli Pyth nie ma instrumentu, który ma też Binance (GOLD → PAXG), wczytaj historię z Binance.
@@ -487,7 +488,7 @@ class BotOrchestrator(
                 delay(5_000)
             }
         }
-        scope.launch { news.ticks.collect { onFeedTick(it) } }
+        scope.launch { news.ticks.collect { t -> guarded("tick ${t.symbol}") { onFeedTick(t) } } }
         scope.launch {
             while (isActive) {
                 runCatching { buildStatus() }.onSuccess { st -> _hud.update { it.copy(status = st) } }
@@ -517,8 +518,8 @@ class BotOrchestrator(
             }
         }
         scope.launch { engine.events.collect { msg(it) } }
-        scope.launch { AutoExecutionService.screenQuote.filterNotNull().collect { onScreen(it) } }
-        scope.launch { risk.killSwitch.filter { it }.collect { engine.flattenAll(risk.killReason ?: "KILL") } }
+        scope.launch { AutoExecutionService.screenQuote.filterNotNull().collect { q -> guarded("odczyt ekranu") { onScreen(q) } } }
+        scope.launch { risk.killSwitch.filter { it }.collect { guarded("KILL") { engine.flattenAll(risk.killReason ?: "KILL") } } }
         // Koniec sesji / weekend: zamknięcie pozycji intraday [SESSION_CLOSE_MIN] min przed zamknięciem rynku.
         scope.launch {
             while (isActive) {
@@ -624,8 +625,18 @@ class BotOrchestrator(
     private suspend fun processPrice(inst: String, px: Double, ts: Long) {
         lastPx[inst] = px to ts
         risk.onMark(inst, px)?.let { exit ->
+            val real = engine.mode.value != ExecutionMode.DRY_RUN && risk.position(inst)?.paper == false
+            if (real && AutoExecutionService.instance?.xtbPositionExists(inst) == false) {
+                // XTB zamknęło pozycję własnym SL/TP szybciej niż bot – tylko księgujemy.
+                risk.bookExternalClose(inst, px, "${exit.reason} (zamknięte przez XTB)")
+                msg("🏁 $inst: ${exit.reason} @ %.2f – pozycję zamknęło XTB, szukam kolejnego wejścia".format(px))
+                return@let
+            }
             msg("🏁 $inst: ${exit.reason} @ %.2f".format(px))
-            engine.submit(withSpread(exit, inst), bypassConfirmation = true)
+            val r = engine.submit(withSpread(exit, inst), bypassConfirmation = true)
+            if (r !is ExecutionResult.Filled && r !is ExecutionResult.Submitted) {
+                msg("⚠️ $inst: zamknięcie (${exit.reason}) nieudane – ponowię za 20 s; pozycję chroni SL w XTB")
+            }
         }
         for (tf in Learner.TIMEFRAMES) {
             val a = agg(inst, tf)
@@ -755,7 +766,9 @@ class BotOrchestrator(
 
     @Volatile private var hudLearningInstrument: String = "GOLD"
 
-    private fun updateLearningHud() {
+    private fun updateLearningHud() { runCatching { updateLearningHudUnsafe() } }
+
+    private fun updateLearningHudUnsafe() {
         val inst = hudLearningInstrument
         val l = learners[inst]
         val load = loading[inst]
@@ -840,8 +853,93 @@ class BotOrchestrator(
             )
         } ?: "brak"
         val pnl = "Wynik dnia – XTB: %+.2f • papier: %+.2f".format(risk.dailyPnl.value, risk.dailyPnlPaper.value)
-        return listOf(line1, line2, "Środki: $funds • wartość lota: $pv", "Pozycja bota: $pos", pnl,
+        return listOf(line1, readinessLine(inst, q), line2, "Środki: $funds • wartość lota: $pv", "Pozycja bota: $pos", pnl,
             "(pozycje otwarte ręcznie w XTB nie są w księdze bota) • wersja ${com.example.algohud.BuildConfig.GIT_SHA}").joinToString("\n")
+    }
+
+    /** Jedna linijka: czy bot może teraz złożyć prawdziwe zlecenie, a jeśli nie – dokładnie dlaczego. */
+    private suspend fun readinessLine(inst: String, q: ScreenQuote?): String {
+        val now = System.currentTimeMillis()
+        val why = ArrayList<String>()
+        if (AutoExecutionService.instance == null) why += "włącz usługę ułatwień dostępu"
+        if (engine.mode.value != ExecutionMode.AUTO) why += "tryb ${engine.mode.value.name} – wybierz AUTO w aplikacji"
+        if (risk.killSwitch.value) why += "KILL aktywny"
+        if (q == null || q.instrument != inst) why += "XTB nie pokazuje biletu $inst"
+        else if (q.bid == null || q.ask == null) why += "brak cen Sell/Buy na ekranie"
+        if (pointValue(inst) == null) why += "nieznana wartość lota"
+        if (AutoExecutionService.lastAccountFunds == null) why += "nieznane środki"
+        val lp = lastPx[inst]
+        if (lp == null || now - lp.second > 20_000) why += "brak świeżej ceny w tle"
+        val bars = aggregators["$inst@${Learner.M1}"]?.closed()?.size ?: 0
+        if (bars < 60) why += "za mało świec 1m ($bars/60)"
+        sessionBlock(inst, now)?.let { why += it }
+        if (risk.cooldownLeftMs() > 0) why += "przerwa po stracie ${risk.cooldownLeftMs() / 1000} s"
+        return when {
+            why.isNotEmpty() -> "⛔ NIE HANDLUJĘ: ${why.joinToString("; ")}"
+            risk.position(inst) != null -> "✅ W POZYCJI – pilnuję wyjścia"
+            else -> "✅ GOTOWY – czekam na sygnał"
+        }
+    }
+
+    // ───────────── Odporność: żaden pojedynczy błąd nie może zatrzymać bota ─────────────
+    private var lastGuardNote = 0L
+
+    private suspend fun guarded(what: String, block: suspend () -> Unit) {
+        try {
+            block()
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            android.util.Log.e("BotOrchestrator", "błąd: $what", t)
+            val now = System.currentTimeMillis()
+            if (now - lastGuardNote > 30_000) {
+                lastGuardNote = now
+                msg("⚠️ błąd wewnętrzny ($what): ${t.javaClass.simpleName} ${t.message ?: ""} – bot działa dalej")
+            }
+        }
+    }
+
+    // ───────────── Uzgadnianie księgi bota z XTB ─────────────
+    private val missCount = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    /** Co 30 s sprawdza w XTB, czy pozycje z księgi bota nadal istnieją (SL/TP w XTB mogły je zamknąć). */
+    private suspend fun reconcileLoop() {
+        while (scope.isActive) {
+            delay(30_000)
+            guarded("uzgadnianie pozycji") { reconcileOnce() }
+        }
+    }
+
+    private suspend fun reconcileOnce() {
+        if (engine.mode.value == ExecutionMode.DRY_RUN) return
+        val svc = AutoExecutionService.instance ?: return
+        val now = System.currentTimeMillis()
+        for (sym in risk.openSymbols()) {
+            val pos = risk.position(sym) ?: continue
+            if (pos.paper || now - pos.openedAt < 25_000) continue
+            when (lock.withLock { svc.xtbPositionExists(sym) }) {
+                true -> missCount[sym] = 0
+                null -> Unit
+                false -> {
+                    val n = (missCount[sym] ?: 0) + 1
+                    missCount[sym] = n
+                    if (n < 2) continue // dwa kolejne potwierdzenia, żeby nie zaksięgować zamknięcia przez pomyłkę
+                    missCount[sym] = 0
+                    val last = lastPx[sym]?.first ?: pos.entryPrice
+                    val long = pos.side == Side.BUY
+                    val tp = pos.takeProfit
+                    val exit = when {
+                        long && last <= pos.stopPrice -> pos.stopPrice
+                        !long && last >= pos.stopPrice -> pos.stopPrice
+                        tp != null && ((long && last >= tp) || (!long && last <= tp)) -> tp
+                        else -> last
+                    }
+                    if (risk.bookExternalClose(sym, exit, "ZAMKNIĘTE W XTB (SL/TP)")) {
+                        msg("🏁 $sym: pozycji nie ma już w XTB (zamknął ją SL/TP) – księga zaktualizowana, szukam kolejnego wejścia")
+                    }
+                }
+            }
+        }
     }
 
     private fun aliasesFor(instrument: String): List<String> {

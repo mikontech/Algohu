@@ -11,6 +11,7 @@ class BarAggregator(private val periodMs: Long = 5 * 60_000L, private val maxBar
     private var current: Bar? = null
 
     /** Zwraca świecę, która właśnie się zamknęła (gdy tick otworzył nową), w przeciwnym razie null. */
+    @Synchronized
     fun onTick(price: Double, ts: Long): Bar? {
         val start = ts - ts % periodMs
         val c = current
@@ -30,15 +31,18 @@ class BarAggregator(private val periodMs: Long = 5 * 60_000L, private val maxBar
     }
 
     /** Historia z REST (bez trwającej świecy) – strategia nie musi czekać godzinami na rozgrzewkę. */
+    @Synchronized
     fun seed(history: List<Bar>) {
         val live = bars.filter { b -> history.none { it.start == b.start } }
         bars.clear()
         (history + live).sortedBy { it.start }.takeLast(maxBars).forEach { bars.addLast(it) }
     }
 
+    @Synchronized
     fun closed(): List<Bar> = bars.toList()
 
     /** Bieżąca, jeszcze trwająca świeca (do detekcji impulsu w czasie rzeczywistym). */
+    @Synchronized
     fun current(): Bar? = current
 }
 

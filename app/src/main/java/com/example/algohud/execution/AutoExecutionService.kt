@@ -63,9 +63,11 @@ class ExecutionEngine(
     private val risk: RiskManager,
     private val executor: OrderExecutor,
     initialMode: ExecutionMode = ExecutionMode.DRY_RUN,
-    private val executorTimeoutMs: Long = 20_000,
+    private val executorTimeoutMs: Long = 75_000, // pełne wejście w XTB (przewijanie, SL, TP, potwierdzenie) trwa 15–40 s
     /** Dodatkowa bramka AUTO (np. wyniki papierowe); null = OK. */
-    private val autoGate: () -> String? = { null }
+    private val autoGate: () -> String? = { null },
+    /** Czy pozycja instrumentu istnieje w aplikacji brokera: true / false / null = nie da się ustalić. */
+    private val positionProbe: suspend (String) -> Boolean? = { null }
 ) {
     private var pendingAt = 0L
     private val _mode = MutableStateFlow(initialMode)
@@ -176,10 +178,42 @@ class ExecutionEngine(
                 else log("❌ Odrzucone przez wykonawcę: ${result.reason}")
             is ExecutionResult.Failed -> {
                 log("💥 ${result.error.message}")
-                risk.engageKillSwitch("Błąd wykonania: ${result.error.message}")
+                return recoverFromFailure(order, result)
             }
         }
         return result
+    }
+
+    /**
+     * Błąd w trakcie obsługi XTB nie oznacza automatycznie KILL: sprawdzamy w aplikacji, co naprawdę się stało.
+     * KILL tylko wtedy, gdy stanu nie da się ustalić.
+     */
+    private suspend fun recoverFromFailure(order: OrderRequest, failed: ExecutionResult.Failed): ExecutionResult {
+        val exists = runCatching { positionProbe(order.symbol) }.getOrNull()
+        return when {
+            !order.reduceOnly && exists == true -> {
+                risk.onFill(order, order.referencePrice, order.quantity) // SL jest wpisany PRZED kliknięciem Buy/Sell
+                log("🔎 Po błędzie: pozycja ${order.symbol} jest w XTB – zaksięgowana")
+                ExecutionResult.Submitted("zaksięgowano po weryfikacji")
+            }
+            !order.reduceOnly && exists == false -> {
+                log("🔎 Po błędzie: pozycji ${order.symbol} w XTB nie ma – zlecenie nie zostało otwarte (bez KILL)")
+                ExecutionResult.Rejected("nie otwarto (zweryfikowano)")
+            }
+            order.reduceOnly && exists == false -> {
+                risk.onFill(order, order.referencePrice, order.quantity)
+                log("🔎 Po błędzie: pozycja ${order.symbol} jest już zamknięta w XTB – zaksięgowana")
+                ExecutionResult.Submitted("zamknięcie zweryfikowane")
+            }
+            order.reduceOnly && exists == true -> {
+                log("⚠️ Zamknięcie ${order.symbol} nie powiodło się; pozycja otwarta (chroni ją SL w XTB) – ponowię")
+                ExecutionResult.Rejected("pozycja nadal otwarta – ponowię")
+            }
+            else -> {
+                risk.engageKillSwitch("Błąd wykonania, stanu XTB nie da się zweryfikować: ${failed.error.message}")
+                failed
+            }
+        }
     }
 
     private fun log(msg: String) {
@@ -372,6 +406,8 @@ class AutoExecutionService : AccessibilityService() {
         /** Diagnoza odczytu ekranu (do HUD). */
         @Volatile var diag: String = "usługa jeszcze nie odczytała ekranu"
         @Volatile private var lastTargetEventAt = 0L
+        /** Samonaprawa ekranu i przywracanie XTB na wierzch – tylko w trybie AUTO (ustawia nakładka). */
+        @Volatile var selfHealEnabled: Boolean = false
 
         private val _gestureActive = MutableStateFlow(false)
         /** HUD obserwuje to i chowa się na czas gestu, żeby nie przechwycić dotyku. */
@@ -499,10 +535,12 @@ class AutoExecutionService : AccessibilityService() {
         val pkg = root?.packageName?.toString()
         val label = pkg?.let { targetLabel(it) }
         if (root == null || pkg == null || label == null) {
+            if (notVisibleSince == 0L) notVisibleSince = now
             diag = "nie widzę okna XTB" + (if (root != null) " (na wierzchu: $pkg)" else "") +
                 (if (lastTargetEventAt > 0) ", ostatni sygnał z XTB ${(now - lastTargetEventAt) / 1000} s temu" else ", brak sygnałów z XTB")
             return false
         }
+        notVisibleSince = 0L
         val profile = activeProfile?.takeIf { it.packageName == pkg }
         val profilePrice = profile?.priceLabel?.let { sel -> find(root, sel)?.text?.toString()?.let(::parsePrice) }
         val ts = System.currentTimeMillis()
@@ -536,6 +574,8 @@ class AutoExecutionService : AccessibilityService() {
             while (isActive) {
                 val ok = runCatching { scanNow() }.getOrDefault(false)
                 if (ok) { misses = 0; _peek.value = false } else if (++misses >= 3) { _peek.value = true; misses = 0 }
+                runCatching { selfHeal() }
+                runCatching { keepXtbFront() }
                 delay(1_000)
             }
         }
@@ -545,15 +585,20 @@ class AutoExecutionService : AccessibilityService() {
     private var pollJob: kotlinx.coroutines.Job? = null
 
     /** Na czas klikania w XTB tarcza musi być uchylona. */
-    private suspend fun <T> withAction(block: suspend () -> T): T {
+    private suspend fun <T> withAction(block: suspend () -> T): T = uiMutex.withLock {
         _actionActive.value = true
         try {
             delay(350) // czas na uchylenie tarczy
-            return block()
+            val result = block()
+            runCatching { restoreTicketTop() } // po każdej akcji bilet wraca na górę – bot dalej widzi ceny
+            result
         } finally {
             _actionActive.value = false
         }
     }
+
+    /** Jedna operacja na ekranie XTB naraz (akcje bota, weryfikacja pozycji, samonaprawa). */
+    private val uiMutex = Mutex()
 
 
     /**
@@ -840,6 +885,105 @@ class AutoExecutionService : AccessibilityService() {
             delay(450)
         }
         return null
+    }
+
+    // ───────────── Samonaprawa i weryfikacja stanu w XTB ─────────────
+
+    private var staleSince = 0L
+    private var notVisibleSince = 0L
+    private var lastFrontAttempt = 0L
+
+    /** Przewija bilet z powrotem na górę (tytuł instrumentu + przyciski Sell/Buy widoczne) – inaczej bot „ślepnie”. */
+    private suspend fun restoreTicketTop() {
+        repeat(8) {
+            val root = appRoot() ?: return
+            if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) return
+            if (ScreenScanner.findById(root, "ModifyPositionButton").isNotEmpty()) return // ekran pozycji – nie ruszamy
+            val titleVisible = ScreenScanner.findById(root, "ElementTitleHorizontalText").isNotEmpty()
+            val buyVisible = ScreenScanner.findById(root, "TradingBuyButton").isNotEmpty()
+            if (titleVisible && buyVisible) return
+            if (ScreenScanner.findById(root, "TradingBuyButton", visibleOnly = false).isEmpty()) return // to nie bilet
+            val scroller = findScrollable(root) ?: return
+            scroller.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)
+            delay(350)
+        }
+    }
+
+    /**
+     * Czy w XTB istnieje otwarta pozycja instrumentu? true / false / null (nie da się ustalić).
+     * Zamyka po drodze „wiszące” okna (potwierdzenie zlecenia, arkusz zamknięcia, ekran pozycji).
+     */
+    suspend fun xtbPositionExists(instrument: String): Boolean? = withContext(Dispatchers.Main.immediate) {
+        try {
+            uiMutex.withLock { probeInternal(instrument) }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    private suspend fun probeInternal(instrument: String): Boolean? {
+        val first = appRoot() ?: return null
+        if (first.packageName?.toString() != ScreenScanner.XTB_PACKAGE) return null
+        repeat(3) {
+            val r = appRoot() ?: return null
+            val stale = findOrderConfirm(r) != null ||
+                ScreenScanner.findById(r, "CloseButton").isNotEmpty() ||
+                ScreenScanner.findById(r, "ModifyPositionButton").isNotEmpty()
+            if (stale) {
+                performGlobalAction(GLOBAL_ACTION_BACK)
+                delay(900)
+            }
+        }
+        restoreTicketTop()
+        val root = appRoot() ?: return null
+        if (xtbTitle(root) != instrument) return null
+        if (ScreenScanner.findById(root, "TradingBuyButton", visibleOnly = false).isEmpty()) return null
+        val found = revealById("PositionRow0")
+        restoreTicketTop()
+        return found != null
+    }
+
+    /** W trybie AUTO: zamyka okna, na których bot utknął, i przywraca bilet na górę. Nie działa w trakcie akcji bota. */
+    private suspend fun selfHeal() {
+        if (!selfHealEnabled || _actionActive.value) { staleSince = 0L; return }
+        if (!uiMutex.tryLock()) return
+        try {
+            val root = appRoot() ?: return
+            if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) { staleSince = 0L; return }
+            val stale = findOrderConfirm(root) != null ||
+                ScreenScanner.findById(root, "CloseButton").isNotEmpty() ||
+                ScreenScanner.findById(root, "ModifyPositionButton").isNotEmpty()
+            if (stale) {
+                val now = SystemClock.uptimeMillis()
+                if (staleSince == 0L) staleSince = now
+                else if (now - staleSince > 8_000) {
+                    performGlobalAction(GLOBAL_ACTION_BACK)
+                    staleSince = 0L
+                    Log.i(TAG, "Samonaprawa: zamknięto wiszące okno XTB")
+                }
+                return
+            }
+            staleSince = 0L
+            restoreTicketTop()
+        } finally {
+            uiMutex.unlock()
+        }
+    }
+
+    /** W trybie AUTO: jeśli XTB zniknęło z ekranu na ponad 20 s, przywraca je na pierwszy plan. */
+    private fun keepXtbFront() {
+        if (!selfHealEnabled || !getSharedPreferences("ui", MODE_PRIVATE).getBoolean("keep_xtb_front", true)) return
+        val since = notVisibleSince
+        val now = SystemClock.uptimeMillis()
+        if (since == 0L || now - since < 20_000 || now - lastFrontAttempt < 30_000) return
+        if (getSystemService(android.os.PowerManager::class.java)?.isInteractive != true) return
+        lastFrontAttempt = now
+        val intent = packageManager.getLaunchIntentForPackage(ScreenScanner.XTB_PACKAGE) ?: return
+        intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { startActivity(intent) }
+        Log.i(TAG, "XTB niewidoczne od ${(now - since) / 1000} s – przywracam na pierwszy plan")
     }
 
     private suspend fun awaitById(id: String, timeoutMs: Long): AccessibilityNodeInfo? = withTimeoutOrNull(timeoutMs) {

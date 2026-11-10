@@ -92,7 +92,8 @@ class RiskManager(
     // TODO: po starcie zsynchronizuj pozycje z brokerem (API) – tu trzymane są tylko w pamięci.
     private val positions = mutableMapOf<String, Position>()
     private val marks = mutableMapOf<String, Double>()
-    private val pendingStops = mutableSetOf<String>()
+    /** symbol → kiedy zlecono zamknięcie (soft-stop); po 20 s bez skutku próba jest ponawiana. */
+    private val pendingStops = mutableMapOf<String, Long>()
     private val orderTimes = ArrayDeque<Long>()
 
     // ── Kapitał i wielkość pozycji ──
@@ -150,6 +151,20 @@ class RiskManager(
     suspend fun hasRealPositions(): Boolean = mutex.withLock { positions.values.any { !it.paper } }
 
     suspend fun openSymbols(): List<String> = mutex.withLock { positions.keys.toList() }
+
+    /** Pozycję zamknął broker (SL/TP w XTB) – księgujemy wynik po podanej cenie i zwalniamy miejsce na kolejne wejście. */
+    suspend fun bookExternalClose(symbol: String, price: Double, reason: String): Boolean = mutex.withLock {
+        val p = positions[symbol] ?: return@withLock false
+        val pnl = (price - p.entryPrice) * p.quantity * p.side.sign * p.pointValue
+        if (p.paper) realizedPaperToday += pnl else realizedToday += pnl
+        journal?.record(closedTradeLocked(p, p.quantity, price, pnl, reason))
+        if (pnl < 0) lastLossAt = clock()
+        positions.remove(symbol)
+        pendingStops.remove(symbol)
+        recomputePnlLocked()
+        persistLocked()
+        true
+    }
 
     suspend fun sizeFor(entry: Double, stop: Double, pointValue: Double = 1.0, tier: Int = 1): Double =
         mutex.withLock { positionSize(equity, entry, stop, pointValue, tier) }
@@ -244,7 +259,7 @@ class RiskManager(
             }
             else -> positions[order.symbol] = Position(
                 order.symbol, order.side, qty, price, order.stopPrice, order.pointValue, paper,
-                takeProfit = order.takeProfit, entryReason = order.reason
+                takeProfit = order.takeProfit, entryReason = order.reason, openedAt = clock()
             )
         }
         recomputePnlLocked()
@@ -259,12 +274,13 @@ class RiskManager(
         marks[symbol] = price
         val p = positions[symbol]?.let { trailLocked(it, price) }?.also { positions[symbol] = it }
         recomputePnlLocked()
-        if (p == null || symbol in pendingStops) return@withLock null
+        if (p == null) return@withLock null
+        pendingStops[symbol]?.let { at -> if (clock() - at < 20_000) return@withLock null }
         val long = p.side == Side.BUY
         val stopHit = if (long) price <= p.stopPrice else price >= p.stopPrice
         val tpHit = p.takeProfit?.let { if (long) price >= it else price <= it } == true
         if (!stopHit && !tpHit) return@withLock null
-        pendingStops += symbol
+        pendingStops[symbol] = clock()
         val reason = when {
             tpHit -> "TP"
             p.stopPrice != p.initialStop -> "TRAILING-STOP"

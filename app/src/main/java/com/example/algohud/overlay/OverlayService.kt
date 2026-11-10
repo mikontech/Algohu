@@ -80,9 +80,11 @@ class OverlayService : LifecycleService() {
         private const val NOTIF_ID = 1001
         private const val MIN_PAPER_TRADES = 30
 
-        fun start(ctx: Context) = ContextCompat.startForegroundService(
-            ctx, Intent(ctx, OverlayService::class.java).setAction(ACTION_START)
-        )
+        fun start(ctx: Context) {
+            // Zapamiętaj, że bot ma działać – po restarcie telefonu BootReceiver uruchomi go ponownie.
+            ctx.getSharedPreferences("ui", Context.MODE_PRIVATE).edit().putBoolean("autostart", true).apply()
+            ContextCompat.startForegroundService(ctx, Intent(ctx, OverlayService::class.java).setAction(ACTION_START))
+        }
     }
 
     private val botScope = CoroutineScope(
@@ -172,7 +174,7 @@ class OverlayService : LifecycleService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
-            ACTION_STOP -> stopSelf()
+            ACTION_STOP -> { uiPrefs().edit().putBoolean("autostart", false).apply(); stopSelf() }
             ACTION_KILL -> if (::engine.isInitialized) botScope.launch { engine.flattenAll("KILL z powiadomienia") }
             ACTION_MODE -> if (::engine.isInitialized) {
                 val m = runCatching { ExecutionMode.valueOf(intent.getStringExtra(EXTRA_VALUE)!!) }.getOrNull()
@@ -234,6 +236,7 @@ class OverlayService : LifecycleService() {
         engine = ExecutionEngine(
             risk, executor, initialMode = ExecutionMode.DRY_RUN,
             // AUTO dopiero po udokumentowanym dodatnim wyniku na papierze.
+            positionProbe = { sym -> AutoExecutionService.instance?.xtbPositionExists(sym) },
             autoGate = {
                 val s = journal.stats.value
                 when {
@@ -437,6 +440,7 @@ class OverlayService : LifecycleService() {
             }
         }
         lifecycleScope.launch { AutoExecutionService.gestureActive.collect { setPassThrough(it) } }
+        lifecycleScope.launch { engine.mode.collect { AutoExecutionService.selfHealEnabled = it == ExecutionMode.AUTO } }
         lifecycleScope.launch {
             kotlinx.coroutines.flow.combine(AutoExecutionService.peek, AutoExecutionService.actionActive) { a, b -> a || b }
                 .collect { open -> setShieldTouchable(!open) }

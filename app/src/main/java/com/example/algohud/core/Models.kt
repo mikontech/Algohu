@@ -74,7 +74,8 @@ data class Position(
     /** Najlepsza cena od otwarcia (do trailing stopu). */
     val best: Double = entryPrice,
     /** Powód wejścia (np. "RT impuls…", "ORB…") – do statystyk w dzienniku. */
-    val entryReason: String = ""
+    val entryReason: String = "",
+    val openedAt: Long = 0L
 )
 
 /** Co jest teraz widoczne w aplikacji brokera (odczytane przez AccessibilityService). */
