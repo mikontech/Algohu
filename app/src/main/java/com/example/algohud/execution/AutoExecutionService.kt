@@ -369,6 +369,8 @@ class AutoExecutionService : AccessibilityService() {
 
         /** Diagnostyka: ostatnio widziane okno nagrywania (do skopiowania z aplikacji, gdy auto-akceptacja nie trafi). */
         @Volatile var lastCaptureDump: String? = null
+        /** Do kiedy uznajemy, że trwa sesja zdalna (tarcza dotyku jest wtedy wstrzymana). */
+        @Volatile var remoteSessionUntil: Long = 0L
         private val CAPTURE_HINTS = listOf("nagrywa", "przesyła", "udostępni", "record", "cast", "share")
         private val CAPTURE_SINGLE = listOf("jedna aplikacj", "jedną aplikacj", "pojedyncz", "single app", "one app")
         private val CAPTURE_ENTIRE = listOf("cały ekran", "caly ekran", "entire screen")
@@ -433,6 +435,8 @@ class AutoExecutionService : AccessibilityService() {
             var n: AccessibilityNodeInfo? = target
             while (n != null && !n.isClickable) n = n.parent
             (n ?: target).performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            // Trwa sesja zdalna: tarcza dotyku blokowałaby też sterowanie z AnyDesk → pauza tarczy na 30 min.
+            remoteSessionUntil = System.currentTimeMillis() + 30 * 60_000
             Log.i(TAG, "Okno nagrywania AnyDesk: kliknięto element")
             return
         }

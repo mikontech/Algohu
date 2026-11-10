@@ -435,7 +435,8 @@ class OverlayService : LifecycleService() {
         lifecycleScope.launch {
             while (true) {
                 val want = shieldEnabled() && engine.mode.value == ExecutionMode.AUTO &&
-                    System.currentTimeMillis() > shieldUserOffUntil && !AutoExecutionService.gestureActive.value
+                    System.currentTimeMillis() > shieldUserOffUntil && !AutoExecutionService.gestureActive.value &&
+                    System.currentTimeMillis() > AutoExecutionService.remoteSessionUntil
                 setShield(want)
                 kotlinx.coroutines.delay(1_000)
             }
