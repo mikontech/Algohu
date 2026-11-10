@@ -135,6 +135,8 @@ object ScreenScanner {
     fun scanXtb(root: AccessibilityNodeInfo, pkg: String, label: String, now: Long): ScreenQuote? {
         val idx = index(root, XTB_IDS)
         val title = idx["ElementTitleHorizontalText"]?.firstOrNull()?.text ?: return null
+        // Ekrany typu "Nowe zlecenie Market" to nie ekran instrumentu (wcześniej czytane jako instrument "Nowe").
+        if (title.contains("zlecenie", ignoreCase = true) || title.startsWith("Nowe", ignoreCase = true)) return null
         // "GOLD Rynek otwarty" → "GOLD"
         val instrument = title.trim().split(Regex("\\s+")).firstOrNull()?.takeIf { it.isNotBlank() } ?: return null
         // W XTB wartości są rodzeństwem kontenera, nie dziećmi – dopasowanie po położeniu.

@@ -695,6 +695,13 @@ class AutoExecutionService : AccessibilityService() {
         found
     }
 
+    /** Przycisk "Potwierdź zlecenie …" na ekranie potwierdzenia XTB. */
+    private fun findOrderConfirm(root: AccessibilityNodeInfo): AccessibilityNodeInfo? =
+        root.findAccessibilityNodeInfosByText("Potwierdź zlecenie").firstOrNull { n ->
+            n.isVisibleToUser && (n.text?.toString() ?: n.contentDescription?.toString() ?: "")
+                .startsWith("Potwierdź zlecenie", ignoreCase = true)
+        }
+
     private fun xtbTitle(root: AccessibilityNodeInfo?): String? =
         root?.let { ScreenScanner.findById(it, "ElementTitleHorizontalText").firstOrNull() }
             ?.text?.toString()?.trim()?.substringBefore(' ')
@@ -749,7 +756,33 @@ class AutoExecutionService : AccessibilityService() {
         val btn = revealById(if (order.side == Side.BUY) "TradingBuyButton" else "TradingSellButton")
             ?: return ExecutionResult.Rejected("nie znaleziono przycisku ${order.side}")
         if (!click(btn)) return ExecutionResult.Rejected("kliknięcie ${order.side} nie powiodło się")
-        delay(1_500)
+
+        // XTB może pokazać ekran "Nowe zlecenie Market" z przyciskiem "Potwierdź zlecenie Market" (np. przy SL/TP).
+        val confirm = withTimeoutOrNull(3_000) {
+            var n: AccessibilityNodeInfo? = null
+            while (n == null) {
+                n = rootInActiveWindow?.let { findOrderConfirm(it) }
+                if (n == null) delay(150)
+            }
+            n
+        }
+        if (confirm != null) {
+            // Zabezpieczenie: na ekranie potwierdzenia musi być nasz wolumen.
+            val screenText = rootInActiveWindow?.let { ScreenScanner.collect(it).joinToString(" ") { t -> t.text } }.orEmpty()
+            if (!screenText.contains(formatQty(order.quantity))) {
+                return ExecutionResult.Failed(IllegalStateException("ekran potwierdzenia XTB pokazuje inny wolumen – NIE potwierdzam, sprawdź ręcznie"))
+            }
+            if (!click(confirm)) {
+                return ExecutionResult.Failed(IllegalStateException("nie udało się dotknąć 'Potwierdź zlecenie' – stan NIEZNANY, sprawdź XTB"))
+            }
+            val gone = withTimeoutOrNull(6_000) {
+                while (rootInActiveWindow?.let { findOrderConfirm(it) } != null) delay(200)
+                true
+            } ?: false
+            if (!gone) return ExecutionResult.Failed(IllegalStateException("ekran potwierdzenia nadal otwarty – stan NIEZNANY, sprawdź XTB"))
+        } else {
+            delay(1_500)
+        }
         return ExecutionResult.Submitted(
             "XTB: ${order.side} ${formatQty(order.quantity)} ${order.symbol}, SL %.2f".format(sl) +
                 (tp?.let { ", TP %.2f".format(it) } ?: "") + " – sprawdź pozycję"
