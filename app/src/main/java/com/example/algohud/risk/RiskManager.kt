@@ -36,9 +36,9 @@ class RiskManager(
         val tierRiskPct: List<Double> = listOf(0.005, 0.01, 0.025),
         val tierLeverage: List<Double> = listOf(3.0, 5.0, 8.0),
         val maxOpenPositions: Int = 1,
-        val maxOrdersPerMinute: Int = 3,
+        val maxOrdersPerMinute: Int = Int.MAX_VALUE,
         val minStopDistancePct: Double = 0.0005,
-        val cooldownAfterLossMs: Long = 10 * 60_000L,
+        val cooldownAfterLossMs: Long = 0L,
         val allowShort: Boolean = true,
         val allowPyramiding: Boolean = false,
         val allowedSymbols: Set<String> = emptySet(),
@@ -132,14 +132,6 @@ class RiskManager(
         if (existing == null && positions.size >= config.maxOpenPositions) return@withLock reject("Osiągnięto limit pozycji")
         if (existing != null && !config.allowPyramiding) return@withLock reject("Pozycja już istnieje")
         if (marketBlackout()) return@withLock reject("Blokada publikacji makroekonomicznych")
-
-        if (now - lastLossAt < cooldownAfterLossMs) {
-            val left = (cooldownAfterLossMs - (now - lastLossAt)) / 1000
-            return@withLock reject("Przerwa po stracie: jeszcze ${left}s")
-        }
-
-        while (orderTimes.isNotEmpty() && now - orderTimes.first() > 60_000) orderTimes.removeFirst()
-        if (orderTimes.size >= config.maxOrdersPerMinute) return@withLock reject("Limit zleceń na minutę")
 
         val ref = order.referencePrice
         val stopOnCorrectSide = if (order.side == Side.BUY) order.stopPrice < ref else order.stopPrice > ref
