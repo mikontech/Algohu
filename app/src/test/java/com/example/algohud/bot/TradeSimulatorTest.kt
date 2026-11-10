@@ -47,7 +47,7 @@ class TradeSimulatorTest {
 
     @Test fun spreadSlippageAndBothCommissionsAreCharged() {
         val cfg = config().copy(spread = 2.0, slippage = 0.5,
-            commissionPerLotPerSide = 0.2, stopAtr = 10.0)
+            commissionPerLotPerSide = 0.2, stopAtr = 10.0, riskFraction = 0.02)
         val t = TradeSimulator.run(listOf(bar(0)), listOf(signal()), cfg).trades.single()
         assertEquals(101.5, t.entryPrice, 1e-9)
         assertEquals(98.5, t.exitPrice, 1e-9)
