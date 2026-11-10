@@ -1,0 +1,59 @@
+name: Shorten feed wait
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/shorten-feed-wait.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: shorten-feed-wait
+  cancel-in-progress: false
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Patch wait time
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('app/src/main/java/com/example/algohud/bot/BotOrchestrator.kt')
+          s = p.read_text()
+          old = 'delay(90_000)'
+          if s.count(old) != 1:
+              raise SystemExit('anchor count = ' + str(s.count(old)) + ' (expected 1)')
+          p.write_text(s.replace(old, 'delay(15_000)'))
+          PY
+      - name: Compile (gate before writing to main)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --stacktrace
+      - name: Commit verified change to main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/java
+          if git diff --cached --quiet; then echo "Nothing to commit"; exit 0; fi
+          git commit -m "Shorten Pyth wait before Binance fallback to 15 s (compiled OK)"
+          git pull --rebase origin main
+          git push origin HEAD:main
+      - uses: actions/upload-artifact@v4
+        with:
+          name: algohud-feedwait-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
