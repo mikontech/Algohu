@@ -371,7 +371,26 @@ class AccessibilityExecutor(private val profileProvider: () -> UiTargetProfile?)
                 return ExecutionResult.Rejected("Nowe wejście zablokowane: ${it.reason}")
             }
         }
-        return svc.executeOnScreen(order, profile)
+        val result = svc.executeOnScreen(order, profile)
+        if (profile.packageName == ScreenScanner.XTB_PACKAGE && !order.reduceOnly &&
+            (result is ExecutionResult.Filled || result is ExecutionResult.Submitted)) {
+            return UiActionRecovery.run(
+                instrument = order.symbol,
+                timeoutMs = 15_000L,
+                action = { result },
+                restore = {
+                    check(svc.xtbPositionExists(order.symbol) == true) {
+                        "Nie potwierdzono pozycji; nie resetuję pól SL/TP"
+                    }
+                    svc.resetNextOrderTicket(order.symbol)
+                },
+                onRecoveryError = { failure ->
+                    AutoExecutionService.diag = "Reset nowego biletu zablokowany: ${failure.message}"
+                    Log.e("TicketProtectionReset", AutoExecutionService.diag, failure)
+                }
+            )
+        }
+        return result
     }
 
     /** Anulowanie zleceń przez UI jest specyficzne dla aplikacji – do zaimplementowania per profil. */
@@ -595,6 +614,25 @@ class AutoExecutionService : AccessibilityService() {
     private var pollJob: kotlinx.coroutines.Job? = null
 
     /** Na czas klikania w XTB tarcza musi być uchylona. */
+    // NEXT_ORDER_TICKET_RESET_V1
+    suspend fun resetNextOrderTicket(instrument: String): Unit =
+        withContext(Dispatchers.Main.immediate) {
+            withAction {
+                restoreTicketTop()
+                TicketProtectionReset.reset(
+                    instrument = instrument,
+                    readRoot = { appRoot() },
+                    reveal = { id -> revealById(id) != null },
+                    hideKeyboard = {
+                        if (windows.any { it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD }) {
+                            check(performGlobalAction(GLOBAL_ACTION_BACK)) { "Nie zamknięto klawiatury" }
+                            delay(350)
+                        }
+                    }
+                )
+            }
+        }
+
     private suspend fun <T> withAction(block: suspend () -> T): T = uiMutex.withLock {
         _actionActive.value = true
         try {
