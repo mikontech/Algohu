@@ -39,14 +39,21 @@ object TicketProtectionReset {
         fun found(id: String) = ScreenScanner.findById(root, id, visibleOnly = false)
         val titles = found("ElementTitleHorizontalText")
         check(titles.size == 1) { "Niejednoznaczny tytuł ekranu" }
+        val title = titles.single().text?.toString()
+        val volumeCount = found("StepperTextField").size
+        val buyCount = found("TradingBuyButton").size
+        val sellCount = found("TradingSellButton").size
+        val modifyCount = found("ModifyPositionButton").size
         val protectionSections = found("StopLossContainer").size + found("TakeProfitContainer").size
-        check(canReset(Context(instrument, titles.single().text?.toString(),
-            found("StepperTextField").size == 1,
-            found("TradingBuyButton").size == 1,
-            found("TradingSellButton").size == 1,
-            found("ModifyPositionButton").isNotEmpty(),
+        check(canReset(Context(instrument, title,
+            volumeCount == 1,
+            buyCount == 1,
+            sellCount == 1,
+            modifyCount > 0,
             protectionCount = protectionSections))) {
-            "To nie jest jednoznacznie rozpoznany bilet nowego zlecenia"
+            "Bilet nierozpoznany: tytuł=${title?.take(40)}, oczekiwany=$instrument, " +
+                "wolumen=$volumeCount, Buy=$buyCount, Sell=$sellCount, " +
+                "Modyfikuj=$modifyCount, sekcje TP/SL=$protectionSections"
         }
     }
 
