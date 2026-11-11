@@ -371,8 +371,12 @@ class AccessibilityExecutor(private val profileProvider: () -> UiTargetProfile?)
                 return ExecutionResult.Rejected("Nowe wejście zablokowane: ${it.reason}")
             }
         }
+        val resetToken = if (profile.packageName == ScreenScanner.XTB_PACKAGE && !order.reduceOnly) {
+            UiActionRecovery.beginTicketReset(order.symbol)
+                ?: return ExecutionResult.Rejected("Bilet jest już zablokowany lub trwa jego reset")
+        } else null
         val result = svc.executeOnScreen(order, profile)
-        if (profile.packageName == ScreenScanner.XTB_PACKAGE && !order.reduceOnly &&
+        if (resetToken != null &&
             (result is ExecutionResult.Filled || result is ExecutionResult.Submitted)) {
             return UiActionRecovery.run(
                 instrument = order.symbol,
@@ -382,7 +386,7 @@ class AccessibilityExecutor(private val profileProvider: () -> UiTargetProfile?)
                     check(svc.xtbPositionExists(order.symbol) == true) {
                         "Nie potwierdzono pozycji; nie resetuję pól SL/TP"
                     }
-                    svc.resetNextOrderTicket(order.symbol)
+                    svc.resetNextOrderTicket(order.symbol, resetToken)
                 },
                 onRecoveryError = { failure ->
                     AutoExecutionService.diag = "Reset nowego biletu zablokowany: ${failure.message}"
@@ -581,7 +585,7 @@ class AutoExecutionService : AccessibilityService() {
             if (!_actionActive.value && pkg == ScreenScanner.XTB_PACKAGE &&
                 ScreenScanner.findById(root, "TradingBuyButton").singleOrNull()?.isEnabled == true &&
                 ScreenScanner.findById(root, "TradingSellButton").singleOrNull()?.isEnabled == true) {
-                UiActionRecovery.observeReadyScreen(quote.instrument, quote.bid, quote.ask)
+                UiActionRecovery.observeReadyScreen(XtbTicketReader.read(root))
             }
             quote.availableFunds?.let { lastAccountFunds = it; lastAccountCurrency = quote.accountCurrency }
         }
@@ -615,9 +619,9 @@ class AutoExecutionService : AccessibilityService() {
 
     /** Na czas klikania w XTB tarcza musi być uchylona. */
     // NEXT_ORDER_TICKET_RESET_V1
-    suspend fun resetNextOrderTicket(instrument: String): Unit =
+    suspend fun resetNextOrderTicket(instrument: String, resetToken: Long): Unit =
         withContext(Dispatchers.Main.immediate) {
-            withAction {
+            withAction(expectedInstrument = instrument) {
                 restoreTicketTop()
                 TicketProtectionReset.reset(
                     instrument = instrument,
@@ -630,40 +634,37 @@ class AutoExecutionService : AccessibilityService() {
                         }
                     }
                 )
+                check(UiActionRecovery.markTicketResetVerified(resetToken)) {
+                    "Nieaktualna sesja resetu biletu; nowe wejścia pozostają zablokowane"
+                }
             }
         }
 
-    private suspend fun <T> withAction(block: suspend () -> T): T = uiMutex.withLock {
+    private suspend fun <T> withAction(
+        expectedInstrument: String? = _screenQuote.value?.instrument,
+        block: suspend () -> T
+    ): T = uiMutex.withLock {
         _actionActive.value = true
         try {
             delay(350) // czas na uchylenie tarczy
             // UI_RECOVERY_V1
-            val expectedInstrument = _screenQuote.value?.instrument
             UiActionRecovery.run(
                 instrument = expectedInstrument,
+                timeoutMs = 12_000L,
                 action = block,
                 restore = {
-                    restoreTicketTop()
-                    val root = appRoot() ?: error("Brak okna po akcji")
-                    if (root.packageName?.toString() == ScreenScanner.XTB_PACKAGE) {
-                        val quote = ScreenScanner.scanXtb(root, ScreenScanner.XTB_PACKAGE,
-                            "XTB", System.currentTimeMillis())
-                        check(expectedInstrument != null && quote?.instrument == expectedInstrument) {
-                            "Nie potwierdzono właściwego instrumentu po akcji"
-                        }
-                        val bid = quote?.bid
-                        val ask = quote?.ask
-                        check(bid != null && ask != null && bid.isFinite() && ask.isFinite() && bid > 0 && ask >= bid) {
-                            "Brak poprawnych cen Sell/Buy po akcji"
-                        }
-                        check(ScreenScanner.findById(root, "TradingBuyButton").singleOrNull()?.isEnabled == true &&
-                            ScreenScanner.findById(root, "TradingSellButton").singleOrNull()?.isEnabled == true) {
-                            "Przyciski transakcji nie są aktywne"
-                        }
-                        UiActionRecovery.observeReadyScreen(quote?.instrument, bid, ask)
-                    } else {
-                        error("Po akcji nie widzę okna XTB")
+                    val instrument = checkNotNull(expectedInstrument) {
+                        "Nie określono instrumentu do przywrócenia"
                     }
+                    check(appRoot()?.packageName?.toString() == ScreenScanner.XTB_PACKAGE) {
+                        "Przed przywracaniem nie widzę okna XTB"
+                    }
+                    restoreTicketTop()
+                    val ready = TicketReadiness.awaitReady(
+                        instrument = instrument,
+                        read = { XtbTicketReader.read(appRoot()) }
+                    )
+                    UiActionRecovery.observeReadyScreen(ready)
                 },
                 onRecoveryError = { failure ->
                     diag = "Błąd przywracania ekranu; nowe wejścia zablokowane: ${failure.message}"
