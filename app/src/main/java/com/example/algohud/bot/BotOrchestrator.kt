@@ -414,7 +414,9 @@ class BotOrchestrator(
             val head = "🧭 PLAN: W POZYCJI ${if (dir > 0) "LONG" else "SHORT"} ${BigDecimal.valueOf(pos.quantity).toPlainString()} @ ${f(pos.entryPrice)} " +
                 "(${stratName(pos.entryReason)}) • %+.2fR".format(pnlR)
             val sl = "SL ${f(pos.stopPrice)}" + if (pos.stopPrice != pos.initialStop) " (przesunięty)" else ""
-            val exit = if (pos.entryReason.startsWith(AI_TAG)) {
+            val exit = if (SL_ONLY) {
+                "Zamknę WYŁĄCZNIE na $sl (bez TP). Przy zysku SL idzie za ceną: wystrzał świecy → ciasno za impulsem, od +1R na wejście i dalej 1R za ceną."
+            } else if (pos.entryReason.startsWith(AI_TAG)) {
                 val t = aiTrades[inst]
                 val vtp = pos.entryPrice + dir * maxOf(AI_VTP_ATR * (aggregators["$inst@${Learner.M1}"]?.closed()?.takeLast(60)?.let { Indicators.atr(it) } ?: r), t?.expBody ?: 0.0)
                 if (t?.trailing == true) "🚀 jadę za impulsem: trailing $sl – zamknę przy pierwszym wyhamowaniu (knot/zawrócenie świecy)"
@@ -570,7 +572,7 @@ class BotOrchestrator(
 
     private suspend fun aiManage(inst: String, px: Double, ts: Long) {
         val pos = risk.position(inst) ?: run { aiTrades.remove(inst); return }
-        val isAi = pos.entryReason.startsWith(AI_TAG)
+        val isAi = pos.entryReason.startsWith(AI_TAG) && !SL_ONLY // w trybie „tylko SL” AI nie ma własnych wyjść
         val t = aiTrades.getOrPut(inst) { AiTrade(expBody = 0.0) } // też pozycje innych strategii / po restarcie
         if (t.closing) return
         val dir = pos.side.sign
@@ -624,7 +626,7 @@ class BotOrchestrator(
         val best = if (dir > 0) maxOf(pos.best, px) else minOf(pos.best, px)
         val trailStop = best - dir * maxOf(AI_TRAIL_ATR * atr, 2 * spreadOf(inst))
         risk.tightenStop(inst, trailStop) // przecięcie = TRAILING-STOP w risk.onMark (natychmiast, bez czekania na XTB)
-        if (cur != null && slowdown(cur, dir, atr)) { aiClose(inst, pos, px, t, "wyhamowanie impetu"); return }
+        if (!SL_ONLY && cur != null && slowdown(cur, dir, atr)) { aiClose(inst, pos, px, t, "wyhamowanie impetu"); return }
         // Zabezpieczenie w XTB (gdyby aplikacja padła): SL za zyskiem + TP odsunięty. Rzadko – to operacje na ekranie.
         // SL przesuwany za impulsem NIGDY po stronie straty: min. wejście + spread (w XTB = próg rentowności).
         val beStop = pos.entryPrice + dir * maxOf(spreadOf(inst), 0.05)
@@ -640,7 +642,7 @@ class BotOrchestrator(
                 try {
                     val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
                     val sh = q?.let { basis(inst, it) } ?: 0.0
-                    val res = AutoExecutionService.instance?.setProtection(inst, stopNow + sh, farTp + sh)
+                    val res = AutoExecutionService.instance?.setProtection(inst, stopNow + sh, if (SL_ONLY) null else farTp + sh)
                     if (res is ExecutionResult.Submitted || res is ExecutionResult.Filled) {
                         t.brokerSl = stopNow
                         msg("🛡 $inst: w XTB SL → %.2f, TP → %.2f (za impulsem)".format(stopNow + sh, farTp + sh))
@@ -886,7 +888,7 @@ class BotOrchestrator(
                 val now = System.currentTimeMillis()
                 for (sym in risk.openSymbols()) {
                     val left = MarketHours.status(sym, now).minutesToClose ?: continue
-                    if (left > SESSION_CLOSE_MIN) continue
+                    if (SL_ONLY || left > SESSION_CLOSE_MIN) continue
                     val px = lastPx[sym]?.first ?: continue
                     val pos = risk.position(sym) ?: continue
                     risk.closingOrder(sym, pos.side.opposite(), px)?.let {
@@ -1110,7 +1112,8 @@ class BotOrchestrator(
             }
             return null
         }
-        return OrderRequest(symbol, side, qty, price, stop, reason, pointValue = pv, takeProfit = takeProfit, tier = tier, fixedSize = true)
+        // Tylko SL: bez Take Profit (w XTB suwak TP wyłączony) – pozycję zamyka wyłącznie Stop Loss.
+        return OrderRequest(symbol, side, qty, price, stop, reason, pointValue = pv, takeProfit = if (SL_ONLY) null else takeProfit, tier = tier, fixedSize = true)
     }
 
     /** Symulacja spreadu XTB w handlu papierowym: kupno po ask, sprzedaż po bid. */
@@ -1350,6 +1353,8 @@ class BotOrchestrator(
         const val SL_MAX_PLN = 20.0              // …maks. 20 PLN (przy stałym locie)
         /** false = bot sam nie zamyka pozycji na minusie (stratę zamyka tylko SL 15–20 PLN / koniec sesji). */
         const val EARLY_LOSS_EXITS = false
+        /** Pozycję zamyka WYŁĄCZNIE Stop Loss (przesuwany za zyskiem); bez TP, bez wyjść bota, bez zamykania na koniec sesji. */
+        const val SL_ONLY = true
         const val AI_WRONG_CANDLE_MIN_LOSS_R = 0.5 // „świeca przeciw” zamyka dopiero przy stracie ≥ 0,5R
         const val AI_SAFETY_TP_R = 3.0           // TP w XTB daleko (3R) – właściwe wyjście prowadzi bot
         const val AI_VTP_ATR = 1.0               // TP wirtualny ≥ 1×ATR (lub prognozowany korpus, jeśli większy)
