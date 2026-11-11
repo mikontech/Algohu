@@ -70,7 +70,9 @@ class SmcEngine(
         /** Dlaczego brak wejścia (gdy setup == null). */
         val note: String,
         /** Scenariusze warunkowe „Jeśli … to …” do HUD-a. */
-        val scenarios: List<String>
+        val scenarios: List<String>,
+        /** Kontekst wielu interwałów: struktura H1, reżim M5 (trend/konsolidacja), zmienność, koszt spreadu. */
+        val context: String = ""
     )
 
     fun session(ts: Long): Session {
@@ -180,9 +182,10 @@ class SmcEngine(
         val atr = Indicators.atr(m1.takeLast(60)) ?: return Result(session, bias, null, null, "brak ATR", emptyList())
         val lv = levels(m5, m1, now)
         val scen = scenarios(lv, price, bias, shift)
-        newsBlackout(now)?.let { return Result(session, bias, lv, null, it, scen) }
-        if (!allSessions && !session.tradable) return Result(session, bias, lv, null, "${session.label} – poza killzone nie handluję, czekam na Londyn 09:00 / NY 14:30", scen)
-        if (spread > 0.25 * atr) return Result(session, bias, lv, null, "spread %.2f > 25%% ATR – rynek za drogi".format(spread), scen)
+        val ctx = context(m1, m5, atr, spread, bias)
+        newsBlackout(now)?.let { return Result(session, bias, lv, null, it, scen, ctx) }
+        if (!allSessions && !session.tradable) return Result(session, bias, lv, null, "${session.label} – poza killzone nie handluję, czekam na Londyn 09:00 / NY 14:30", scen, ctx)
+        if (spread > 0.25 * atr) return Result(session, bias, lv, null, "spread %.2f > 25%% ATR – rynek za drogi".format(spread), scen, ctx)
 
         val tol = 0.05 * atr
         val buf = max(0.2 * atr, 1.5 * spread)
@@ -233,23 +236,47 @@ class SmcEngine(
                 if (risk <= 0 || (price - stop) * dir <= 0) continue
                 // 5) cel: najbliższa przeciwna płynność z R:R ≥ MIN_RR (TP tuż przed poziomem)
                 val targets = if (dir < 0) lv.below(price) else lv.above(price)
+                // R:R PO KOSZTACH: zysk pomniejszony o spread, ryzyko powiększone o spread (wejście/wyjście po gorszej stronie).
+                fun netRr(tp: Double) = (abs(tp - price) - spread) / (risk + spread)
                 val tgt = targets.map { it to (it.price + dir * -0.1 * atr) }
-                    .firstOrNull { (_, tp) -> abs(tp - price) / risk >= MIN_RR }
+                    .firstOrNull { (_, tp) -> netRr(tp) >= MIN_RR }
                 if (tgt == null) {
                     why = "sweep ${level.name} + CHoCH ✓, ale brak celu z R:R ≥ 1:%.1f (SL %.2f) – odpuszczam".format(MIN_RR, stop + shift)
                     continue
                 }
-                val rr = abs(tgt.second - price) / risk
+                val rr = netRr(tgt.second)
                 val s = Setup(
                     side, stop, tgt.second, rr, level, extreme, sw.second,
                     key = "${level.name}:${m1[ext].start}",
-                    reason = "SMC ${if (dir < 0) "SHORT" else "LONG"}: sweep ${level.name} %.2f → CHoCH %.2f, cel ${tgt.first.name} %.2f, R:R 1:%.1f".format(
+                    reason = "SMC ${if (dir < 0) "SHORT" else "LONG"}: sweep ${level.name} %.2f → CHoCH %.2f (potwierdzone zamknięciem M1), cel ${tgt.first.name} %.2f, R:R po kosztach 1:%.1f".format(
                         level.price + shift, sw.second + shift, tgt.first.price + shift, rr)
                 )
                 if (best == null || s.rr > best.rr) best = s
             }
         }
-        return Result(session, bias, lv, best, if (best != null) best.reason else why, scen)
+        return Result(session, bias, lv, best, if (best != null) best.reason else "NO TRADE – $why", scen, ctx)
+    }
+
+    /** Kontekst: H1 struktura, M5 trend vs konsolidacja (zakres 12 świec vs ATR5), zmienność 1m vs mediana, spread jako % ATR. */
+    private fun context(m1: List<Bar>, m5: List<Bar>, atr1: Double, spread: Double, bias: Int): String {
+        val h1 = when (bias) { 1 -> "H1 ↑"; -1 -> "H1 ↓"; else -> "H1 ↔" }
+        val regime = m5.takeLast(12).takeIf { it.size == 12 }?.let { w ->
+            val atr5 = Indicators.atr(m5.takeLast(60)) ?: return@let null
+            val span = w.maxOf { it.high } - w.minOf { it.low }
+            val net = abs(w.last().close - w.first().open)
+            when {
+                span < 3 * atr5 -> "M5 konsolidacja (zakres 1h %.1f×ATR5)".format(span / atr5)
+                net > 0.6 * span -> "M5 trend %s".format(if (w.last().close > w.first().open) "↑" else "↓")
+                else -> "M5 szarpany zakres"
+            }
+        } ?: "M5 brak danych"
+        val ranges = m1.takeLast(300).map { it.high - it.low }
+        val vol = DataQuality.median(ranges)?.takeIf { it > 0 }?.let { med ->
+            val r = atr1 / med
+            when { r > 1.6 -> "zmienność wysoka"; r < 0.7 -> "zmienność niska"; else -> "zmienność normalna" }
+        } ?: "zmienność ?"
+        val cost = if (atr1 > 0) "spread %.0f%% ATR1".format(spread / atr1 * 100) else "spread ?"
+        return "$h1 • $regime • $vol • $cost"
     }
 
     /** Scenariusze warunkowe dla najbliższej płynności nad i pod ceną. */

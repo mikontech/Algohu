@@ -76,6 +76,28 @@ class NextCandlePredictorTest {
         assertTrue(kotlin.math.abs(pr.probUp - 0.5) < 0.1)
     }
 
+    /** Losowy rynek: model nie może się „skalibrować” na przewagę, której nie ma. */
+    @Test fun randomMarketIsNotCalibrated() {
+        val rnd = kotlin.random.Random(42)
+        var px = 2000.0
+        val bars = List(3000) { i -> val o = px; px += rnd.nextDouble(-1.0, 1.0); Bar(i * 60_000L, o, maxOf(o, px) + 0.2, minOf(o, px) - 0.2, px) }
+        val p = NextCandlePredictor().apply { warmUp(bars.take(1000)) }
+        for (i in 1000 until 2999) { p.predict(bars.subList(0, i), bars[i], 1.0, 60_000L, 0L); p.onBarClosed(bars.subList(0, i + 1)) }
+        val c = p.calibration()
+        assertTrue(c.n >= NextCandlePredictor.CAL_MIN_N)
+        assertTrue(c.why, !c.ok)
+        val b = NextCandlePredictor()
+        assertTrue(b.import(p.export()))
+        assertEquals(c.n, b.calibration().n)
+    }
+
+    @Test fun momentumMarketCalibrates() {
+        val bars = momentumBars(4000, seed = 9)
+        val p = NextCandlePredictor().apply { warmUp(bars.take(1000)) }
+        for (i in 1000 until 3999) { p.predict(bars.subList(0, i), bars[i], 1.0, 60_000L, 0L); p.onBarClosed(bars.subList(0, i + 1)) }
+        assertTrue(p.calibration().brier!! < 0.247)
+    }
+
     @Test fun badImportIsRejected() {
         assertTrue(!NextCandlePredictor().import("garbage"))
     }

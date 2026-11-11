@@ -488,6 +488,7 @@ class BotOrchestrator(
             val px = lastPx[inst]?.first ?: continue
             aiPredictTick(inst, px, now)
             candleEarlyExit(inst, now)
+            watchDataOutage(inst, now)
             smcTick(inst, px, now)
             if (inst == hudLearningInstrument) updatePlan(inst, now)
             if (inst == hudLearningInstrument) {
@@ -744,15 +745,126 @@ class BotOrchestrator(
         val (hit, graded) = pr.hitStats()
         val acc = if (graded > 0) "%d/%d (%.0f%%)".format(hit, graded, hit * 100.0 / graded) else "brak ocen"
         val p = pr.last?.takeIf { System.currentTimeMillis() - it.madeAt < 2 * Learner.M1 }
+        val cal = pr.calibration()
+        val cur = aggregators["$inst@${Learner.M1}"]?.current()
         val line1 = p?.let {
-            "🔮 Następna świeca 1m: %s | Szansa: %.0f%% | Siła ruchu: %s (~%.2f)".format(
-                if (it.up) "WZROSTOWA" else "SPADKOWA", it.prob * 100, it.strength, it.expBody)
-        } ?: "🔮 Następna świeca 1m: prognoza ~10 s przed zamknięciem bieżącej"
+            val sideways = it.prob < 0.55 || it.expBody < 2 * spreadOf(inst)
+            val scenario = if (sideways) "BOCZNY (brak przewagi po kosztach)" else if (it.up) "WZROSTOWY" else "SPADKOWY"
+            val chance = if (cal.ok) " | P≈%.0f%% (skalibrowane)".format(it.prob * 100) else ""
+            val inval = cur?.let { c -> if (it.up) " | unieważnia: zamknięcie M1 < %.2f".format(c.low) else " | unieważnia: zamknięcie M1 > %.2f".format(c.high) } ?: ""
+            "🔮 Horyzont 1 świeca (1m), ${if (it.early) "wstępna – świeca w trakcie" else "późna – świeca prawie zamknięta"}: $scenario$chance | zakres ±%.2f$inval".format(it.expBody)
+        } ?: "🔮 Prognoza 1m powstaje od 30 s świecy"
         val (eh, eg) = pr.hitStats(early = true)
         val eacc = if (eg > 0) "%d/%d (%.0f%%)".format(eh, eg, eh * 100.0 / eg) else "brak ocen"
-        val line2 = "🎓 Model: trafność z ost. 20: $acc • wcześnie (30–50 s): $eacc • nauczony na ${pr.samples} świecach"
+        val line2 = "🎓 Model: trafność z ost. 20: $acc • wcześnie (30–50 s): $eacc • ${cal.why} • tylko informacja, nie otwiera pozycji"
         val line3: String? = null
-        _hud.update { it.copy(prediction = listOfNotNull(line1, line2, line3).joinToString("\n"), predictionUp = p?.up) }
+        val ctx = smcResult[inst]?.context?.takeIf { it.isNotBlank() }?.let { "🧭 Kontekst: $it" }
+        _hud.update { it.copy(prediction = listOfNotNull(ctx, line1, line2, line3).joinToString("\n"), predictionUp = p?.takeIf { pp -> pp.prob >= 0.55 }?.up) }
+    }
+
+    // ───────────── 📡 Dane: pochodzenie, świeżość, bramka wejść, uzgodnienie po przerwie ─────────────
+
+    private val basisHist = java.util.concurrent.ConcurrentHashMap<String, ArrayDeque<Double>>()
+    private val basisAt = HashMap<String, Long>()
+    private val needsReconcile = java.util.Collections.synchronizedSet(HashSet<String>())
+    private val outageSince = HashMap<String, Long>()
+    @Volatile private var reconcileRunning = false
+
+    private fun sampleBasis(inst: String, q: ScreenQuote) {
+        val mid = q.mid ?: return
+        val (px, ts) = lastPx[inst] ?: return
+        if (!hasBackground(inst) || !q.isFresh() || System.currentTimeMillis() - ts > 10_000) return
+        val now = System.currentTimeMillis()
+        if (now - (basisAt[inst] ?: 0L) < 5_000) return
+        basisAt[inst] = now
+        val d = basisHist.getOrPut(inst) { ArrayDeque() }
+        synchronized(d) { d.addLast(mid - px); while (d.size > 120) d.removeFirst() } // ~10 min próbek
+    }
+
+    private fun gateInput(inst: String): DataQuality.GateInput {
+        val now = System.currentTimeMillis()
+        val q = AutoExecutionService.screenQuote.value
+        val (fp, fts) = lastPx[inst] ?: (null to null)
+        val typical = basisHist[inst]?.let { d -> synchronized(d) { d.toList() } }?.takeIf { it.size >= 6 }?.let { DataQuality.median(it) }
+        return DataQuality.GateInput(
+            now = now, expectedInstrument = inst,
+            screenInstrument = q?.instrument, screenQuoteAt = q?.timestamp, screenBid = q?.bid, screenAsk = q?.ask,
+            feedAt = fts, feedPrice = fp,
+            typicalBasis = if (hasBackground(inst)) typical else 0.0,
+            atr1 = aggregators["$inst@${Learner.M1}"]?.closed()?.takeLast(60)?.let { Indicators.atr(it) },
+            pointValueKnown = pointValue(inst) != null,
+            needsReconcile = inst in needsReconcile,
+            realTrading = engine.mode.value != ExecutionMode.DRY_RUN
+        )
+    }
+
+    private fun dataBlock(inst: String): String? = DataQuality.entryBlock(gateInput(inst)).also { dataNote[inst] = it }
+    private val dataNote = java.util.concurrent.ConcurrentHashMap<String, String?>()
+
+    /** Przerwa w danych > 30 s → po powrocie najpierw uzgodnienie pozycji z XTB, dopiero potem nowe wejścia. */
+    private suspend fun watchDataOutage(inst: String, now: Long) {
+        val g = gateInput(inst)
+        val feedStale = g.feedAt == null || now - g.feedAt > DataQuality.FEED_MAX_AGE_MS
+        val screenStale = g.realTrading && (g.screenQuoteAt == null || now - g.screenQuoteAt > 30_000 || g.screenInstrument != inst)
+        if (feedStale || screenStale) {
+            val since = outageSince.getOrPut(inst) { now }
+            if (now - since > 30_000 && needsReconcile.add(inst)) msg("📡 $inst: przerwa w danych > 30 s – nowe wejścia wstrzymane do uzgodnienia z XTB")
+            return
+        }
+        outageSince.remove(inst)
+        if (inst in needsReconcile && !reconcileRunning) {
+            reconcileRunning = true
+            scope.launch {
+                try {
+                    guarded("uzgadnianie po przerwie") { reconcileOnce() }
+                    needsReconcile.remove(inst)
+                    msg("✅ $inst: dane wróciły, pozycje uzgodnione z XTB – wejścia odblokowane")
+                } finally { reconcileRunning = false }
+            }
+        }
+        updateDataReport(inst, g)
+    }
+
+    private var lastReportAt = 0L
+
+    /** Raport pól: wartość, źródło, czas, jednostka, status. Brak = „brak”, nigdy zero. */
+    private suspend fun updateDataReport(inst: String, g: DataQuality.GateInput) {
+        val now = g.now
+        if (now - lastReportAt < 2_000 || inst != hudLearningInstrument) return
+        lastReportAt = now
+        val q = AutoExecutionService.screenQuote.value?.takeIf { it.instrument == inst }
+        val feedSrc = when { inst in binanceFallback -> "feed Binance ${FEEDS[inst] ?: "?"}"; hasBackground(inst) -> "feed w tle (Pyth/Binance)"; else -> "XTB ekran" }
+        val m1 = aggregators["$inst@${Learner.M1}"]
+        val m5 = aggregators["$inst@${Learner.M5}"]
+        val pos = risk.position(inst)
+        val pv = pointValue(inst)
+        val fields = listOf(
+            DataQuality.Field("Instrument w XTB", q?.instrument, "XTB ekran (tytuł)", q?.timestamp, "", DataQuality.SCREEN_MAX_AGE_MS),
+            DataQuality.Field("Sell/Buy", if (q?.bid != null && q.ask != null) "%.2f / %.2f".format(q.bid, q.ask) else null, "XTB ekran", q?.timestamp, "USD", DataQuality.SCREEN_MAX_AGE_MS),
+            DataQuality.Field("Spread", if (q?.bid != null && q.ask != null) "%.2f".format(q.ask - q.bid) else null, "obliczone z XTB", q?.timestamp, "USD", DataQuality.SCREEN_MAX_AGE_MS),
+            DataQuality.Field("Cena do analizy", g.feedPrice?.let { "%.2f".format(it) }, feedSrc, g.feedAt, "USD", DataQuality.FEED_MAX_AGE_MS),
+            DataQuality.Field("Różnica XTB−feed", g.typicalBasis?.let { "%.2f (mediana 10 min)".format(it) }, "obliczone", basisAt[inst], "USD", 60_000),
+            DataQuality.Field("Świeca 1m", m1?.current()?.let { "otwarta od ${(now - it.start) / 1000} s, zamkniętych ${m1.closed().size}" }, "$feedSrc (wykres XTB to canvas – nieczytelny)", lastPx[inst]?.second, "", DataQuality.FEED_MAX_AGE_MS),
+            DataQuality.Field("Świece 5m", m5?.closed()?.size?.toString(), feedSrc, lastPx[inst]?.second, "szt.", DataQuality.FEED_MAX_AGE_MS),
+            DataQuality.Field("Wartość kontraktu", q?.contractValueAcct?.let { "%.2f za %s lota".format(it, q.volume?.let { v -> BigDecimal.valueOf(v).toPlainString() } ?: "?") }, "XTB ekran (bilet)", q?.timestamp, q?.accountCurrency ?: "PLN", DataQuality.SCREEN_MAX_AGE_MS),
+            DataQuality.Field("Wartość 1 lota / 1 USD", pv?.let { "%.2f".format(it) }, "obliczone z biletu XTB (zapamiętane)", if (pv != null) now else null, q?.accountCurrency ?: "PLN", Long.MAX_VALUE),
+            DataQuality.Field("Wolne środki", q?.availableFunds?.let { "%.2f".format(it) }, "XTB ekran (bilet)", q?.timestamp, q?.accountCurrency ?: "PLN", DataQuality.SCREEN_MAX_AGE_MS),
+            DataQuality.Field("Saldo / equity", null, "XTB bilet tego nie pokazuje", null, "PLN", 0),
+            DataQuality.Field("Depozyt pozycji", null, "nieodczytywany (pole „Depozyt” bez stałego ID)", null, "PLN", 0),
+            DataQuality.Field("Krok / min. wolumen", null, "XTB nie pokazuje na bilecie; bot używa 0.006 (przyjmowane przez XTB)", null, "lot", 0),
+            DataQuality.Field("Pozycja bota", pos?.let { "${it.side} ${BigDecimal.valueOf(it.quantity).toPlainString()} @ %.2f SL %.2f TP %s".format(it.entryPrice, it.stopPrice, it.takeProfit?.let { t -> "%.2f".format(t) } ?: "—") } ?: "brak pozycji",
+                "księga bota (uzgadniana z XTB co 30 s)", now, "", Long.MAX_VALUE),
+            DataQuality.Field("Godziny handlu", MarketHours.status(inst, now).let { st -> if (st.open) "otwarte, do zamknięcia ${st.minutesToClose ?: "?"} min" else "zamknięte" }, "wbudowany harmonogram (nie z XTB)", now, "", Long.MAX_VALUE),
+            DataQuality.Field("Kalendarz / wiadomości", null, "nie zintegrowane z XTB; stałe okna danych USA", null, "", 0)
+        )
+        val block = dataNote[inst] ?: DataQuality.entryBlock(g)
+        DataQuality.lastReport = buildString {
+            appendLine("📡 Dane $inst – ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.ROOT).format(java.util.Date(now))}")
+            appendLine("Wejścia: " + (block?.let { "⛔ $it" } ?: "✓ dane wiarygodne"))
+            fields.forEach { appendLine(it.line(now)) }
+        }
+        val headline = "📡 Dane: " + (block?.let { "⛔ $it" } ?: "✓ XTB ${q?.timestamp?.let { (now - it) / 1000 } ?: "?"} s • feed ${g.feedAt?.let { (now - it) / 1000 } ?: "?"} s")
+        _hud.update { it.copy(dataStatus = headline) }
     }
 
     private val binanceFallback = java.util.Collections.synchronizedSet(HashSet<String>())
@@ -1037,6 +1149,7 @@ class BotOrchestrator(
         if (inst != null && inst != hudLearningInstrument) { hudLearningInstrument = inst; updateLearningHud() }
         if (inst == null) return
         q.pointValuePerLot?.let { rememberPointValue(inst, it) }
+        sampleBasis(inst, q)
         if (q.bid != null && q.ask != null && q.ask >= q.bid) rememberSpread(inst, q.ask - q.bid)
         // Instrumenty bez feedu w tle – liczone z ekranu XTB (tylko gdy jest widoczny).
         if (!hasBackground(inst)) q.mid?.let { px -> lock.withLock { processPrice(inst, px, q.timestamp) } }
@@ -1137,6 +1250,10 @@ class BotOrchestrator(
         tier: Int = 1, structural: Boolean = false
     ): OrderRequest? {
         risk.closingOrder(symbol, side, price)?.let { return it.copy(reason = "$reason (zamknięcie)") }
+        dataBlock(symbol)?.let { why ->
+            if (rtNotes.add("data:$symbol:$why:${System.currentTimeMillis() / 60_000}")) msg("📡 $symbol: $reason – wstrzymane: $why")
+            return null
+        }
         val pv = pointValue ?: run {
             if (warned.add("pv:$symbol")) msg("Otwórz raz bilet $symbol w XTB – bot musi poznać wartość kontraktu")
             return null

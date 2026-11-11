@@ -115,6 +115,15 @@ class MainActivity : ComponentActivity() {
             ui().edit().putBoolean("auto_anydesk_accept", false).apply()
             Toast.makeText(this, "Wyłączone", Toast.LENGTH_SHORT).show()
         }
+        button("📡 Skopiuj raport danych (źródło, czas, jednostka, status)") {
+            val d = com.example.algohud.bot.DataQuality.lastReport
+            if (d == null) Toast.makeText(this, "Brak – uruchom bota i otwórz bilet GOLD w XTB", Toast.LENGTH_LONG).show()
+            else {
+                getSystemService(android.content.ClipboardManager::class.java)
+                    .setPrimaryClip(android.content.ClipData.newPlainText("raport danych", d))
+                Toast.makeText(this, "Skopiowano – wklej w czacie", Toast.LENGTH_SHORT).show()
+            }
+        }
         button("Skopiuj diagnostykę okna połączenia AnyDesk") {
             val d = AutoExecutionService.lastRemoteDump
             if (d == null) Toast.makeText(this, "Brak – połącz się raz z głównego telefonu", Toast.LENGTH_LONG).show()

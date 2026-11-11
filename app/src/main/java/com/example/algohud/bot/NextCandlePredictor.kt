@@ -47,6 +47,34 @@ class NextCandlePredictor {
     private val gSize = DoubleArray(N)
     private val hits = ArrayDeque<Boolean>()
     private val earlyHits = ArrayDeque<Boolean>()
+
+    // Kalibracja (tylko prognozy „późne”, oceniane po zamknięciu świecy): Brier i trafność w koszykach pewności.
+    private var calN = 0L
+    private var brierSum = 0.0
+    private val bucketN = LongArray(3)     // pewność 50–55%, 55–60%, ≥60%
+    private val bucketHit = LongArray(3)
+    private val bucketProb = DoubleArray(3)
+
+    data class Calibration(val n: Long, val brier: Double?, val ok: Boolean, val why: String)
+
+    /**
+     * Procent wolno pokazywać tylko, gdy model jest skalibrowany na danych z życia:
+     * ≥ [CAL_MIN_N] ocen, Brier lepszy niż rzut monetą (0,25) i w każdym koszyku z ≥ 30 ocenami
+     * trafność różni się od deklarowanej pewności o ≤ 7 pkt proc.
+     */
+    fun calibration(): Calibration {
+        if (calN < CAL_MIN_N) return Calibration(calN, if (calN > 0) brierSum / calN else null, false, "kalibracja: $calN/$CAL_MIN_N ocen")
+        val brier = brierSum / calN
+        if (brier >= 0.25 - 0.003) return Calibration(calN, brier, false, "Brier %.3f ≥ 0,247 – brak przewagi nad rzutem monetą".format(brier))
+        for (b in 0 until 3) {
+            if (bucketN[b] < 30) continue
+            val hit = bucketHit[b].toDouble() / bucketN[b]
+            val prob = bucketProb[b] / bucketN[b]
+            if (abs(hit - prob) > 0.07) return Calibration(calN, brier, false,
+                "koszyk %.0f%%: trafność %.0f%% ≠ deklarowana – procenty niewiarygodne".format(prob * 100, hit * 100))
+        }
+        return Calibration(calN, brier, true, "skalibrowane (n=$calN, Brier %.3f)".format(brier))
+    }
     /** Ile świec model już przerobił (nauka). */
     var samples = 0L
         private set
@@ -72,7 +100,17 @@ class NextCandlePredictor {
     fun onBarClosed(closed: List<Bar>) {
         val bar = closed.lastOrNull() ?: return
         if (bar.close != bar.open) {
-            for (p in pending.filter { it.forBarStart == bar.start }) push((bar.close > bar.open) == p.up, p.early)
+            val y = if (bar.close > bar.open) 1.0 else 0.0
+            for (p in pending.filter { it.forBarStart == bar.start }) {
+                push((bar.close > bar.open) == p.up, p.early)
+                if (!p.early) {
+                    calN++
+                    brierSum += (p.probUp - y) * (p.probUp - y)
+                    val b = when { p.prob < 0.55 -> 0; p.prob < 0.60 -> 1; else -> 2 }
+                    bucketN[b]++; bucketProb[b] += p.prob
+                    if ((y > 0.5) == p.up) bucketHit[b]++
+                }
+            }
         }
         pending.removeAll { it.forBarStart <= bar.start }
         train(closed)
@@ -181,7 +219,8 @@ class NextCandlePredictor {
         "v1", samples.toString(), lastTrainedStart.toString(),
         wDir.joinToString(","), gDir.joinToString(","), wSize.joinToString(","), gSize.joinToString(","),
         hits.joinToString("") { if (it) "1" else "0" },
-        earlyHits.joinToString("") { if (it) "1" else "0" }
+        earlyHits.joinToString("") { if (it) "1" else "0" },
+        (listOf(calN.toDouble(), brierSum) + (0 until 3).flatMap { listOf(bucketN[it].toDouble(), bucketHit[it].toDouble(), bucketProb[it]) }).joinToString(",")
     ).joinToString(";")
 
     fun import(s: String): Boolean = runCatching {
@@ -194,6 +233,10 @@ class NextCandlePredictor {
         lastTrainedStart = p[2].toLong()
         hits.clear(); p[7].forEach { push(it == '1') }
         earlyHits.clear(); p.getOrNull(8)?.forEach { push(it == '1', early = true) }
+        p.getOrNull(9)?.split(",")?.map { it.toDouble() }?.takeIf { it.size == 11 }?.let { c ->
+            calN = c[0].toLong(); brierSum = c[1]
+            for (b in 0 until 3) { bucketN[b] = c[2 + b * 3].toLong(); bucketHit[b] = c[3 + b * 3].toLong(); bucketProb[b] = c[4 + b * 3] }
+        }
         true
     }.getOrDefault(false)
 
@@ -208,6 +251,7 @@ class NextCandlePredictor {
         const val TRUST_SAMPLES = 300.0
         const val STRONG_BODY_ATR = 0.70
         const val MEDIUM_BODY_ATR = 0.35
+        const val CAL_MIN_N = 200L
 
         private fun sigmoid(z: Double) = 1.0 / (1.0 + exp(-z.coerceIn(-30.0, 30.0)))
         private fun dot(w: DoubleArray, x: DoubleArray): Double { var s = 0.0; for (i in w.indices) s += w[i] * x[i]; return s }

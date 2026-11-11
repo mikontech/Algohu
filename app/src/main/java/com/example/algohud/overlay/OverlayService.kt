@@ -496,8 +496,9 @@ class OverlayService : LifecycleService() {
             .format(s.dailyPnl)
         tvMessage.text = s.lastMessage
         setKeepScreenOn(s.mode == ExecutionMode.AUTO && !s.killSwitch)
-        tvPlan.visibility = if (s.plan.isBlank()) View.GONE else View.VISIBLE
-        tvPlan.text = s.plan
+        val planText = listOf(s.dataStatus, s.plan).filter { it.isNotBlank() }.joinToString("\n")
+        tvPlan.visibility = if (planText.isBlank()) View.GONE else View.VISIBLE
+        tvPlan.text = planText
         tvPredict.visibility = if (s.prediction.isBlank()) View.GONE else View.VISIBLE
         tvPredict.text = s.prediction
         tvPredict.setTextColor(
