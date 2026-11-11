@@ -415,13 +415,13 @@ class BotOrchestrator(
             val sl = "SL ${f(pos.stopPrice)}" + if (pos.stopPrice != pos.initialStop) " (przesunięty)" else ""
             val exit = if (pos.entryReason.startsWith(AI_TAG)) {
                 val t = aiTrades[inst]
-                val vtp = pos.entryPrice + dir * maxOf(AI_MIN_VTP_R * r, t?.expBody ?: 0.0)
+                val vtp = pos.entryPrice + dir * maxOf(AI_VTP_ATR * (aggregators["$inst@${Learner.M1}"]?.closed()?.takeLast(60)?.let { Indicators.atr(it) } ?: r), t?.expBody ?: 0.0)
                 if (t?.trailing == true) "🚀 jadę za impulsem: trailing $sl – zamknę przy pierwszym wyhamowaniu (knot/zawrócenie świecy)"
                 else "Cel ${f(vtp)}: przy celu z silnym impulsem NIE zamykam (trailing), bez impulsu zamykam. " +
                     "Wcześniej: gdy świeca prognozy zamknie się przeciwnie przy stracie ≥ 0,5R albo po 4 świecach bez ruchu. $sl"
             } else {
                 "TP ${pos.takeProfit?.let { f(it) } ?: "—"} • $sl (od +1R stop na wejście, dalej 1R za ceną). " +
-                    "Przy wystrzale świecy (od +0,5R): TP dalej, SL za ceną. Wcześniej: gdy 3 świece 1m zamkną się przeciwko pozycji przy stracie ≥ 0,5R."
+                    "Przy wystrzale świecy (od +0,7×ATR zysku): TP dalej, SL za ceną. Wcześniej: gdy 3 świece 1m zamkną się przeciwko pozycji przy stracie ≥ 0,5R."
             }
             "$head\n$exit"
         } else {
@@ -578,19 +578,20 @@ class BotOrchestrator(
         val closed = a.closed()
         val cur = a.current()
         val atr = Indicators.atr(closed.takeLast(60))?.takeIf { it > 0 } ?: r
-        val virtualTp = pos.entryPrice + dir * maxOf(AI_MIN_VTP_R * r, t.expBody)
+        val virtualTp = pos.entryPrice + dir * maxOf(AI_VTP_ATR * atr, t.expBody)
+        val profitAtr = (px - pos.entryPrice) * dir / atr
 
         val pnlR = (px - pos.entryPrice) * dir / r
         if (!t.trailing && !isAi) {
             // Pozostałe strategie: wystrzał świecy w stronę pozycji przy zysku → TP dalej, SL za ceną.
-            if (pnlR >= IMPULSE_MIN_R && cur != null && impulseStrong(inst, cur, dir, atr, ts)) {
+            if (profitAtr >= IMPULSE_MIN_ATR && cur != null && impulseStrong(inst, cur, dir, atr, ts)) {
                 t.trailing = true
                 risk.moveTakeProfit(inst, null)
                 msg("🚀 $inst: wystrzał świecy przy %+.1fR – przesuwam TP dalej i SL za ceną".format(pnlR))
             } else return
         }
         if (!t.trailing) {
-            if (pnlR >= IMPULSE_MIN_R && (px - virtualTp) * dir < 0 && cur != null && impulseStrong(inst, cur, dir, atr, ts)) {
+            if (profitAtr >= IMPULSE_MIN_ATR && (px - virtualTp) * dir < 0 && cur != null && impulseStrong(inst, cur, dir, atr, ts)) {
                 // wystrzał jeszcze przed celem – też jedziemy za nim
                 t.trailing = true
                 risk.moveTakeProfit(inst, null)
@@ -1074,11 +1075,15 @@ class BotOrchestrator(
         val atr1 = aggregators["$symbol@${Learner.M1}"]?.closed()?.takeLast(60)?.let { Indicators.atr(it) }
         var stop = stop
         var takeProfit = takeProfit
-        if (atr1 != null && atr1 > 0 && abs(price - stop) < MIN_STOP_ATR * atr1) {
+        // SL w złotówkach: strata przy SL zawsze 15–20 PLN (stały lot) – miejsce na szarpnięcie i odbicie świecy.
+        run {
             val d = if (side == Side.BUY) 1 else -1
-            val oldDist = abs(price - stop)
-            stop = price - d * MIN_STOP_ATR * atr1
-            takeProfit = takeProfit?.let { tp -> price + d * maxOf(abs(tp - price), abs(tp - price) / oldDist.coerceAtLeast(1e-9) * MIN_STOP_ATR * atr1 * 0.75) }
+            val perPrice = FIXED_LOT * pv // PLN za ruch ceny o 1,0
+            if (perPrice > 0) {
+                val loss = abs(price - stop) * perPrice
+                val target = loss.coerceIn(SL_MIN_PLN, SL_MAX_PLN)
+                if (abs(loss - target) > 0.01) stop = price - d * target / perPrice
+            }
         }
         val minDist = price * risk.config.minStopDistancePct
         if (abs(price - stop) < minDist) {
@@ -1332,10 +1337,12 @@ class BotOrchestrator(
         const val AI_MIN_BODY_SPREADS = 2.0      // oczekiwany ruch ≥ 2× spread
         const val AI_STOP_ATR = 1.6              // twardy SL 1,6×ATR (min. 3× spread) – miejsce na odbicie
         const val MIN_STOP_ATR = 1.5             // każda strategia: SL min. 1,5×ATR(1m)
-        const val IMPULSE_MIN_R = 0.5            // przesuwanie TP/SL za impulsem od +0,5R
+        const val IMPULSE_MIN_ATR = 0.7          // przesuwanie TP/SL za impulsem od zysku 0,7×ATR
+        const val SL_MIN_PLN = 15.0              // strata przy SL: min. 15 PLN…
+        const val SL_MAX_PLN = 20.0              // …maks. 20 PLN (przy stałym locie)
         const val AI_WRONG_CANDLE_MIN_LOSS_R = 0.5 // „świeca przeciw” zamyka dopiero przy stracie ≥ 0,5R
         const val AI_SAFETY_TP_R = 3.0           // TP w XTB daleko (3R) – właściwe wyjście prowadzi bot
-        const val AI_MIN_VTP_R = 1.0             // TP wirtualny ≥ 1R (lub prognozowany korpus, jeśli większy)
+        const val AI_VTP_ATR = 1.0               // TP wirtualny ≥ 1×ATR (lub prognozowany korpus, jeśli większy)
         const val AI_MAX_EXTRA_BARS = 3          // świeca prognozy + 3 – potem wyjście czasowe
         const val AI_IMPULSE_ATR = 0.6           // impuls: zasięg świecy ≥ 0,6×ATR
         const val AI_TRAIL_ATR = 0.35            // ciasny trailing 0,35×ATR za najlepszą ceną
