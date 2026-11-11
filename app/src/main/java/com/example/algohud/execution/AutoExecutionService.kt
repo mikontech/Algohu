@@ -393,6 +393,10 @@ class AutoExecutionService : AccessibilityService() {
         /** Cena odczytana z ekranu brokera – do weryfikacji spójności z feedem. */
         val screenPrice: StateFlow<Double?> = _screenPrice.asStateFlow()
 
+        private val _uiEvents = MutableSharedFlow<String>(extraBufferCapacity = 16)
+        /** Komunikaty dla HUD (np. wynik weryfikacji SL/TP i przywracania suwaków). */
+        val uiEvents: SharedFlow<String> = _uiEvents.asSharedFlow()
+
         private val _volumeTriple = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
         /** 3× "głośność w dół" w ciągu 2 s – przełącza tarczę dotyku. */
         val volumeTriple: SharedFlow<Unit> = _volumeTriple.asSharedFlow()
@@ -1034,6 +1038,12 @@ class AutoExecutionService : AccessibilityService() {
         val sl = order.stopPrice + shift
         val tp = order.takeProfit?.plus(shift)
 
+        // Stan suwaków SL/TP i lista pozycji PRZED wejściem – do weryfikacji i późniejszego przywrócenia formularza.
+        val formBefore = runCatching { readTicketSlTp() }.getOrNull()
+        val rowsBefore = appRoot()?.let { runCatching { readPositionRows(it) }.getOrNull() }.orEmpty()
+        val formOp = formBefore?.let { formCoordinator.beginEntry(order.clientOrderId, order.symbol, it) }
+        if (formBefore == null) _uiEvents.tryEmit("⚠️ ${order.symbol}: nie odczytano suwaków SL/TP – po wejściu nie zostaną przywrócone")
+
         revealById("MarketSizeInput") ?: return ExecutionResult.Rejected("nie znaleziono pola wolumenu")
         val vol = fieldIn("MarketSizeInput") ?: return ExecutionResult.Rejected("nie znaleziono pola wolumenu")
         val args = Bundle().apply {
@@ -1097,10 +1107,174 @@ class AutoExecutionService : AccessibilityService() {
         } else {
             delay(1_500)
         }
-        return ExecutionResult.Submitted(
-            "XTB: ${order.side} ${formatQty(order.quantity)} ${order.symbol}, SL %.2f".format(sl) +
-                (tp?.let { ", TP %.2f".format(it) } ?: "") + " – sprawdź pozycję"
-        )
+
+        // Sukces dopiero, gdy XTB pokazuje NOWĄ pozycję z zapisanymi SL/TP (nie samo kliknięcie).
+        val desc = "${order.side} ${formatQty(order.quantity)} ${order.symbol}, SL %.2f".format(sl) + (tp?.let { ", TP %.2f".format(it) } ?: "")
+        return when (val check = awaitOpenedPosition(order, sl, tp, rowsBefore)) {
+            is OpenCheck.Confirmed -> {
+                if (formOp != null) {
+                    formCoordinator.onConfirmed(
+                        formOp,
+                        SlTpFormCoordinator.ConfirmedPosition(formOp.opId, order.symbol, check.row.signature, sl, tp, System.currentTimeMillis()),
+                        restore = { restoreFormFor(it) },
+                        report = { _uiEvents.tryEmit(it) }
+                    )
+                }
+                ExecutionResult.Submitted(
+                    "XTB: $desc – SL/TP potwierdzone przy pozycji ${check.row.entryText ?: ""}" +
+                        (if (formOp != null) "; suwaki wrócą za ok. 5 s" else "")
+                )
+            }
+            is OpenCheck.SlTpProblem -> {
+                formOp?.let { formCoordinator.onFailed(it) }
+                val text = check.problems.joinToString("; ")
+                _uiEvents.tryEmit("⛔ ${order.symbol}: pozycja otwarta, ale SL/TP NIE zapisane poprawnie ($text) – sprawdź w XTB; suwaki bez zmian")
+                ExecutionResult.Submitted("XTB: $desc – UWAGA: $text")
+            }
+            OpenCheck.NotFound -> {
+                formOp?.let { formCoordinator.onFailed(it) }
+                ExecutionResult.Failed(IllegalStateException("XTB nie pokazało nowej pozycji w ciągu 15 s – otwarcie niepotwierdzone"))
+            }
+        }
+    }
+
+    // ───────────── Suwaki SL/TP w bilecie: zapis stanu, weryfikacja przy pozycji, przywracanie ─────────────
+
+    private val formCoordinator by lazy { SlTpFormCoordinator(serviceScope) }
+
+    /** Przełącznik ("suwak") w wierszu sekcji SL/TP biletu. */
+    private fun switchIn(toggleId: String): AccessibilityNodeInfo? {
+        val root = appRoot() ?: return null
+        val area = ScreenScanner.findById(root, toggleId).firstOrNull()?.let { n -> Rect().also { n.getBoundsInScreen(it) } } ?: return null
+        val r = Rect()
+        return ScreenScanner.findById(root, "ToggleRowSwitch").firstOrNull { n -> n.getBoundsInScreen(r); area.contains(r.centerX(), r.centerY()) }
+    }
+
+    /** Włączony = przełącznik zaznaczony (jeśli XTB to raportuje) albo widoczne pole ceny. */
+    private fun readEnabled(containerId: String, toggleId: String): Boolean {
+        val sw = switchIn(toggleId)
+        return if (sw != null && sw.isCheckable) sw.isChecked else fieldIn(containerId) != null
+    }
+
+    /** Aktualny stan suwaków SL/TP w bilecie (przewija do sekcji). null = nie udało się odczytać. */
+    private suspend fun readTicketSlTp(): TicketSlTpState? {
+        revealById("StopLossContainer") ?: return null
+        val slOn = readEnabled("StopLossContainer", "StopLossToggle")
+        val slVal = fieldIn("StopLossContainer")?.text?.toString()
+        revealById("TakeProfitContainer") ?: return null
+        val tpOn = readEnabled("TakeProfitContainer", "TakeProfitToggle")
+        val tpVal = fieldIn("TakeProfitContainer")?.text?.toString()
+        return TicketSlTpState(slOn, slVal, tpOn, tpVal)
+    }
+
+    /** Wszystkie elementy z tekstem (także poza ekranem) – do odczytu wierszy pozycji. */
+    private fun uiItems(root: AccessibilityNodeInfo, limit: Int = 4000): List<UiItem> {
+        val out = ArrayList<UiItem>()
+        val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+        val r = Rect()
+        var visited = 0
+        while (queue.isNotEmpty() && visited < limit) {
+            val n = queue.removeFirst()
+            visited++
+            val t = n.text?.toString()
+            if (!t.isNullOrEmpty()) {
+                n.getBoundsInScreen(r)
+                out += UiItem(n.viewIdResourceName?.substringAfter(":id/")?.substringAfterLast('/'), t, r.left, r.top, r.right, r.bottom)
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+        return out
+    }
+
+    /** Wiersze sekcji "Otwarte pozycje" biletu XTB. */
+    private fun readPositionRows(root: AccessibilityNodeInfo): List<PositionRowInfo> {
+        val items = uiItems(root)
+        val r = Rect()
+        return (0 until 10).mapNotNull { k ->
+            val row = ScreenScanner.findById(root, "PositionRow$k", visibleOnly = false).firstOrNull() ?: return@mapNotNull null
+            row.getBoundsInScreen(r)
+            if (r.isEmpty) return@mapNotNull null
+            PositionRowParser.parse(items.filter { it.left >= r.left && it.right <= r.right && it.top >= r.top && it.bottom <= r.bottom })
+        }
+    }
+
+    private sealed interface OpenCheck {
+        data class Confirmed(val row: PositionRowInfo) : OpenCheck
+        data class SlTpProblem(val problems: List<String>) : OpenCheck
+        object NotFound : OpenCheck
+    }
+
+    /** Czeka, aż w XTB pojawi się NOWA pozycja (strona + wolumen) i sprawdza zapisane przy niej SL/TP. */
+    private suspend fun awaitOpenedPosition(order: OrderRequest, sl: Double, tp: Double?, before: List<PositionRowInfo>): OpenCheck {
+        var lastProblems: List<String>? = null
+        var revealed = false
+        val deadline = SystemClock.uptimeMillis() + 15_000
+        while (SystemClock.uptimeMillis() < deadline) {
+            val root = appRoot()
+            if (root != null && root.packageName?.toString() == ScreenScanner.XTB_PACKAGE) {
+                val rows = readPositionRows(root)
+                val candidates = SlTpVerifier.newRows(before, rows, order.side, order.quantity)
+                for (c in candidates) {
+                    when (val chk = SlTpVerifier.check(c, sl, tp)) {
+                        SlTpCheck.Ok -> return OpenCheck.Confirmed(c)
+                        is SlTpCheck.Mismatch -> lastProblems = chk.problems // XTB mogło jeszcze nie odświeżyć – czekamy dalej
+                    }
+                }
+                if (candidates.isEmpty() && !revealed && SystemClock.uptimeMillis() > deadline - 10_000) {
+                    revealed = true
+                    revealById("PositionRow0") // sekcja pozycji mogła nie być jeszcze wyrenderowana
+                }
+            }
+            delay(700)
+        }
+        return lastProblems?.let { OpenCheck.SlTpProblem(it) } ?: OpenCheck.NotFound
+    }
+
+    /** Ustawia przełącznik (i ewentualnie wartość) w bilecie. Dotyczy WYŁĄCZNIE formularza, nie pozycji. */
+    private suspend fun applyFormToggle(containerId: String, toggleId: String, on: Boolean, value: String?): String? {
+        revealById(containerId) ?: return "nie znaleziono sekcji"
+        if (readEnabled(containerId, toggleId) != on) {
+            val sw = switchIn(toggleId) ?: return "nie znaleziono przełącznika"
+            if (!click(sw)) return "nie udało się przełączyć"
+            delay(500)
+            if (readEnabled(containerId, toggleId) != on) return "przełącznik nie zmienił stanu"
+        }
+        if (on && value != null) {
+            val f = fieldIn(containerId) ?: return "brak pola ceny"
+            if (f.text?.toString() != value) {
+                val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value) }
+                if (!f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return "nie udało się wpisać wartości"
+                delay(300)
+                val now = fieldIn(containerId)?.text?.toString()?.let { ScreenScanner.parseNumber(it) }
+                val want = ScreenScanner.parseNumber(value)
+                if (now == null || want == null || abs(now - want) > 1e-6) return "XTB nie przyjęło wartości $value"
+            }
+        }
+        return null
+    }
+
+    /** Przywrócenie formularza – tylko na bilecie tego instrumentu i gdy nic innego nie trwa. */
+    private suspend fun restoreFormFor(op: SlTpFormCoordinator.Operation): SlTpFormCoordinator.RestoreOutcome {
+        if (_actionActive.value || !uiMutex.tryLock()) return SlTpFormCoordinator.RestoreOutcome.Busy
+        try {
+            val root = appRoot() ?: return SlTpFormCoordinator.RestoreOutcome.Busy
+            if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) return SlTpFormCoordinator.RestoreOutcome.Busy
+            // Edycja pozycji / arkusz / potwierdzenie zlecenia na ekranie → nie ruszamy formularza.
+            if (ScreenScanner.findById(root, "ModifyPositionButton").isNotEmpty() || findOrderConfirm(root) != null ||
+                ScreenScanner.findById(root, "CloseButton").isNotEmpty()
+            ) return SlTpFormCoordinator.RestoreOutcome.Busy
+            if (xtbTitle(root) != op.instrument) return SlTpFormCoordinator.RestoreOutcome.Busy
+            _actionActive.value = true // tarcza dotyku uchylona na czas zmian
+            delay(350)
+            val b = op.baseline
+            val err = applyFormToggle("StopLossContainer", "StopLossToggle", b.slEnabled, b.slValue)?.let { "SL: $it" }
+                ?: applyFormToggle("TakeProfitContainer", "TakeProfitToggle", b.tpEnabled, b.tpValue)?.let { "TP: $it" }
+            runCatching { restoreTicketTop() }
+            return if (err == null) SlTpFormCoordinator.RestoreOutcome.Done else SlTpFormCoordinator.RestoreOutcome.Failed(err)
+        } finally {
+            _actionActive.value = false
+            uiMutex.unlock()
+        }
     }
 
     private suspend fun awaitNode(sel: NodeSelector, timeoutMs: Long): AccessibilityNodeInfo? =

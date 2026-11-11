@@ -518,6 +518,7 @@ class BotOrchestrator(
             }
         }
         scope.launch { engine.events.collect { msg(it) } }
+        scope.launch { AutoExecutionService.uiEvents.collect { msg(it) } }
         scope.launch { AutoExecutionService.screenQuote.filterNotNull().collect { q -> guarded("odczyt ekranu") { onScreen(q) } } }
         scope.launch { risk.killSwitch.filter { it }.collect { guarded("KILL") { engine.flattenAll(risk.killReason ?: "KILL") } } }
         // Koniec sesji / weekend: zamknięcie pozycji intraday [SESSION_CLOSE_MIN] min przed zamknięciem rynku.
