@@ -164,7 +164,7 @@ class BotOrchestrator(
     private val orbs = HashMap<String, Orb>()
 
     private fun applyProfile() {
-        risk.cooldownAfterLossMs = if (profile.value == BotProfile.STANDARD) risk.config.cooldownAfterLossMs else AGGRESSIVE_COOLDOWN_MS
+        risk.cooldownAfterLossMs = AGGRESSIVE_COOLDOWN_MS
     }
 
     fun setProfile(p: BotProfile) {
@@ -175,7 +175,7 @@ class BotOrchestrator(
         msg("Profil: ${p.label}")
     }
 
-    private fun profileLabel() = profile.value.label
+    private fun profileLabel() = ALL_LABEL
 
     // ───────────── ZAKRES: wejście przy dole zakresu po odbiciu, wyjście przy górze ─────────────
     private class RangeState(var lowSeen: Double = Double.MAX_VALUE, var highSeen: Double = -Double.MAX_VALUE, var lastEntryBar: Long = 0L)
@@ -268,7 +268,10 @@ class BotOrchestrator(
         if (closed.size < RT_LOOKBACK + 15) return
         val atr = Indicators.atr(closed)?.takeIf { it > 0 } ?: return
         val range = cur.high - cur.low
-        if (range < RT_RANGE_ATR * atr) return // to jeszcze nie jest kandydat na impuls
+        if (range < RT_RANGE_ATR * atr) {
+            rtInfo[inst] = "czekam na świecę 1m ≥ %.1f×ATR (teraz %.1f×) wybijającą szczyt/dołek %d świec".format(RT_RANGE_ATR, range / atr, RT_LOOKBACK)
+            return // to jeszcze nie jest kandydat na impuls
+        }
         val body = abs(cur.close - cur.open)
         val dir = if (cur.close > cur.open) 1 else -1
         // Long: cena przy szczycie (mały górny knot); short: przy dołku (mały dolny knot).
@@ -284,6 +287,7 @@ class BotOrchestrator(
             risk.cooldownLeftMs() > 0 -> "przerwa po stracie – jeszcze %d s".format(risk.cooldownLeftMs() / 1000)
             else -> null
         }
+        rtInfo[inst] = "świeca %.1f×ATR %s – %s".format(range / atr, if (dir > 0) "↑" else "↓", why ?: "WCHODZĘ")
         if (why != null) {
             // Raz na świecę i powód (żeby HUD nie migał przy każdym ticku).
             val key = "$inst@${cur.start}:${why.substringBefore(' ')}"
@@ -340,9 +344,9 @@ class BotOrchestrator(
         val stop = if (abs(entry - rawStop) < minDist) entry - dir * minDist else rawStop
         val takeProfit = tp ?: (entry + dir * tpR * abs(entry - stop))
         val side = if (dir > 0) Side.BUY else Side.SELL
-        risk.closingOrder(inst, side, px)?.let { close ->
-            val r = engine.submit(withSpread(close.copy(reason = "ODWRÓCENIE (impuls)"), inst), bypassConfirmation = true)
-            if (r !is ExecutionResult.Filled && r !is ExecutionResult.Submitted) return r
+        risk.position(inst)?.let { pos ->
+            if (rtNotes.add("inpos:$inst:${ts / Learner.M1}")) msg("✋ $inst: $why – pominięte, już w pozycji (${stratName(pos.entryReason)})")
+            return null
         }
         val order = buildOrder(inst, side, entry, stop, takeProfit, why, pointValue(inst), tier) ?: return null
         decisionCard(inst, order, Signal(side, stop, takeProfit, why, tier), ev = Double.NaN)
@@ -354,6 +358,87 @@ class BotOrchestrator(
     private val predictors = java.util.concurrent.ConcurrentHashMap<String, NextCandlePredictor>()
     private val predictedBar = HashMap<String, Long>()
     private val aiNote = HashMap<String, String>()
+    private val aiEnteredBar = HashMap<String, Long>()
+    private val rtInfo = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val earlyExitChecked = HashMap<String, Long>()
+    private val _plan = HashMap<String, String>()
+
+    private fun stratName(reason: String) = when {
+        reason.startsWith(AI_TAG) -> "🕯️ ŚWIECE+AI"
+        reason.startsWith("RT") -> "⚡ RT impuls"
+        reason.startsWith("ORB") -> "⚡ ORB otwarcie"
+        reason.startsWith("ZAKRES") -> "📈 ZAKRES"
+        reason.startsWith("STRAT") -> "🧠 TURNIEJ"
+        reason.startsWith("MANUAL") -> "ręczna"
+        else -> reason.take(20)
+    }
+
+    /**
+     * Wcześniejsze wyjście dla pozycji spoza AI (AI ma własne reguły): dwie kolejne świece 1m po wejściu
+     * zamknięte przeciwko pozycji (korpus ≥ 0,3×ATR każda) przy stracie = świece nie idą tak, jak powinny.
+     */
+    private suspend fun candleEarlyExit(inst: String, now: Long) {
+        val pos = risk.position(inst) ?: return
+        if (pos.entryReason.startsWith(AI_TAG)) return
+        val a = aggregators["$inst@${Learner.M1}"] ?: return
+        val closed = a.closed()
+        val last = closed.lastOrNull() ?: return
+        if (earlyExitChecked[inst] == last.start) return
+        earlyExitChecked[inst] = last.start
+        val after = closed.filter { it.start >= pos.openedAt - pos.openedAt % Learner.M1 + Learner.M1 }.takeLast(2)
+        if (after.size < 2) return
+        val atr = Indicators.atr(closed.takeLast(60))?.takeIf { it > 0 } ?: return
+        val dir = pos.side.sign
+        val px = lastPx[inst]?.first ?: return
+        val against = after.all { (it.close - it.open) * dir <= -EARLY_EXIT_BODY_ATR * atr }
+        if (!against || (px - pos.entryPrice) * dir >= 0) return
+        val close = risk.closingOrder(inst, pos.side.opposite(), px) ?: return
+        msg("🏁 $inst: 2 świece 1m przeciwko pozycji – zamykam wcześniej, przed SL @ %.2f".format(px))
+        engine.submit(withSpread(close.copy(reason = "ŚWIECE PRZECIW (wcześniejsze wyjście)"), inst), bypassConfirmation = true)
+    }
+
+    /** Plan bota po ludzku: co robi teraz, na co czeka, kiedy zamknie. */
+    private suspend fun updatePlan(inst: String, now: Long) {
+        val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
+        val sh = q?.let { basis(inst, it) } ?: 0.0
+        fun f(v: Double) = "%.2f".format(v + sh)
+        val pos = risk.position(inst)
+        val text = if (pos != null) {
+            val dir = pos.side.sign
+            val px = lastPx[inst]?.first ?: pos.entryPrice
+            val r = abs(pos.entryPrice - pos.initialStop)
+            val pnlR = if (r > 0) (px - pos.entryPrice) * dir / r else 0.0
+            val head = "🧭 PLAN: W POZYCJI ${if (dir > 0) "LONG" else "SHORT"} ${BigDecimal.valueOf(pos.quantity).toPlainString()} @ ${f(pos.entryPrice)} " +
+                "(${stratName(pos.entryReason)}) • %+.2fR".format(pnlR)
+            val sl = "SL ${f(pos.stopPrice)}" + if (pos.stopPrice != pos.initialStop) " (przesunięty)" else ""
+            val exit = if (pos.entryReason.startsWith(AI_TAG)) {
+                val t = aiTrades[inst]
+                val vtp = pos.entryPrice + dir * maxOf(AI_MIN_VTP_R * r, t?.expBody ?: 0.0)
+                if (t?.trailing == true) "🚀 jadę za impulsem: trailing $sl – zamknę przy pierwszym wyhamowaniu (knot/zawrócenie świecy)"
+                else "Cel ${f(vtp)}: przy celu z silnym impulsem NIE zamykam (trailing), bez impulsu zamykam. " +
+                    "Wcześniej: gdy świeca prognozy zamknie się przeciwnie albo po 2 świecach bez ruchu. $sl"
+            } else {
+                "TP ${pos.takeProfit?.let { f(it) } ?: "—"} • $sl (od +1R stop na wejście, dalej 1R za ceną). " +
+                    "Wcześniej: gdy 2 świece 1m zamkną się przeciwko pozycji przy stracie."
+            }
+            "$head\n$exit"
+        } else {
+            val block = sessionBlock(inst, now) ?: if (risk.cooldownLeftMs() > 0) "przerwa po stracie ${risk.cooldownLeftMs() / 1000} s" else null
+            val l = learners[inst]
+            val orb = MarketHours.status(inst, now).lastOpenEventMs?.let { ev ->
+                val m = (now - ev) / 60_000
+                if (m in 0 until ORB_ACTIVE_MIN) "zasięg otwarcia sesji – wejdę przy wybiciu (jeszcze ${ORB_ACTIVE_MIN - m} min)" else null
+            }
+            listOfNotNull(
+                "🧭 PLAN: CZEKAM" + (block?.let { " – $it" } ?: " – żadna z 4 strategii nie daje jeszcze sygnału"),
+                "• 🕯️ AI: " + (aiNote[inst]?.removePrefix("⏸ ") ?: "prognoza od 30 s świecy, wejdę gdy szansa i trafność będą wystarczające"),
+                "• ⚡ RT: " + (rtInfo[inst] ?: "zbieram świece 1m…") + (orb?.let { "\n• ⚡ ORB: $it" } ?: ""),
+                "• 📈 " + (rangeInfo[inst] ?: "ZAKRES: zbieram świece 1m…"),
+                "• 🧠 TURNIEJ: " + (l?.summary()?.substringBefore('\n')?.substringAfter(": ")?.take(90) ?: "uczę się…")
+            ).joinToString("\n")
+        }
+        if (_plan[inst] != text) { _plan[inst] = text; _hud.update { it.copy(plan = text) } }
+    }
 
     private fun predictor(inst: String) = predictors.getOrPut(inst) {
         NextCandlePredictor().also { p -> prefs.getString("ncp_$inst", null)?.let { p.import(it) } }
@@ -395,6 +480,8 @@ class BotOrchestrator(
             a.roll(now)?.let { onM1Closed(inst, a.closed()) }
             val px = lastPx[inst]?.first ?: continue
             aiPredictTick(inst, px, now)
+            candleEarlyExit(inst, now)
+            if (inst == hudLearningInstrument) updatePlan(inst, now)
             if (inst == hudLearningInstrument) {
                 val lc = lastM1Close[inst] ?: now.also { lastM1Close[inst] = it }
                 if (now - lc > 3 * Learner.M1 && now - lastStallNote > Learner.M1) {
@@ -421,26 +508,35 @@ class BotOrchestrator(
     private suspend fun aiPredictTick(inst: String, px: Double, ts: Long) {
         val a = aggregators["$inst@${Learner.M1}"] ?: return
         val cur = a.current() ?: return
-        if (ts - cur.start < AI_PREDICT_AT_MS || predictedBar[inst] == cur.start) return
+        val elapsed = ts - cur.start
+        if (elapsed < AI_EARLY_AT_MS) return
+        val slot = cur.start + elapsed / AI_EARLY_STEP_MS // od 30 s co 5 s, od 50 s jedna „późna”
+        val late = elapsed >= AI_PREDICT_AT_MS
+        val key = if (late) cur.start * 10 + 9 else slot * 10
+        if (predictedBar[inst] == key) return
         val closed = a.closed()
         if (closed.size < 60) return
-        predictedBar[inst] = cur.start
-        val p = predictor(inst).predict(closed, cur, tickRatio(inst, ts), Learner.M1, ts) ?: return
-        if (profile.value == BotProfile.AI) aiEntry(inst, p, px, ts)
+        predictedBar[inst] = key
+        val p = predictor(inst).predict(closed, cur, tickRatio(inst, ts), Learner.M1, ts, early = !late) ?: return
+        aiEntry(inst, p, px, ts)
         if (inst == hudLearningInstrument) updatePredictionHud(inst)
     }
 
     private suspend fun aiEntry(inst: String, p: NextCandlePredictor.Prediction, px: Double, ts: Long) {
-        val (hit, graded) = predictor(inst).hitStats()
+        val curBar = p.forBarStart - Learner.M1
+        if (aiEnteredBar[inst] == curBar) return
+        val (hit, graded) = predictor(inst).hitStats(early = p.early)
         val acc = if (graded > 0) hit.toDouble() / graded else 0.0
+        val minProb = if (p.early) AI_EARLY_MIN_PROB else AI_MIN_PROB
+        val label = if (p.early) "wczesna prognoza" else "prognoza"
         val dir = if (p.up) 1 else -1
         val side = if (dir > 0) Side.BUY else Side.SELL
         val spread = spreadOf(inst)
         val pos = risk.position(inst)
         val why = when {
-            graded < AI_MIN_GRADED -> "model się rozgrzewa (ocenione $graded/$AI_MIN_GRADED)"
-            acc < AI_MIN_ACC -> "trafność %.0f%% < %.0f%% – model nie ma przewagi".format(acc * 100, AI_MIN_ACC * 100)
-            p.prob < AI_MIN_PROB -> "szansa %.0f%% < %.0f%%".format(p.prob * 100, AI_MIN_PROB * 100)
+            graded < AI_MIN_GRADED -> "$label: model się rozgrzewa (ocenione $graded/$AI_MIN_GRADED)"
+            acc < AI_MIN_ACC -> "$label: trafność %.0f%% < %.0f%% – brak przewagi".format(acc * 100, AI_MIN_ACC * 100)
+            p.prob < minProb -> "$label: szansa %.0f%% < %.0f%%".format(p.prob * 100, minProb * 100)
             p.expBody < AI_MIN_BODY_SPREADS * spread -> "oczekiwany ruch %.2f < %.0f× spread".format(p.expBody, AI_MIN_BODY_SPREADS)
             pos?.side == side -> "już w pozycji w tę stronę"
             pos != null && !pos.entryReason.startsWith(AI_TAG) -> "otwarta pozycja innej strategii"
@@ -450,7 +546,8 @@ class BotOrchestrator(
         aiNote[inst] = why?.let { "⏸ $it" } ?: "▶️ WCHODZĘ ${if (dir > 0) "LONG" else "SHORT"}"
         if (why != null) return
         val stop = px - dir * AI_STOP_ATR * p.atr
-        val reason = "$AI_TAG ${if (dir > 0) "wzrostowa" else "spadkowa"} %.0f%%, korpus ~%.2f".format(p.prob * 100, p.expBody)
+        val reason = "$AI_TAG ${if (p.early) "wcześnie " else ""}${if (dir > 0) "wzrostowa" else "spadkowa"} %.0f%%, korpus ~%.2f".format(p.prob * 100, p.expBody)
+        aiEnteredBar[inst] = curBar
         val r = enterAggressive(inst, dir, px, stop, reason, ts, tpR = AI_SAFETY_TP_R)
         if (r is ExecutionResult.Filled || r is ExecutionResult.Submitted) aiTrades[inst] = AiTrade(expBody = p.expBody)
     }
@@ -564,8 +661,10 @@ class BotOrchestrator(
             "🔮 Następna świeca 1m: %s | Szansa: %.0f%% | Siła ruchu: %s (~%.2f)".format(
                 if (it.up) "WZROSTOWA" else "SPADKOWA", it.prob * 100, it.strength, it.expBody)
         } ?: "🔮 Następna świeca 1m: prognoza ~10 s przed zamknięciem bieżącej"
-        val line2 = "🎓 Model: trafność z ost. 20: $acc • nauczony na %,d świecach".format(pr.samples).replace(',', ' ')
-        val line3 = if (profile.value == BotProfile.AI) aiNote[inst] else null
+        val (eh, eg) = pr.hitStats(early = true)
+        val eacc = if (eg > 0) "%d/%d (%.0f%%)".format(eh, eg, eh * 100.0 / eg) else "brak ocen"
+        val line2 = "🎓 Model: trafność z ost. 20: $acc • wcześnie (30–50 s): $eacc • nauczony na ${pr.samples} świecach"
+        val line3: String? = null
         _hud.update { it.copy(prediction = listOfNotNull(line1, line2, line3).joinToString("\n"), predictionUp = p?.up) }
     }
 
@@ -891,24 +990,19 @@ class BotOrchestrator(
             updateLearningHud()
             if (sig != null) handleSignal(inst, sig, px)
         }
-        when (profile.value) {
-            BotProfile.AGGRESSIVE -> { orbCheck(inst, px, ts); realtimeCheck(inst, px, ts) }
-            BotProfile.RANGE -> rangeCheck(inst, px, ts)
-            BotProfile.STANDARD, BotProfile.AI -> Unit
-        }
+        // Wszystkie strategie działają razem; pierwsza z sygnałem otwiera pozycję, pozostałe czekają aż się zamknie.
+        orbCheck(inst, px, ts)
+        realtimeCheck(inst, px, ts)
+        rangeCheck(inst, px, ts)
         aiPredictTick(inst, px, ts)
     }
 
     private suspend fun handleSignal(inst: String, sig: Signal, px: Double) {
-        if (profile.value != BotProfile.STANDARD) return // turniej się uczy, ale handluje tylko w profilu STANDARD
         val learner = learner(inst)
         sessionBlock(inst, System.currentTimeMillis())?.let { msg("✋ $inst: sygnał pominięty – $it"); return }
         msg("📈 $inst ${sig.side} [${learner.champion?.name}]: ${sig.reason}")
-        // Sygnał przeciwny do otwartej pozycji = zamknięcie i odwrócenie (long → short i odwrotnie).
-        risk.closingOrder(inst, sig.side, px)?.let { close ->
-            val r = engine.submit(withSpread(close.copy(reason = "ODWRÓCENIE"), inst), bypassConfirmation = true)
-            if (r !is ExecutionResult.Filled && r !is ExecutionResult.Submitted) return
-        }
+        // Jedna pozycja naraz: gdy jakaś strategia już jest w rynku, sygnał innej czeka (bez odwracania).
+        risk.position(inst)?.let { msg("✋ $inst: sygnał TURNIEJ ${sig.side} pominięty – już w pozycji (${stratName(it.entryReason)})"); return }
         val entry = px + spreadOf(inst) / 2 * sig.side.sign
         // 1) Agresja tylko przy udowodnionej przewadze (rolling, po kosztach) tego instrumentu i interwału.
         val st = learner.championStats
@@ -1046,11 +1140,6 @@ class BotOrchestrator(
                 b.copy(open = b.open + shift, high = b.high + shift, low = b.low + shift, close = b.close + shift)
             }
         }
-        if (profile.value == BotProfile.RANGE) {
-            val info = rangeInfo[inst] ?: "ZAKRES: zbieram świece 1m (potrzeba 60)…"
-            _hud.update { it.copy(learning = "📈 $info\n" + l.summary().substringBefore('\n')) }
-            return
-        }
         val readTf = l.championBarMs ?: Learner.M5
         val read = aggregators["$inst@$readTf"]?.closed()?.let { MarketRead.describe(it) }
         _hud.update {
@@ -1088,7 +1177,7 @@ class BotOrchestrator(
         } else "XTB: ${AutoExecutionService.diag}" +
             (if (AutoExecutionService.instance == null) " • USŁUGA UŁATWIEŃ DOSTĘPU WYŁĄCZONA" else "")
         val kill = if (risk.killSwitch.value) "\n⛔ KILL: ${risk.killReason ?: "aktywny"} – nowe zlecenia zablokowane" else ""
-        val line2 = "Tryb ${engine.mode.value.name} • ${profile.value.label}$kill"
+        val line2 = "Tryb ${engine.mode.value.name} • $ALL_LABEL$kill"
         val funds = AutoExecutionService.lastAccountFunds?.let { "%.2f %s".format(it, AutoExecutionService.lastAccountCurrency ?: "") } ?: "nieznane (otwórz bilet)"
         val pv = if (pointValue(inst) != null) "znana ✓" else "NIEZNANA – przewiń bilet do „Wartość kontraktu”"
         val pos = risk.position(inst)?.let { p ->
@@ -1205,7 +1294,12 @@ class BotOrchestrator(
 
         // ŚWIECE + PREDYKCJA AI
         const val AI_TAG = "AI"
-        const val AI_PREDICT_AT_MS = 50_000L     // prognoza ~10 s przed zamknięciem świecy 1m
+        const val AI_PREDICT_AT_MS = 50_000L     // prognoza „późna” ~10 s przed zamknięciem świecy 1m
+        const val AI_EARLY_AT_MS = 30_000L       // wczesne prognozy od 30 s świecy…
+        const val AI_EARLY_STEP_MS = 5_000L      // …co 5 s
+        const val AI_EARLY_MIN_PROB = 0.60       // wcześniejsze wejście wymaga większej pewności
+        const val EARLY_EXIT_BODY_ATR = 0.30     // wcześniejsze wyjście: 2 świece przeciw, korpus ≥ 0,3×ATR
+        const val ALL_LABEL = "🤖 WSZYSTKIE 4 (AI + RT/ORB + ZAKRES + TURNIEJ)"
         const val AI_MIN_GRADED = 20             // min. ocenionych prognoz na żywo
         const val AI_MIN_ACC = 0.55              // min. trafność z ostatnich 20
         const val AI_MIN_PROB = 0.58             // min. szansa kierunku

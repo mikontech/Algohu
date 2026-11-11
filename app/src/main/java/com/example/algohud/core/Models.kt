@@ -125,6 +125,8 @@ data class HudState(
     /** Czytelny, wielolinijkowy stan bota (prawdziwe wartości z XTB i księgi bota). */
     val status: String = "",
     val learning: String = "",
+    /** Plan bota: LONG/SHORT/czekam, na co czeka, kiedy zamknie. */
+    val plan: String = "",
     /** Predykcja następnej świecy + status uczenia modelu (sekcja w HUD). */
     val prediction: String = "",
     /** true = wzrostowa (zielona), false = spadkowa (czerwona), null = brak prognozy. */

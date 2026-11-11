@@ -27,7 +27,9 @@ class NextCandlePredictor {
         /** Szacowany korpus następnej świecy w ATR. */
         val expBodyAtr: Double,
         val atr: Double,
-        val madeAt: Long
+        val madeAt: Long,
+        /** Wczesna prognoza (z niepełnej świecy, ~30–50 s) – oceniana osobno, żeby nauczyć się, czy wolno wchodzić wcześniej. */
+        val early: Boolean = false
     ) {
         val up get() = probUp >= 0.5
         val prob get() = if (up) probUp else 1 - probUp
@@ -44,6 +46,7 @@ class NextCandlePredictor {
     private val wSize = DoubleArray(N).also { it[0] = 0.5 } // start: przeciętny korpus ≈ 0,5 ATR
     private val gSize = DoubleArray(N)
     private val hits = ArrayDeque<Boolean>()
+    private val earlyHits = ArrayDeque<Boolean>()
     /** Ile świec model już przerobił (nauka). */
     var samples = 0L
         private set
@@ -54,7 +57,7 @@ class NextCandlePredictor {
         private set
 
     /** Trafione / ocenione z ostatnich [WINDOW] prognoz. */
-    fun hitStats(): Pair<Int, Int> = hits.count { it } to hits.size
+    fun hitStats(early: Boolean = false): Pair<Int, Int> = (if (early) earlyHits else hits).let { h -> h.count { it } to h.size }
     fun accuracy(): Double? = if (hits.isEmpty()) null else hits.count { it }.toDouble() / hits.size
 
     /** Nauka na historii (np. po starcie) – tylko gdy model jest pusty. */
@@ -68,8 +71,8 @@ class NextCandlePredictor {
      */
     fun onBarClosed(closed: List<Bar>) {
         val bar = closed.lastOrNull() ?: return
-        pending.firstOrNull { it.forBarStart == bar.start }?.let { p ->
-            if (bar.close != bar.open) push((bar.close > bar.open) == p.up)
+        if (bar.close != bar.open) {
+            for (p in pending.filter { it.forBarStart == bar.start }) push((bar.close > bar.open) == p.up, p.early)
         }
         pending.removeAll { it.forBarStart <= bar.start }
         train(closed)
@@ -79,7 +82,7 @@ class NextCandlePredictor {
      * Prognoza dla świecy po [current] (trwającej, prawie zamkniętej). [tickRatio] = aktywność ticków
      * bieżącej świecy względem średniej (1.0 = normalnie).
      */
-    fun predict(closed: List<Bar>, current: Bar, tickRatio: Double, periodMs: Long, now: Long): Prediction? {
+    fun predict(closed: List<Bar>, current: Bar, tickRatio: Double, periodMs: Long, now: Long, early: Boolean = false): Prediction? {
         val bars = closed + current
         val x = features(bars, tickRatio) ?: return null
         val atr = Indicators.atr(bars.takeLast(ATR_WINDOW))?.takeIf { it > 0 } ?: return null
@@ -90,9 +93,10 @@ class NextCandlePredictor {
             probUp = 0.5 + (raw - 0.5) * trust,
             expBodyAtr = dot(wSize, x).coerceIn(0.0, 3.0),
             atr = atr,
-            madeAt = now
+            madeAt = now,
+            early = early
         )
-        pending.removeAll { it.forBarStart == p.forBarStart }
+        pending.removeAll { it.forBarStart == p.forBarStart && it.early == early }
         pending.addLast(p)
         while (pending.size > 5) pending.removeFirst()
         last = p
@@ -128,9 +132,10 @@ class NextCandlePredictor {
         }
     }
 
-    private fun push(hit: Boolean) {
-        hits.addLast(hit)
-        while (hits.size > WINDOW) hits.removeFirst()
+    private fun push(hit: Boolean, early: Boolean = false) {
+        val h = if (early) earlyHits else hits
+        h.addLast(hit)
+        while (h.size > WINDOW) h.removeFirst()
     }
 
     // ───────────── cechy ─────────────
@@ -175,7 +180,8 @@ class NextCandlePredictor {
     fun export(): String = listOf(
         "v1", samples.toString(), lastTrainedStart.toString(),
         wDir.joinToString(","), gDir.joinToString(","), wSize.joinToString(","), gSize.joinToString(","),
-        hits.joinToString("") { if (it) "1" else "0" }
+        hits.joinToString("") { if (it) "1" else "0" },
+        earlyHits.joinToString("") { if (it) "1" else "0" }
     ).joinToString(";")
 
     fun import(s: String): Boolean = runCatching {
@@ -187,6 +193,7 @@ class NextCandlePredictor {
         samples = p[1].toLong()
         lastTrainedStart = p[2].toLong()
         hits.clear(); p[7].forEach { push(it == '1') }
+        earlyHits.clear(); p.getOrNull(8)?.forEach { push(it == '1', early = true) }
         true
     }.getOrDefault(false)
 

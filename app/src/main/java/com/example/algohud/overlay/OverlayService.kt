@@ -102,6 +102,7 @@ class OverlayService : LifecycleService() {
     private lateinit var tvScreen: TextView
     private lateinit var tvStats: TextView
     private lateinit var tvPredict: TextView
+    private lateinit var tvPlan: TextView
     private lateinit var btnMode: Button
     private lateinit var btnConfirm: Button
 
@@ -294,6 +295,7 @@ class OverlayService : LifecycleService() {
             maxLines = 4; maxWidth = dp(280); ellipsize = TextUtils.TruncateAt.END
         }
         tvStats = TextView(this).apply { setTextColor(0xFF90CAF9.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 8 }
+        tvPlan = TextView(this).apply { setTextColor(0xFFFFE082.toInt()); textSize = 11.5f; visibility = View.GONE }
         tvPredict = TextView(this).apply { setTextColor(0xFFBDBDBD.toInt()); textSize = 11.5f; visibility = View.GONE }
         tvScreen = TextView(this).apply { setTextColor(0xFFFFE082.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 3 }
         btnConfirm = actionButton("✔ Potwierdź", 0xFF1565C0.toInt()) {
@@ -308,7 +310,7 @@ class OverlayService : LifecycleService() {
             addView(btnConfirm)
         }
         fun full() = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        listOf(tvStatus, tvPredict, tvStats, tvMessage).forEach { it.maxWidth = Int.MAX_VALUE; it.maxLines = 12 }
+        listOf(tvStatus, tvPlan, tvPredict, tvStats, tvMessage).forEach { it.maxWidth = Int.MAX_VALUE; it.maxLines = 12 }
         tvStatus.setTextColor(0xFFEEEEEE.toInt())
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -316,6 +318,7 @@ class OverlayService : LifecycleService() {
             setPadding(dp(10), dp(8), dp(10), dp(8))
             visibility = View.GONE
             addView(tvStatus, full())
+            addView(tvPlan, full().apply { topMargin = dp(4) })
             addView(tvPredict, full().apply { topMargin = dp(4) })
             addView(tvStats, full().apply { topMargin = dp(4) })
             addView(tvMessage, full().apply { topMargin = dp(4) })
@@ -493,6 +496,8 @@ class OverlayService : LifecycleService() {
             .format(s.dailyPnl)
         tvMessage.text = s.lastMessage
         setKeepScreenOn(s.mode == ExecutionMode.AUTO && !s.killSwitch)
+        tvPlan.visibility = if (s.plan.isBlank()) View.GONE else View.VISIBLE
+        tvPlan.text = s.plan
         tvPredict.visibility = if (s.prediction.isBlank()) View.GONE else View.VISIBLE
         tvPredict.text = s.prediction
         tvPredict.setTextColor(
