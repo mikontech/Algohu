@@ -414,8 +414,8 @@ class BotOrchestrator(
             val head = "🧭 PLAN: W POZYCJI ${if (dir > 0) "LONG" else "SHORT"} ${BigDecimal.valueOf(pos.quantity).toPlainString()} @ ${f(pos.entryPrice)} " +
                 "(${stratName(pos.entryReason)}) • %+.2fR".format(pnlR)
             val sl = "SL ${f(pos.stopPrice)}" + if (pos.stopPrice != pos.initialStop) " (przesunięty)" else ""
-            val exit = if (SL_ONLY) {
-                "Zamknę WYŁĄCZNIE na $sl (bez TP). Od +8 zł zysku SL na wejście, dalej 10 zł za ceną; wystrzał świecy → ciaśniej. SL zmieniam w otwartej pozycji XTB."
+            val exit = if (BROKER_EXITS_ONLY) {
+                "Zamknę WYŁĄCZNIE w XTB: TP ${pos.takeProfit?.let { f(it) } ?: "—"} (zysk) albo $sl (strata). Od +8 zł zysku SL na wejście, dalej 10 zł za ceną; zmiany SL w otwartej pozycji XTB."
             } else if (pos.entryReason.startsWith(AI_TAG)) {
                 val t = aiTrades[inst]
                 val vtp = pos.entryPrice + dir * maxOf(AI_VTP_ATR * (aggregators["$inst@${Learner.M1}"]?.closed()?.takeLast(60)?.let { Indicators.atr(it) } ?: r), t?.expBody ?: 0.0)
@@ -439,6 +439,7 @@ class BotOrchestrator(
                 "• 🕯️ AI: " + (aiNote[inst]?.removePrefix("⏸ ") ?: "prognoza od 30 s świecy, wejdę gdy szansa i trafność będą wystarczające"),
                 "• ⚡ RT: " + (rtInfo[inst] ?: "zbieram świece 1m…") + (orb?.let { "\n• ⚡ ORB: $it" } ?: ""),
                 "• 📈 " + (rangeInfo[inst] ?: "ZAKRES: zbieram świece 1m…"),
+                traderNote[inst]?.let { "• 🎩 Trader: ostatni sygnał odpuszczony – $it" },
                 "• 🧠 TURNIEJ: " + (l?.summary()?.substringBefore('\n')?.substringAfter(": ")?.take(90) ?: "uczę się…")
             ).joinToString("\n")
         }
@@ -573,7 +574,7 @@ class BotOrchestrator(
 
     private suspend fun aiManage(inst: String, px: Double, ts: Long) {
         val pos = risk.position(inst) ?: run { aiTrades.remove(inst); return }
-        val isAi = pos.entryReason.startsWith(AI_TAG) && !SL_ONLY // w trybie „tylko SL” AI nie ma własnych wyjść
+        val isAi = pos.entryReason.startsWith(AI_TAG) && !BROKER_EXITS_ONLY // w trybie „tylko SL” AI nie ma własnych wyjść
         val t = aiTrades.getOrPut(inst) { AiTrade(expBody = 0.0) } // też pozycje innych strategii / po restarcie
         if (t.closing) return
         val dir = pos.side.sign
@@ -586,7 +587,7 @@ class BotOrchestrator(
         val profitAtr = (px - pos.entryPrice) * dir / atr
 
         val pnlR = (px - pos.entryPrice) * dir / r
-        if (SL_ONLY) {
+        if (BROKER_EXITS_ONLY) {
             // Tylko SL: stop prowadzony w złotówkach i przesuwany W OTWARTEJ POZYCJI w XTB (ekran edycji pozycji).
             val best = if (dir > 0) maxOf(pos.best, px) else minOf(pos.best, px)
             val perPrice = pos.quantity * pos.pointValue // PLN za ruch ceny o 1,0
@@ -651,7 +652,7 @@ class BotOrchestrator(
         val best = if (dir > 0) maxOf(pos.best, px) else minOf(pos.best, px)
         val trailStop = best - dir * maxOf(AI_TRAIL_ATR * atr, 2 * spreadOf(inst))
         risk.tightenStop(inst, trailStop) // przecięcie = TRAILING-STOP w risk.onMark (natychmiast, bez czekania na XTB)
-        if (!SL_ONLY && cur != null && slowdown(cur, dir, atr)) { aiClose(inst, pos, px, t, "wyhamowanie impetu"); return }
+        if (!BROKER_EXITS_ONLY && cur != null && slowdown(cur, dir, atr)) { aiClose(inst, pos, px, t, "wyhamowanie impetu"); return }
         // Zabezpieczenie w XTB (gdyby aplikacja padła): SL za zyskiem + TP odsunięty. Rzadko – to operacje na ekranie.
         // SL przesuwany za impulsem NIGDY po stronie straty: min. wejście + spread (w XTB = próg rentowności).
         val beStop = pos.entryPrice + dir * maxOf(spreadOf(inst), 0.05)
@@ -667,10 +668,10 @@ class BotOrchestrator(
                 try {
                     val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
                     val sh = q?.let { basis(inst, it) } ?: 0.0
-                    val res = AutoExecutionService.instance?.setProtection(inst, stopNow + sh, if (SL_ONLY) null else farTp + sh)
+                    val res = AutoExecutionService.instance?.setProtection(inst, stopNow + sh, if (BROKER_EXITS_ONLY) null else farTp + sh)
                     if (res is ExecutionResult.Submitted || res is ExecutionResult.Filled) {
                         t.brokerSl = stopNow
-                        msg(if (SL_ONLY) "🛡 $inst: w XTB SL → %.2f (za zyskiem)".format(stopNow + sh) else "🛡 $inst: w XTB SL → %.2f, TP → %.2f (za impulsem)".format(stopNow + sh, farTp + sh))
+                        msg(if (BROKER_EXITS_ONLY) "🛡 $inst: w XTB SL → %.2f (za zyskiem)".format(stopNow + sh) else "🛡 $inst: w XTB SL → %.2f, TP → %.2f (za impulsem)".format(stopNow + sh, farTp + sh))
                     } else if (res != null) msg("⚠️ $inst: nie przesunąłem SL/TP w XTB (${(res as? ExecutionResult.Rejected)?.reason ?: res}) – trailing pilnuje bot")
                 } finally { t.brokerBusy = false }
             }
@@ -943,7 +944,7 @@ class BotOrchestrator(
                 val now = System.currentTimeMillis()
                 for (sym in risk.openSymbols()) {
                     val left = MarketHours.status(sym, now).minutesToClose ?: continue
-                    if (SL_ONLY || left > SESSION_CLOSE_MIN) continue
+                    if (BROKER_EXITS_ONLY || left > SESSION_CLOSE_MIN) continue
                     val px = lastPx[sym]?.first ?: continue
                     val pos = risk.position(sym) ?: continue
                     risk.closingOrder(sym, pos.side.opposite(), px)?.let {
@@ -1167,8 +1168,58 @@ class BotOrchestrator(
             }
             return null
         }
-        // Tylko SL: bez Take Profit (w XTB suwak TP wyłączony) – pozycję zamyka wyłącznie Stop Loss.
-        return OrderRequest(symbol, side, qty, price, stop, reason, pointValue = pv, takeProfit = if (SL_ONLY) null else takeProfit, tier = tier, fixedSize = true)
+        // TP zamyka z zyskiem, SL ze stratą: TP = TP_R × odległość SL (SL 15–20 zł → TP ok. 22–30 zł).
+        val d = if (side == Side.BUY) 1 else -1
+        val tp = price + d * TP_R * abs(price - stop)
+        traderCheck(symbol, side, price, stop, tp)?.let { why ->
+            if (rtNotes.add("trader:$symbol:$why:${System.currentTimeMillis() / 60_000}")) msg("🎩 $symbol: $reason – odpuszczam: $why")
+            traderNote[symbol] = why
+            return null
+        }
+        traderNote.remove(symbol)
+        return OrderRequest(symbol, side, qty, price, stop, reason, pointValue = pv, takeProfit = if (BROKER_EXITS_ONLY) tp else takeProfit, tier = tier, fixedSize = true)
+    }
+
+    private val traderNote = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /**
+     * „Doświadczony trader” – filtr każdego wejścia (wszystkie strategie). Null = wolno wejść, inaczej powód.
+     *  1. Nie gra pod prąd silnego trendu 5m (EMA20 vs EMA50 > 0,5×ATR5).
+     *  2. Nie kupuje pod oporem / nie sprzedaje nad wsparciem: TP musi się zmieścić przed ekstremum ostatnich 60 świec 1m.
+     *  3. Nie goni: świeca 1m już > 2×ATR w stronę wejścia albo cena > 2,5×ATR od EMA20(1m).
+     *  4. Rynek ma sens: spread ≤ 25% ATR(1m), zmienność nie martwa (ATR ≥ 3× spread).
+     */
+    private fun traderCheck(symbol: String, side: Side, price: Double, stop: Double, tp: Double): String? {
+        val dir = if (side == Side.BUY) 1 else -1
+        val m1 = aggregators["$symbol@${Learner.M1}"]?.closed().orEmpty()
+        val m5 = aggregators["$symbol@${Learner.M5}"]?.closed().orEmpty()
+        val atr1 = Indicators.atr(m1.takeLast(60)) ?: return null // za mało danych – nie blokujemy
+        val spread = spreadOf(symbol)
+        if (spread > 0 && spread > 0.25 * atr1) return "spread %.2f to > 25%% ruchu świecy – za drogo".format(spread)
+        if (spread > 0 && atr1 < 3 * spread) return "rynek martwy (ATR %.2f < 3× spread)".format(atr1)
+        if (m5.size >= 60) {
+            val c5 = m5.map { it.close }
+            val e20 = Indicators.ema(c5, 20); val e50 = Indicators.ema(c5, 50); val atr5 = Indicators.atr(m5.takeLast(60))
+            if (e20 != null && e50 != null && atr5 != null && atr5 > 0) {
+                val trend = (e20 - e50) / atr5
+                if (trend * dir < -0.5) return "pod prąd trendu 5m (%s) – nie walczę z rynkiem".format(if (trend > 0) "wzrostowy" else "spadkowy")
+            }
+        }
+        val cur = aggregators["$symbol@${Learner.M1}"]?.current()
+        if (cur != null && (cur.close - cur.open) * dir > 2 * atr1) return "świeca już poszła %.1f×ATR – nie gonię".format(abs(cur.close - cur.open) / atr1)
+        Indicators.ema(m1.map { it.close }.takeLast(60), 20)?.let { e ->
+            if ((price - e) * dir > 2.5 * atr1) return "cena %.1f×ATR od średniej – za daleko, czekam na cofnięcie".format(abs(price - e) / atr1)
+        }
+        if (m1.size >= 30) {
+            val last = m1.takeLast(60)
+            val wall = if (dir > 0) last.maxOf { it.high } else last.minOf { it.low }
+            val room = (wall - price) * dir
+            val need = abs(tp - price)
+            // Tylko gdy ekstremum jest przed nami (nie wybicie) – TP musi zmieścić się choć w 60% drogi.
+            if (room > 0 && room < 0.6 * need) return "%s %.2f za blisko (miejsce %.2f, TP potrzebuje %.2f)".format(
+                if (dir > 0) "opór" else "wsparcie", wall, room, need)
+        }
+        return null
     }
 
     /** Symulacja spreadu XTB w handlu papierowym: kupno po ask, sprzedaż po bid. */
@@ -1409,7 +1460,8 @@ class BotOrchestrator(
         /** false = bot sam nie zamyka pozycji na minusie (stratę zamyka tylko SL 15–20 PLN / koniec sesji). */
         const val EARLY_LOSS_EXITS = false
         /** Pozycję zamyka WYŁĄCZNIE Stop Loss (przesuwany za zyskiem); bez TP, bez wyjść bota, bez zamykania na koniec sesji. */
-        const val SL_ONLY = true
+        const val BROKER_EXITS_ONLY = true       // zamyka wyłącznie XTB: TP (zysk) albo SL (strata)
+        const val TP_R = 1.5                     // TP = 1,5 × odległość SL
         const val BE_AT_PLN = 8.0                // od 8 zł zysku SL na wejście (+spread)…
         const val TRAIL_PLN = 10.0               // …i dalej 10 zł za najlepszą ceną
         const val BROKER_STEP_PLN = 2.0          // SL w XTB przesuwany o ≥ 2 zł…
