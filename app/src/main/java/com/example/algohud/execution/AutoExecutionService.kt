@@ -510,11 +510,11 @@ class AutoExecutionService : AccessibilityService() {
      */
     private fun maybeAcceptRemoteRequest() {
         val ui = getSharedPreferences("ui", MODE_PRIVATE)
-        if (!ui.getBoolean("auto_anydesk_accept", false)) return
+        val enabled = ui.getBoolean("auto_anydesk_accept", false)
         val now = SystemClock.uptimeMillis()
         if (now - lastRemoteAttempt < 700) return
         lastRemoteAttempt = now
-        val allowed = (ui.getString("anydesk_allow", "") ?: "").split(',', ';', '\n').map { it.trim() }.filter { it.isNotEmpty() }
+        val allowed = allowedRemote()
         val roots = runCatching {
             windows.mapNotNull { it.root }.filter { r ->
                 val p = r.packageName?.toString() ?: ""
@@ -527,34 +527,92 @@ class AutoExecutionService : AccessibilityService() {
             val fromSystemUi = root.packageName?.toString() == "com.android.systemui"
             if (fromSystemUi && texts.none { it.contains("AnyDesk", ignoreCase = true) }) continue
             if (texts.none { t -> REMOTE_HINTS.any { t.contains(it, ignoreCase = true) } }) continue
-            val accept = nodes.firstOrNull { (_, t) -> REMOTE_ACCEPT.any { t.equals(it, ignoreCase = true) } }?.first ?: continue
-            lastRemoteDump = ScreenScanner.dump(root)
-            val trusted = allowed.any { a ->
-                val digits = a.filter(Char::isDigit)
-                texts.any { t ->
-                    (digits.length >= 6 && t.filter(Char::isDigit).contains(digits)) ||
-                        (digits.length < 6 && t.contains(a, ignoreCase = true))
-                }
+            val accept = nodes.firstOrNull { (_, t) -> isAcceptLabel(t) }?.first
+            if (accept == null) {
+                // Samo powiadomienie (bez przycisku) – otwórz je, żeby AnyDesk pokazał okno z „Akceptuj”.
+                if (fromSystemUi && enabled) {
+                    val note = nodes.firstOrNull { (_, t) -> t.contains("AnyDesk", ignoreCase = true) }?.first
+                    var n: AccessibilityNodeInfo? = note
+                    while (n != null && !n.isClickable) n = n.parent
+                    if (n?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true) remoteNote("📡 AnyDesk: otwieram powiadomienie o połączeniu…")
+                } else remoteNote("📡 AnyDesk: widzę okno połączenia, ale nie znalazłem przycisku akceptacji – skopiuj diagnostykę w aplikacji")
+                lastRemoteDump = ScreenScanner.dump(root)
+                continue
             }
-            if (!trusted) {
-                if (now - lastRemoteWarn > 60_000) {
-                    lastRemoteWarn = now
-                    lastRemoteNote = "Odrzucam auto-akceptację: prośba AnyDesk od spoza listy zaufanych (" +
-                        texts.firstOrNull { it.count(Char::isDigit) >= 9 }?.take(40).orEmpty() + ")"
-                    Log.w(TAG, lastRemoteNote!!)
-                }
+            lastRemoteDump = ScreenScanner.dump(root)
+            val caller = callerText(texts)
+            if (!enabled) { remoteNote("ℹ️ AnyDesk: prośba o połączenie ($caller), ale auto-akceptacja jest wyłączona"); return }
+            if (!isTrusted(allowed, texts)) {
+                remoteNote("⛔ AnyDesk: prośba od «$caller» – nie ma na liście zaufanych (${allowed.joinToString().ifEmpty { "lista pusta" }}). Nie wpuszczam.")
                 return
             }
             var n: AccessibilityNodeInfo? = accept
             while (n != null && !n.isClickable) n = n.parent
             if ((n ?: accept).performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
                 remoteSessionUntil = System.currentTimeMillis() + 30 * 60_000 // tarcza dotyku nie blokuje sterowania
-                lastRemoteNote = "Zaakceptowano połączenie AnyDesk (zaufany)"
-                Log.i(TAG, lastRemoteNote!!)
-            }
+                remoteNote("✅ AnyDesk: zaakceptowano połączenie od «$caller»", force = true)
+            } else remoteNote("⚠️ AnyDesk: kliknięcie „Akceptuj” nie zadziałało – skopiuj diagnostykę w aplikacji")
             return
         }
     }
+
+    /** Powiadomienie AnyDesk: akcja „Akceptuj” wprost z powiadomienia albo otwarcie okna prośby. */
+    private fun handleAnydeskNotification(event: AccessibilityEvent) {
+        val ui = getSharedPreferences("ui", MODE_PRIVATE)
+        val notif = event.parcelableData as? android.app.Notification ?: return
+        val ex = notif.extras
+        val texts = listOfNotNull(
+            ex?.getCharSequence(android.app.Notification.EXTRA_TITLE), ex?.getCharSequence(android.app.Notification.EXTRA_TEXT),
+            ex?.getCharSequence(android.app.Notification.EXTRA_BIG_TEXT), notif.tickerText
+        ).map { it.toString() } + event.text.map { it.toString() }
+        val actions = notif.actions.orEmpty()
+        lastRemoteDump = "# powiadomienie AnyDesk\n" + texts.joinToString("\n") + "\n# akcje: " + actions.joinToString { it.title?.toString() ?: "?" }
+        if (texts.none { t -> REMOTE_HINTS.any { t.contains(it, ignoreCase = true) } } && actions.none { isAcceptLabel(it.title?.toString() ?: "") }) return
+        val caller = callerText(texts)
+        if (!ui.getBoolean("auto_anydesk_accept", false)) { remoteNote("ℹ️ AnyDesk: powiadomienie o połączeniu ($caller), auto-akceptacja wyłączona"); return }
+        val action = actions.firstOrNull { isAcceptLabel(it.title?.toString() ?: "") }
+        if (action != null) {
+            // W powiadomieniu nie zawsze widać ID – wtedy otwieramy okno i tam sprawdzamy listę zaufanych.
+            if (isTrusted(allowedRemote(), texts)) {
+                runCatching { action.actionIntent.send() }.onSuccess {
+                    remoteSessionUntil = System.currentTimeMillis() + 30 * 60_000
+                    remoteNote("✅ AnyDesk: zaakceptowano z powiadomienia («$caller»)", force = true)
+                    return
+                }
+            }
+        }
+        runCatching { notif.contentIntent?.send() }.onSuccess { remoteNote("📡 AnyDesk: otwieram okno prośby o połączenie…") }
+    }
+
+    private fun allowedRemote(): List<String> =
+        (getSharedPreferences("ui", MODE_PRIVATE).getString("anydesk_allow", "") ?: "")
+            .split(',', ';', '\n').map { it.trim() }.filter { it.isNotEmpty() }
+
+    private fun isAcceptLabel(t: String): Boolean {
+        val s = t.trim()
+        return s.length <= 30 && REMOTE_ACCEPT.any { s.startsWith(it, ignoreCase = true) }
+    }
+
+    private fun isTrusted(allowed: List<String>, texts: List<String>): Boolean = allowed.any { a ->
+        val digits = a.filter(Char::isDigit)
+        texts.any { t ->
+            (digits.length >= 6 && t.filter(Char::isDigit).contains(digits)) ||
+                (a.length >= 3 && t.contains(a, ignoreCase = true))
+        }
+    }
+
+    private fun callerText(texts: List<String>): String =
+        (texts.firstOrNull { it.count(Char::isDigit) >= 9 } ?: texts.firstOrNull { '@' in it } ?: texts.take(3).joinToString(" | ")).take(60)
+
+    private fun remoteNote(text: String, force: Boolean = false) {
+        lastRemoteNote = text
+        val now = SystemClock.uptimeMillis()
+        if (!force && text == lastRemoteSent && now - lastRemoteWarn < 30_000) return
+        lastRemoteSent = text; lastRemoteWarn = now
+        Log.i(TAG, text)
+        _uiEvents.tryEmit(text)
+    }
+    private var lastRemoteSent: String? = null
     private var lastRemoteAttempt = 0L
     private var lastRemoteWarn = 0L
 
@@ -586,7 +644,10 @@ class AutoExecutionService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val pkg = event?.packageName?.toString() ?: return
-        if (pkg.startsWith("com.anydesk")) { maybeAcceptRemoteRequest(); return }
+        if (pkg.startsWith("com.anydesk")) {
+            if (event.eventType == AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) handleAnydeskNotification(event)
+            maybeAcceptRemoteRequest(); return
+        }
         if (pkg == "com.android.systemui" || pkg == "android") { maybeAcceptCapture(pkg); maybeAcceptRemoteRequest(); return }
         targetLabel(pkg) ?: return // inne aplikacje odrzucamy od razu – nic z nich nie czytamy
         lastTargetEventAt = SystemClock.uptimeMillis()
