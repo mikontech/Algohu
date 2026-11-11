@@ -1,0 +1,82 @@
+name: Apply and verify ticket readiness
+
+on:
+  push:
+    branches: [feature/research-lab]
+    paths:
+      - scripts/apply-ticket-readiness.py
+      - scripts/ticket-readiness/**
+      - .github/workflows/apply-ticket-readiness.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ticket-readiness-integration
+  cancel-in-progress: false
+
+jobs:
+  apply-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/research-lab
+          fetch-depth: 0
+      - name: Check triggering revision
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Apply guarded integration
+        run: python3 scripts/apply-ticket-readiness.py
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Verify tests lint and build before source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --stacktrace --console=plain 2>&1 | tee ticket-readiness-verification.log
+      - name: Commit verified source integration
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote origin refs/heads/feature/research-lab | cut -f1)" = "$EXPECTED_SHA"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/src/main/java/com/example/algohud/execution/AutoExecutionService.kt app/src/main/java/com/example/algohud/execution/TicketReadiness.kt app/src/main/java/com/example/algohud/execution/XtbTicketReader.kt app/src/main/java/com/example/algohud/execution/UiActionRecovery.kt app/src/test/java/com/example/algohud/execution/UiActionRecoveryTest.kt app/src/test/java/com/example/algohud/execution/TicketReadinessTest.kt
+          git commit -m 'Integrate bounded fresh price reads and verified ticket reset gate'
+          git push origin HEAD:feature/research-lab
+      - name: Build APK with integrated source revision
+        id: final-build
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GITHUB_SHA="$(git rev-parse HEAD)"
+          ./gradlew :app:assembleDebug --stacktrace --console=plain 2>&1 | tee ticket-readiness-build.log
+          echo "Integrated source: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload verification reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ticket-readiness-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            ticket-readiness-*.log
+            app/build/reports/
+            app/build/test-results/
+      - name: Upload verified debug APK
+        if: success() && steps.final-build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ticket-readiness-debug-apk-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: error
+          path: app/build/outputs/apk/debug/*.apk
