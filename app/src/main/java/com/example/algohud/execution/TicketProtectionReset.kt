@@ -4,7 +4,7 @@ import android.os.Bundle
 import android.view.accessibility.AccessibilityNodeInfo
 import kotlinx.coroutines.delay
 
-/** Only a recognized new-order ticket may be changed. No position modifications. */
+/** Only after a fresh compatible screen and never a position editor. */
 object TicketProtectionReset {
     data class Context(
         val expectedInstrument: String,
@@ -12,12 +12,14 @@ object TicketProtectionReset {
         val hasVolume: Boolean,
         val hasBuy: Boolean,
         val hasSell: Boolean,
-        val hasModifyPosition: Boolean
+        val hasModifyPosition: Boolean,
+        val protectionCount: Int = 0
     )
 
     fun canReset(c: Context): Boolean = c.expectedInstrument.isNotBlank() &&
         c.title?.trim()?.split(Regex("\\s+"))?.firstOrNull() == c.expectedInstrument &&
-        c.hasVolume && c.hasBuy && c.hasSell && !c.hasModifyPosition
+        c.hasVolume && !c.hasModifyPosition &&
+        (c.hasBuy && c.hasSell || c.protectionCount == 2)
 
     private fun nodes(root: AccessibilityNodeInfo): List<AccessibilityNodeInfo> {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
@@ -37,11 +39,13 @@ object TicketProtectionReset {
         fun found(id: String) = ScreenScanner.findById(root, id, visibleOnly = false)
         val titles = found("ElementTitleHorizontalText")
         check(titles.size == 1) { "Niejednoznaczny tytuł ekranu" }
+        val protectionSections = found("StopLossContainer").size + found("TakeProfitContainer").size
         check(canReset(Context(instrument, titles.single().text?.toString(),
             found("StepperTextField").size == 1,
             found("TradingBuyButton").size == 1,
             found("TradingSellButton").size == 1,
-            found("ModifyPositionButton").isNotEmpty()))) {
+            found("ModifyPositionButton").isNotEmpty(),
+            protectionCount = protectionSections))) {
             "To nie jest jednoznacznie rozpoznany bilet nowego zlecenia"
         }
     }
