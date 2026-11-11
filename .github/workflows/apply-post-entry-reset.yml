@@ -1,0 +1,75 @@
+name: Apply and verify post-entry ticket protection reset
+
+on:
+  push:
+    branches: [feature/research-lab]
+    paths:
+      - scripts/apply-post-entry-reset.py
+      - scripts/post-entry-reset/**
+      - .github/workflows/apply-post-entry-reset.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: post-entry-ticket-reset
+  cancel-in-progress: false
+
+jobs:
+  apply-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/research-lab
+          fetch-depth: 0
+      - name: Apply controlled post-entry reset change
+        run: python3 scripts/apply-post-entry-reset.py
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Verify tests lint and build before source commit
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug --stacktrace --console=plain 2>&1 | tee post-entry-reset-verification.log
+      - name: Commit verified source change
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote origin refs/heads/feature/research-lab | cut -f1)" = "$EXPECTED_SHA"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/src/main/java/com/example/algohud/execution/TicketProtectionReset.kt app/src/test/java/com/example/algohud/execution/TicketProtectionResetTest.kt
+          git commit -m 'Allow post-entry ticket reset while keeping position editor excluded'
+          git push origin HEAD:feature/research-lab
+      - name: Build APK with integrated source revision
+        id: final-build
+        run: |
+          set -euo pipefail
+          export GITHUB_SHA="$(git rev-parse HEAD)"
+          ./gradlew :app:assembleDebug --stacktrace --console=plain 2>&1 | tee post-entry-reset-build.log
+      - name: Upload verification reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-entry-reset-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            post-entry-reset-*.log
+            app/build/reports/
+            app/build/test-results/
+      - name: Upload verified debug APK
+        if: success() && steps.final-build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-entry-reset-debug-apk-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: error
+          path: app/build/outputs/apk/debug/*.apk
