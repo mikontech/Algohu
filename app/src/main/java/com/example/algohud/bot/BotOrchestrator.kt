@@ -645,7 +645,7 @@ class BotOrchestrator(
                     val res = AutoExecutionService.instance?.setProtection(inst, stopNow + sh, if (SL_ONLY) null else farTp + sh)
                     if (res is ExecutionResult.Submitted || res is ExecutionResult.Filled) {
                         t.brokerSl = stopNow
-                        msg("🛡 $inst: w XTB SL → %.2f, TP → %.2f (za impulsem)".format(stopNow + sh, farTp + sh))
+                        msg(if (SL_ONLY) "🛡 $inst: w XTB SL → %.2f (za zyskiem)".format(stopNow + sh) else "🛡 $inst: w XTB SL → %.2f, TP → %.2f (za impulsem)".format(stopNow + sh, farTp + sh))
                     } else if (res != null) msg("⚠️ $inst: nie przesunąłem SL/TP w XTB (${(res as? ExecutionResult.Rejected)?.reason ?: res}) – trailing pilnuje bot")
                 } finally { t.brokerBusy = false }
             }
