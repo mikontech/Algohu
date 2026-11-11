@@ -423,6 +423,14 @@ class AutoExecutionService : AccessibilityService() {
         @Volatile var lastCaptureDump: String? = null
         /** Do kiedy uznajemy, że trwa sesja zdalna (tarcza dotyku jest wtedy wstrzymana). */
         @Volatile var remoteSessionUntil: Long = 0L
+        /** Diagnostyka okna prośby o połączenie AnyDesk + ostatni komunikat (akceptacja / odmowa). */
+        @Volatile var lastRemoteDump: String? = null
+        @Volatile var lastRemoteNote: String? = null
+        private val REMOTE_HINTS = listOf(
+            "połącz", "polacz", "połączeni", "żądanie", "zadanie", "przychodz", "sesj", "dostęp",
+            "connect", "request", "incoming", "session", "access", "wants to"
+        )
+        private val REMOTE_ACCEPT = listOf("Akceptuj", "Zaakceptuj", "Przyjmij", "Zezwól", "Zezwalaj", "Accept", "Allow")
         private val CAPTURE_HINTS = listOf("nagrywa", "przesyła", "udostępni", "record", "cast", "share")
         private val CAPTURE_SINGLE = listOf("jedna aplikacj", "jedną aplikacj", "pojedyncz", "single app", "one app")
         private val CAPTURE_ENTIRE = listOf("cały ekran", "caly ekran", "entire screen")
@@ -496,6 +504,60 @@ class AutoExecutionService : AccessibilityService() {
         }
     }
 
+    /**
+     * Prośba o połączenie AnyDesk (okno aplikacji AnyDesk albo powiadomienie): akceptuje TYLKO, gdy w oknie
+     * widać ID lub alias z listy zaufanych. Obcy ID → nic nie klika, tylko zapisuje diagnostykę i ostrzega.
+     */
+    private fun maybeAcceptRemoteRequest() {
+        val ui = getSharedPreferences("ui", MODE_PRIVATE)
+        if (!ui.getBoolean("auto_anydesk_accept", false)) return
+        val now = SystemClock.uptimeMillis()
+        if (now - lastRemoteAttempt < 700) return
+        lastRemoteAttempt = now
+        val allowed = (ui.getString("anydesk_allow", "") ?: "").split(',', ';', '\n').map { it.trim() }.filter { it.isNotEmpty() }
+        val roots = runCatching {
+            windows.mapNotNull { it.root }.filter { r ->
+                val p = r.packageName?.toString() ?: ""
+                p.startsWith("com.anydesk") || p == "com.android.systemui"
+            }
+        }.getOrDefault(emptyList())
+        for (root in roots) {
+            val nodes = textNodes(root)
+            val texts = nodes.map { it.second }
+            val fromSystemUi = root.packageName?.toString() == "com.android.systemui"
+            if (fromSystemUi && texts.none { it.contains("AnyDesk", ignoreCase = true) }) continue
+            if (texts.none { t -> REMOTE_HINTS.any { t.contains(it, ignoreCase = true) } }) continue
+            val accept = nodes.firstOrNull { (_, t) -> REMOTE_ACCEPT.any { t.equals(it, ignoreCase = true) } }?.first ?: continue
+            lastRemoteDump = ScreenScanner.dump(root)
+            val trusted = allowed.any { a ->
+                val digits = a.filter(Char::isDigit)
+                texts.any { t ->
+                    (digits.length >= 6 && t.filter(Char::isDigit).contains(digits)) ||
+                        (digits.length < 6 && t.contains(a, ignoreCase = true))
+                }
+            }
+            if (!trusted) {
+                if (now - lastRemoteWarn > 60_000) {
+                    lastRemoteWarn = now
+                    lastRemoteNote = "Odrzucam auto-akceptację: prośba AnyDesk od spoza listy zaufanych (" +
+                        texts.firstOrNull { it.count(Char::isDigit) >= 9 }?.take(40).orEmpty() + ")"
+                    Log.w(TAG, lastRemoteNote!!)
+                }
+                return
+            }
+            var n: AccessibilityNodeInfo? = accept
+            while (n != null && !n.isClickable) n = n.parent
+            if ((n ?: accept).performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                remoteSessionUntil = System.currentTimeMillis() + 30 * 60_000 // tarcza dotyku nie blokuje sterowania
+                lastRemoteNote = "Zaakceptowano połączenie AnyDesk (zaufany)"
+                Log.i(TAG, lastRemoteNote!!)
+            }
+            return
+        }
+    }
+    private var lastRemoteAttempt = 0L
+    private var lastRemoteWarn = 0L
+
     private fun textNodes(root: AccessibilityNodeInfo, limit: Int = 400): List<Pair<AccessibilityNodeInfo, String>> {
         val out = ArrayList<Pair<AccessibilityNodeInfo, String>>()
         val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
@@ -524,7 +586,8 @@ class AutoExecutionService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         val pkg = event?.packageName?.toString() ?: return
-        if (pkg == "com.android.systemui" || pkg == "android") { maybeAcceptCapture(pkg); return }
+        if (pkg.startsWith("com.anydesk")) { maybeAcceptRemoteRequest(); return }
+        if (pkg == "com.android.systemui" || pkg == "android") { maybeAcceptCapture(pkg); maybeAcceptRemoteRequest(); return }
         targetLabel(pkg) ?: return // inne aplikacje odrzucamy od razu – nic z nich nie czytamy
         lastTargetEventAt = SystemClock.uptimeMillis()
         scanNow()
@@ -579,6 +642,7 @@ class AutoExecutionService : AccessibilityService() {
                 val ok = runCatching { scanNow() }.getOrDefault(false)
                 if (ok) { misses = 0; _peek.value = false } else if (++misses >= 3) { _peek.value = true; misses = 0 }
                 runCatching { selfHeal() }
+                runCatching { maybeAcceptRemoteRequest() }
                 runCatching { keepXtbFront() }
                 delay(1_000)
             }

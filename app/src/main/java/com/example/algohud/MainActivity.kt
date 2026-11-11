@@ -94,6 +94,37 @@ class MainActivity : ComponentActivity() {
             ui().edit().putBoolean("auto_capture", false).apply()
             Toast.makeText(this, "Wyłączone", Toast.LENGTH_SHORT).show()
         }
+        TextView(this).apply {
+            text = "\nAkceptacja prośby o połączenie – tylko od zaufanych ID AnyDesk (np. ID Twojego głównego telefonu). " +
+                "Obcy ID nie zostanie wpuszczony."
+        }.also { layout.addView(it) }
+        val allowEdit = android.widget.EditText(this).apply {
+            hint = "Zaufane ID AnyDesk (np. 123 456 789), oddziel przecinkiem"
+            setText(ui().getString("anydesk_allow", ""))
+        }.also { layout.addView(it) }
+        button("AnyDesk: zapisz zaufane ID i WŁĄCZ auto-akceptację połączeń") {
+            val ids = allowEdit.text.toString().trim()
+            if (ids.split(',').none { it.filter(Char::isDigit).length >= 9 || it.trim().length >= 3 }) {
+                Toast.makeText(this, "Wpisz co najmniej jedno ID AnyDesk (9–10 cyfr) lub alias", Toast.LENGTH_LONG).show()
+            } else {
+                ui().edit().putString("anydesk_allow", ids).putBoolean("auto_anydesk_accept", true).apply()
+                Toast.makeText(this, "Włączone – akceptuję tylko: $ids", Toast.LENGTH_LONG).show()
+            }
+        }
+        button("AnyDesk: auto-akceptacja połączeń – wyłącz") {
+            ui().edit().putBoolean("auto_anydesk_accept", false).apply()
+            Toast.makeText(this, "Wyłączone", Toast.LENGTH_SHORT).show()
+        }
+        button("Skopiuj diagnostykę okna połączenia AnyDesk") {
+            val d = AutoExecutionService.lastRemoteDump
+            if (d == null) Toast.makeText(this, "Brak – połącz się raz z głównego telefonu", Toast.LENGTH_LONG).show()
+            else {
+                getSystemService(android.content.ClipboardManager::class.java)
+                    .setPrimaryClip(android.content.ClipData.newPlainText("anydesk request",
+                        (AutoExecutionService.lastRemoteNote ?: "") + "\n" + d))
+                Toast.makeText(this, "Skopiowano – wklej w czacie", Toast.LENGTH_SHORT).show()
+            }
+        }
         button("Skopiuj diagnostykę okna nagrywania") {
             val d = AutoExecutionService.lastCaptureDump
             if (d == null) Toast.makeText(this, "Brak – najpierw włącz auto-akceptację i połącz się przez AnyDesk", Toast.LENGTH_LONG).show()
