@@ -1201,7 +1201,7 @@ class BotOrchestrator(
 
     // ───────────── 🏦 SMC: sweep płynności → CHoCH → wejście, SL za ekstremum, TP na przeciwnej płynności ─────────────
 
-    private val smc = SmcEngine()
+    private val smc = SmcEngine(allSessions = TRADE_ALL_SESSIONS)
     private val smcResult = java.util.concurrent.ConcurrentHashMap<String, SmcEngine.Result>()
     private val smcNote = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val smcTaken = java.util.Collections.synchronizedSet(LinkedHashSet<String>())
@@ -1261,7 +1261,7 @@ class BotOrchestrator(
         val m5 = aggregators["$symbol@${Learner.M5}"]?.closed().orEmpty()
         val now = System.currentTimeMillis()
         smc.newsBlackout(now)?.let { return it }
-        smc.session(now).let { if (!it.tradable) return "${it.label} – handluję tylko w killzone (Londyn 09–12, NY 14:30–17)" }
+        if (!TRADE_ALL_SESSIONS) smc.session(now).let { if (!it.tradable) return "${it.label} – handluję tylko w killzone (Londyn 09–12, NY 14:30–17)" }
         val atr1 = Indicators.atr(m1.takeLast(60)) ?: return null // za mało danych – nie blokujemy
         val spread = spreadOf(symbol)
         if (spread > 0 && spread > 0.25 * atr1) return "spread %.2f to > 25%% ruchu świecy – za drogo".format(spread)
@@ -1516,7 +1516,7 @@ class BotOrchestrator(
         const val AI_EARLY_STEP_MS = 5_000L      // …co 5 s
         const val AI_EARLY_MIN_PROB = 0.60       // wcześniejsze wejście wymaga większej pewności
         const val EARLY_EXIT_BODY_ATR = 0.30     // wcześniejsze wyjście: 2 świece przeciw, korpus ≥ 0,3×ATR
-        const val ALL_LABEL = "🏦 SMC XAU + RT/ORB + ZAKRES + TURNIEJ (filtr killzone, R:R ≥ 1:2,5)"
+        const val ALL_LABEL = "🏦 SMC XAU + RT/ORB + ZAKRES + TURNIEJ (całą dobę, R:R ≥ 1:2,5)"
         const val AI_MIN_GRADED = 20             // min. ocenionych prognoz na żywo
         const val AI_MIN_ACC = 0.55              // min. trafność z ostatnich 20
         const val AI_MIN_PROB = 0.58             // min. szansa kierunku
@@ -1532,7 +1532,8 @@ class BotOrchestrator(
         const val BROKER_EXITS_ONLY = true       // zamyka wyłącznie XTB: TP (zysk) albo SL (strata)
         const val TP_R = 2.5                     // TP = 2,5 × odległość SL (min. R:R 1:2,5)
         const val AI_PREDICTOR_ENTRIES = false   // model świec tylko jako informacja – wejścia daje SMC
-        const val SMC_MAX_PER_SESSION = 2        // bez overtradingu: maks. 2 wejścia SMC na killzone
+        const val SMC_MAX_PER_SESSION = 2        // bez overtradingu: maks. 2 wejścia SMC na sesję
+        const val TRADE_ALL_SESSIONS = true      // handel cały czas (Azja, Londyn, NY); blackout tylko wokół danych USA
         const val BE_AT_PLN = 8.0                // od 8 zł zysku SL na wejście (+spread)…
         const val TRAIL_PLN = 10.0               // …i dalej 10 zł za najlepszą ceną
         const val BROKER_STEP_PLN = 2.0          // SL w XTB przesuwany o ≥ 2 zł…

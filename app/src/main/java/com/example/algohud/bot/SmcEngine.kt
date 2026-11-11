@@ -18,7 +18,11 @@ import kotlin.math.min
  *  • kontekst: struktura H1 (z M5) – przeciw trendowi H1 tylko po sweepie PDH/PDL.
  * Makro (DXY, US10Y, kalendarz) – brak feedu w aplikacji; zamiast kalendarza stałe okna publikacji danych USA.
  */
-class SmcEngine(private val zone: ZoneId = ZoneId.of("Europe/Warsaw")) {
+class SmcEngine(
+    private val zone: ZoneId = ZoneId.of("Europe/Warsaw"),
+    /** true = handel przez całą dobę (killzone'y tylko w opisie); false = tylko Londyn/NY killzone. */
+    private val allSessions: Boolean = false
+) {
 
     enum class Session(val label: String, val tradable: Boolean) {
         ASIA("AZJA – buduje płynność", false),
@@ -177,7 +181,7 @@ class SmcEngine(private val zone: ZoneId = ZoneId.of("Europe/Warsaw")) {
         val lv = levels(m5, m1, now)
         val scen = scenarios(lv, price, bias, shift)
         newsBlackout(now)?.let { return Result(session, bias, lv, null, it, scen) }
-        if (!session.tradable) return Result(session, bias, lv, null, "${session.label} – poza killzone nie handluję, czekam na Londyn 09:00 / NY 14:30", scen)
+        if (!allSessions && !session.tradable) return Result(session, bias, lv, null, "${session.label} – poza killzone nie handluję, czekam na Londyn 09:00 / NY 14:30", scen)
         if (spread > 0.25 * atr) return Result(session, bias, lv, null, "spread %.2f > 25%% ATR – rynek za drogi".format(spread), scen)
 
         val tol = 0.05 * atr
