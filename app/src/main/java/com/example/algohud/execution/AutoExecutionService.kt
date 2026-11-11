@@ -811,6 +811,7 @@ class AutoExecutionService : AccessibilityService() {
     /** Włącza (jeśli trzeba) sekcję SL/TP, wpisuje cenę i sprawdza, czy XTB ją przyjęło. null = OK. */
     private suspend fun setPriceIn(containerId: String, toggleId: String, price: Double): String? {
         revealById(containerId) ?: return "nie znaleziono sekcji"
+        centerOn(toggleId)
         var field = revealField(containerId)
         if (field == null && readEnabled(containerId, toggleId)) return "suwak włączony, ale pole ceny niewidoczne"
         if (field == null) {
@@ -895,28 +896,63 @@ class AutoExecutionService : AccessibilityService() {
     /**
      * Doprowadza na ekran kontener RAZEM z jego polem StepperTextField.
      * revealById zwraca kontener, gdy wystaje choćby krawędzią – pole w środku bywa wtedy
-     * jeszcze niewidoczne i fieldIn() daje null. Tu dociągamy, aż pole faktycznie jest dostępne.
+     * niewidoczne (albo pod przyklejonym nagłówkiem XTB). centerOn dociąga go na środek ekranu.
      */
     private suspend fun revealField(containerId: String): AccessibilityNodeInfo? {
-        fieldIn(containerId)?.let { return it }
-        revealById(containerId) ?: return null
-        fieldIn(containerId)?.let { return it }
-        val c = Rect(); val sc = Rect()
-        repeat(4) {
-            val root = appRoot() ?: return null
-            val node = ScreenScanner.findById(root, containerId, visibleOnly = false).firstOrNull() ?: return null
-            val scroller = findScrollable(root)
-            if (!node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id) && scroller != null) {
-                node.getBoundsInScreen(c); scroller.getBoundsInScreen(sc)
-                // przycięty od góry → w górę, w przeciwnym razie w dół
-                val up = c.top <= sc.top + 4
-                scroller.performAction(if (up) AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD else AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
-            }
-            delay(400)
-            fieldIn(containerId)?.let { return it }
-            revealById(containerId) ?: return null
-        }
+        centerOn(containerId) ?: return null
         return fieldIn(containerId)
+    }
+
+    /**
+     * revealById + dociągnięcie elementu do „bezpiecznego pasa” ekranu: poniżej przyklejonego
+     * nagłówka (tytuł/cena XTB) i HUD-a, powyżej dolnej krawędzi. Przewija krótkim, wolnym
+     * przeciągnięciem o wyliczoną odległość – SCROLL_FORWARD/BACKWARD skacze o cały ekran
+     * i potrafi przeskoczyć element. Zwraca węzeł (świeży) albo null, gdy go nie ma.
+     */
+    private suspend fun centerOn(id: String): AccessibilityNodeInfo? {
+        revealById(id) ?: return null
+        val n = Rect(); val sc = Rect()
+        repeat(5) {
+            val root = appRoot() ?: return null
+            val node = ScreenScanner.findById(root, id).firstOrNull() ?: return revealById(id)
+            val scroller = findScrollable(root) ?: return node
+            node.getBoundsInScreen(n); scroller.getBoundsInScreen(sc)
+            val h = sc.height().toFloat()
+            if (h <= 0f) return node
+            val bandTop = sc.top + h * 0.30f
+            val bandBottom = sc.bottom - h * 0.15f
+            if (n.top >= bandTop && n.bottom <= bandBottom) return node          // cały w pasie
+            if (n.height() > bandBottom - bandTop && n.top >= bandTop) return node // wyższy niż pas – góra widoczna
+            // Przesunięcie treści: środek elementu → środek pasa (dodatnie = treść w górę).
+            val delta = (n.exactCenterY() - (bandTop + bandBottom) / 2f).coerceIn(-h * 0.5f, h * 0.5f)
+            if (kotlin.math.abs(delta) < 8f) return node
+            val x = sc.exactCenterX() // środek: krawędź ekranu = systemowy gest „Wstecz”
+            val y0 = if (delta > 0) sc.bottom - h * 0.12f else sc.top + h * 0.35f
+            if (!drag(x, y0, y0 - delta)) return node
+            delay(450)
+        }
+        return appRoot()?.let { ScreenScanner.findById(it, id).firstOrNull() }
+    }
+
+    /** Wolne pionowe przeciągnięcie (bez „flinga”), HUD schowany na czas gestu. */
+    private suspend fun drag(x: Float, fromY: Float, toY: Float): Boolean {
+        _gestureActive.value = true
+        try {
+            delay(80)
+            return suspendCancellableCoroutine { cont ->
+                val path = Path().apply { moveTo(x, fromY); lineTo(x, toY) }
+                val gesture = GestureDescription.Builder()
+                    .addStroke(GestureDescription.StrokeDescription(path, 0, 700))
+                    .build()
+                val accepted = dispatchGesture(gesture, object : GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) { if (cont.isActive) cont.resume(true) }
+                    override fun onCancelled(gestureDescription: GestureDescription?) { if (cont.isActive) cont.resume(false) }
+                }, null)
+                if (!accepted && cont.isActive) cont.resume(false)
+            }
+        } finally {
+            _gestureActive.value = false
+        }
     }
 
     // ───────────── Samonaprawa i weryfikacja stanu w XTB ─────────────
@@ -934,7 +970,9 @@ class AutoExecutionService : AccessibilityService() {
             val titleVisible = ScreenScanner.findById(root, "ElementTitleHorizontalText").isNotEmpty()
             val buyVisible = ScreenScanner.findById(root, "TradingBuyButton").isNotEmpty()
             if (titleVisible && buyVisible) return
-            if (ScreenScanner.findById(root, "TradingBuyButton", visibleOnly = false).isEmpty()) return // to nie bilet
+            val isTicket = listOf("TradingBuyButton", "MarketSizeInput", "StopLossContainer", "TakeProfitContainer", "PositionRow0")
+                .any { ScreenScanner.findById(root, it, visibleOnly = false).isNotEmpty() }
+            if (!isTicket) return // to nie bilet
             val scroller = findScrollable(root) ?: return
             scroller.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)
             delay(350)
@@ -1188,9 +1226,11 @@ class AutoExecutionService : AccessibilityService() {
     /** Aktualny stan suwaków SL/TP w bilecie (przewija do sekcji). null = nie udało się odczytać. */
     private suspend fun readTicketSlTp(): TicketSlTpState? {
         revealById("StopLossContainer") ?: return null
+        centerOn("StopLossToggle") ?: return null
         val slOn = readEnabled("StopLossContainer", "StopLossToggle")
         val slVal = (if (slOn) revealField("StopLossContainer") else null)?.text?.toString()
         revealById("TakeProfitContainer") ?: return null
+        centerOn("TakeProfitToggle") ?: return null
         val tpOn = readEnabled("TakeProfitContainer", "TakeProfitToggle")
         val tpVal = (if (tpOn) revealField("TakeProfitContainer") else null)?.text?.toString()
         return TicketSlTpState(slOn, slVal, tpOn, tpVal)
@@ -1262,6 +1302,7 @@ class AutoExecutionService : AccessibilityService() {
     /** Ustawia przełącznik (i ewentualnie wartość) w bilecie. Dotyczy WYŁĄCZNIE formularza, nie pozycji. */
     private suspend fun applyFormToggle(containerId: String, toggleId: String, on: Boolean, value: String?): String? {
         revealById(containerId) ?: return "nie znaleziono sekcji"
+        centerOn(toggleId) ?: return "nie znaleziono wiersza przełącznika"
         if (readEnabled(containerId, toggleId) != on) {
             val sw = switchIn(toggleId) ?: return "nie znaleziono przełącznika"
             if (!click(sw)) return "nie udało się przełączyć"
@@ -1269,7 +1310,7 @@ class AutoExecutionService : AccessibilityService() {
             if (readEnabled(containerId, toggleId) != on) return "przełącznik nie zmienił stanu"
         }
         if (on && value != null) {
-            val f = fieldIn(containerId) ?: return "brak pola ceny"
+            val f = revealField(containerId) ?: return "brak pola ceny"
             if (f.text?.toString() != value) {
                 val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value) }
                 if (!f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return "nie udało się wpisać wartości"
