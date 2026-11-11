@@ -1,0 +1,79 @@
+name: Apply and verify ticket SL TP reset
+
+on:
+  push:
+    branches: [feature/research-lab]
+    paths:
+      - scripts/apply-ticket-reset-fix.py
+      - app/src/main/java/com/example/algohud/execution/TicketProtectionReset.kt
+      - app/src/test/java/com/example/algohud/execution/TicketProtectionResetTest.kt
+      - .github/workflows/apply-ticket-reset.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/research-lab
+          fetch-depth: 0
+      - name: Apply guarded integration
+        run: python3 scripts/apply-ticket-reset-fix.py
+      - name: Commit source integration
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/src/main/java/com/example/algohud/execution/AutoExecutionService.kt
+          git commit -m 'Reset only recognized next-order SL TP ticket after verified entry'
+          git push origin HEAD:feature/research-lab
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Unit tests
+        id: tests
+        continue-on-error: true
+        shell: bash
+        run: |
+          chmod +x gradlew
+          export GITHUB_SHA="$(git rev-parse HEAD)"
+          ./gradlew :app:testDebugUnitTest --stacktrace --console=plain 2>&1 | tee ticket-tests.log
+      - name: Build debug APK
+        id: build
+        continue-on-error: true
+        shell: bash
+        run: |
+          export GITHUB_SHA="$(git rev-parse HEAD)"
+          ./gradlew :app:assembleDebug --stacktrace --console=plain 2>&1 | tee ticket-build.log
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ticket-reset-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            ticket-*.log
+            app/build/reports/tests/
+            app/build/test-results/
+      - name: Upload APK
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ticket-reset-debug-apk-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
+          if-no-files-found: error
+          path: app/build/outputs/apk/debug/*.apk
+      - name: Enforce verification
+        if: always()
+        env:
+          TESTS: ${{ steps.tests.outcome }}
+          BUILD: ${{ steps.build.outcome }}
+        run: |
+          echo "Tests: $TESTS; build: $BUILD" >> "$GITHUB_STEP_SUMMARY"
+          test "$TESTS" = success && test "$BUILD" = success
