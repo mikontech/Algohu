@@ -542,6 +542,16 @@ class AutoExecutionService : AccessibilityService() {
             lastRemoteDump = ScreenScanner.dump(root)
             val caller = callerText(texts)
             if (!enabled) { remoteNote("ℹ️ AnyDesk: prośba o połączenie ($caller), ale auto-akceptacja jest wyłączona"); return }
+            if (!isTrusted(allowed, texts) && fromSystemUi) {
+                // Belka z góry często nie pokazuje ID – otwieramy ją (nie akceptując); ID sprawdzimy w oknie AnyDesk.
+                val note = nodes.firstOrNull { (_, t) -> t.contains("AnyDesk", ignoreCase = true) }?.first
+                var b: AccessibilityNodeInfo? = note
+                while (b != null && !b.isClickable) b = b.parent
+                if (b != null && b != accept && b.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                    remoteNote("📡 AnyDesk: belka bez zaufanego ID («$caller») – otwieram okno prośby, tam sprawdzę ID")
+                    return
+                }
+            }
             if (!isTrusted(allowed, texts)) {
                 remoteNote("⛔ AnyDesk: prośba od «$caller» – nie ma na liście zaufanych (${allowed.joinToString().ifEmpty { "lista pusta" }}). Nie wpuszczam.")
                 return
