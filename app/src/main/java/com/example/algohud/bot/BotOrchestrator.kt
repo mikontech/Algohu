@@ -415,7 +415,7 @@ class BotOrchestrator(
                 "(${stratName(pos.entryReason)}) • %+.2fR".format(pnlR)
             val sl = "SL ${f(pos.stopPrice)}" + if (pos.stopPrice != pos.initialStop) " (przesunięty)" else ""
             val exit = if (SL_ONLY) {
-                "Zamknę WYŁĄCZNIE na $sl (bez TP). Przy zysku SL idzie za ceną: wystrzał świecy → ciasno za impulsem, od +1R na wejście i dalej 1R za ceną."
+                "Zamknę WYŁĄCZNIE na $sl (bez TP). Od +8 zł zysku SL na wejście, dalej 10 zł za ceną; wystrzał świecy → ciaśniej. SL zmieniam w otwartej pozycji XTB."
             } else if (pos.entryReason.startsWith(AI_TAG)) {
                 val t = aiTrades[inst]
                 val vtp = pos.entryPrice + dir * maxOf(AI_VTP_ATR * (aggregators["$inst@${Learner.M1}"]?.closed()?.takeLast(60)?.let { Indicators.atr(it) } ?: r), t?.expBody ?: 0.0)
@@ -566,7 +566,8 @@ class BotOrchestrator(
         var brokerSl: Double = Double.NaN,
         var brokerAt: Long = 0L,
         var brokerBusy: Boolean = false,
-        var closing: Boolean = false
+        var closing: Boolean = false,
+        var beNoted: Boolean = false
     )
     private val aiTrades = HashMap<String, AiTrade>()
 
@@ -585,6 +586,30 @@ class BotOrchestrator(
         val profitAtr = (px - pos.entryPrice) * dir / atr
 
         val pnlR = (px - pos.entryPrice) * dir / r
+        if (SL_ONLY) {
+            // Tylko SL: stop prowadzony w złotówkach i przesuwany W OTWARTEJ POZYCJI w XTB (ekran edycji pozycji).
+            val best = if (dir > 0) maxOf(pos.best, px) else minOf(pos.best, px)
+            val perPrice = pos.quantity * pos.pointValue // PLN za ruch ceny o 1,0
+            if (perPrice > 0) {
+                val bestPln = (best - pos.entryPrice) * dir * perPrice
+                if (bestPln >= BE_AT_PLN) {
+                    val be = pos.entryPrice + dir * maxOf(spreadOf(inst), 0.05)
+                    val trail = best - dir * TRAIL_PLN / perPrice
+                    val target = if ((trail - be) * dir > 0) trail else be
+                    if (risk.tightenStop(inst, target) && !t.beNoted) {
+                        t.beNoted = true
+                        msg("🔒 $inst: zysk %.0f zł – SL na wejście, dalej %.0f zł za najlepszą ceną".format(bestPln, TRAIL_PLN))
+                    }
+                }
+            }
+            if (!t.trailing && profitAtr >= IMPULSE_MIN_ATR && cur != null && impulseStrong(inst, cur, dir, atr, ts)) {
+                t.trailing = true
+                msg("🚀 $inst: wystrzał świecy – SL ciasno za impulsem")
+            }
+            if (t.trailing) risk.tightenStop(inst, best - dir * maxOf(AI_TRAIL_ATR * atr, 2 * spreadOf(inst)))
+            brokerSync(inst, pos, t, ts, perPrice)
+            return
+        }
         if (!t.trailing && !isAi) {
             // Pozostałe strategie: wystrzał świecy w stronę pozycji przy zysku → TP dalej, SL za ceną.
             if (profitAtr >= IMPULSE_MIN_ATR && cur != null && impulseStrong(inst, cur, dir, atr, ts)) {
@@ -649,6 +674,36 @@ class BotOrchestrator(
                     } else if (res != null) msg("⚠️ $inst: nie przesunąłem SL/TP w XTB (${(res as? ExecutionResult.Rejected)?.reason ?: res}) – trailing pilnuje bot")
                 } finally { t.brokerBusy = false }
             }
+        }
+    }
+
+    /**
+     * Przenosi SL z księgi bota do OTWARTEJ POZYCJI w XTB (ekran pozycji → edycja → Stop Loss → zapisz).
+     * Tylko po stronie zysku (≥ wejście + spread), maks. co [BROKER_SYNC_EVERY_MS] i o ≥ [BROKER_STEP_PLN] zł.
+     */
+    private fun brokerSync(inst: String, pos: com.example.algohud.core.Position, t: AiTrade, ts: Long, perPrice: Double) {
+        if (pos.paper || engine.mode.value == ExecutionMode.DRY_RUN || t.brokerBusy) return
+        if (ts - t.brokerAt < BROKER_SYNC_EVERY_MS) return
+        scope.launch {
+            val stopNow = risk.position(inst)?.stopPrice ?: return@launch
+            val dir = pos.side.sign
+            val be = pos.entryPrice + dir * maxOf(spreadOf(inst), 0.05)
+            if ((stopNow - be) * dir < 0) return@launch // SL jeszcze startowy (15–20 zł) – w XTB bez zmian
+            val step = maxOf(2 * spreadOf(inst), if (perPrice > 0) BROKER_STEP_PLN / perPrice else 0.3)
+            if (!t.brokerSl.isNaN() && abs(stopNow - t.brokerSl) < step) return@launch
+            if (t.brokerBusy) return@launch
+            t.brokerBusy = true; t.brokerAt = ts
+            try {
+                val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
+                val sh = q?.let { basis(inst, it) } ?: 0.0
+                val res = AutoExecutionService.instance?.setProtection(inst, stopNow + sh, null)
+                if (res is ExecutionResult.Submitted || res is ExecutionResult.Filled) {
+                    t.brokerSl = stopNow
+                    msg("🛡 $inst: SL w otwartej pozycji XTB → %.2f".format(stopNow + sh))
+                } else if (res != null) {
+                    msg("⚠️ $inst: nie zmieniłem SL w pozycji XTB (${(res as? ExecutionResult.Rejected)?.reason ?: res}) – ponowię")
+                }
+            } finally { t.brokerBusy = false }
         }
     }
 
@@ -1355,6 +1410,10 @@ class BotOrchestrator(
         const val EARLY_LOSS_EXITS = false
         /** Pozycję zamyka WYŁĄCZNIE Stop Loss (przesuwany za zyskiem); bez TP, bez wyjść bota, bez zamykania na koniec sesji. */
         const val SL_ONLY = true
+        const val BE_AT_PLN = 8.0                // od 8 zł zysku SL na wejście (+spread)…
+        const val TRAIL_PLN = 10.0               // …i dalej 10 zł za najlepszą ceną
+        const val BROKER_STEP_PLN = 2.0          // SL w XTB przesuwany o ≥ 2 zł…
+        const val BROKER_SYNC_EVERY_MS = 20_000L // …maks. co 20 s (edycja pozycji to kilka sekund na ekranie)
         const val AI_WRONG_CANDLE_MIN_LOSS_R = 0.5 // „świeca przeciw” zamyka dopiero przy stracie ≥ 0,5R
         const val AI_SAFETY_TP_R = 3.0           // TP w XTB daleko (3R) – właściwe wyjście prowadzi bot
         const val AI_VTP_ATR = 1.0               // TP wirtualny ≥ 1×ATR (lub prognozowany korpus, jeśli większy)
