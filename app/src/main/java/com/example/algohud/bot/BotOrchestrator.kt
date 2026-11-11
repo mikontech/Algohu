@@ -626,7 +626,11 @@ class BotOrchestrator(
         risk.tightenStop(inst, trailStop) // przecięcie = TRAILING-STOP w risk.onMark (natychmiast, bez czekania na XTB)
         if (cur != null && slowdown(cur, dir, atr)) { aiClose(inst, pos, px, t, "wyhamowanie impetu"); return }
         // Zabezpieczenie w XTB (gdyby aplikacja padła): SL za zyskiem + TP odsunięty. Rzadko – to operacje na ekranie.
-        val stopNow = risk.position(inst)?.stopPrice ?: return
+        // SL przesuwany za impulsem NIGDY po stronie straty: min. wejście + spread (w XTB = próg rentowności).
+        val beStop = pos.entryPrice + dir * maxOf(spreadOf(inst), 0.05)
+        val ledgerStop = risk.position(inst)?.stopPrice ?: return
+        if ((ledgerStop - beStop) * dir < 0) return // trailing jeszcze nie wyszedł nad próg – w XTB zostaje SL 15–20 PLN
+        val stopNow = ledgerStop
         if (!pos.paper && engine.mode.value != ExecutionMode.DRY_RUN && !t.brokerBusy &&
             ts - t.brokerAt >= AI_BROKER_EVERY_MS && (t.brokerSl.isNaN() || abs(stopNow - t.brokerSl) >= AI_BROKER_STEP_ATR * atr)
         ) {
