@@ -214,12 +214,18 @@ class RiskManager(
         if (dist < ref * config.minStopDistancePct) return@withLock reject("Stop-loss zbyt blisko ceny")
 
         val tradeRisk = dist * order.quantity * order.pointValue
-        val maxTradeRisk = equity * riskPct(order.tier)
-        if (tradeRisk > maxTradeRisk * 1.05) {
-            return@withLock reject("Ryzyko %.2f > limit %.2f".format(tradeRisk, maxTradeRisk))
-        }
-        if (order.quantity * ref * order.pointValue > equity * leverage(order.tier) * 1.01) {
-            return@withLock reject("Zbyt duża ekspozycja (dźwignia > %.0f×)".format(leverage(order.tier)))
+        if (order.fixedSize) {
+            // Stały wolumen: bez limitu % ryzyka poziomu i dźwigni – zostaje bezpiecznik „SL nie może zjeść > 10% kapitału”.
+            val cap = equity * FIXED_SIZE_MAX_RISK_PCT
+            if (tradeRisk > cap) return@withLock reject("Stały wolumen: strata przy SL %.2f > %.0f%% kapitału (%.2f)".format(tradeRisk, FIXED_SIZE_MAX_RISK_PCT * 100, cap))
+        } else {
+            val maxTradeRisk = equity * riskPct(order.tier)
+            if (tradeRisk > maxTradeRisk * 1.05) {
+                return@withLock reject("Ryzyko %.2f > limit %.2f".format(tradeRisk, maxTradeRisk))
+            }
+            if (order.quantity * ref * order.pointValue > equity * leverage(order.tier) * 1.01) {
+                return@withLock reject("Zbyt duża ekspozycja (dźwignia > %.0f×)".format(leverage(order.tier)))
+            }
         }
         val dailyLimit = dayStartEquity * config.maxDailyLossPct
         val currentLoss = (-_dailyPnl.value).coerceAtLeast(0.0)
@@ -306,6 +312,23 @@ class RiskManager(
     }
 
     suspend fun position(symbol: String): Position? = mutex.withLock { positions[symbol] }
+
+    /** Dociąga stop pozycji (trailing z zarządzania transakcją) – wyłącznie w stronę zysku. true = przesunięto. */
+    suspend fun tightenStop(symbol: String, stop: Double): Boolean = mutex.withLock {
+        val p = positions[symbol] ?: return@withLock false
+        val better = if (p.side == Side.BUY) stop > p.stopPrice else stop < p.stopPrice
+        if (!better) return@withLock false
+        positions[symbol] = p.copy(stopPrice = stop)
+        persistLocked()
+        true
+    }
+
+    /** Odsuwa TP w księdze (TP przesuwany za impulsem); null = bez TP. */
+    suspend fun moveTakeProfit(symbol: String, tp: Double?) = mutex.withLock {
+        val p = positions[symbol] ?: return@withLock
+        positions[symbol] = p.copy(takeProfit = tp)
+        persistLocked()
+    }
 
     suspend fun closingOrder(symbol: String, side: Side, price: Double): OrderRequest? = mutex.withLock {
         val p = positions[symbol] ?: return@withLock null
@@ -417,6 +440,8 @@ class RiskManager(
     companion object {
         const val REASON_DAILY_LOSS = "Przekroczony dzienny limit straty"
         private const val TAG = "RiskManager"
+        /** Stały wolumen: strata przy SL nie może przekroczyć 10% kapitału (bezpiecznik). */
+        const val FIXED_SIZE_MAX_RISK_PCT = 0.10
         private const val K_KILL = "kill"
         private const val K_KILL_REASON = "kill_reason"
         private const val K_DAY = "day"

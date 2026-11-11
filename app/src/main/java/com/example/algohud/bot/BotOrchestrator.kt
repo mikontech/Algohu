@@ -30,7 +30,8 @@ import kotlin.math.abs
 enum class BotProfile(val label: String) {
     RANGE("📈 ZAKRES (dół → góra)"),
     AGGRESSIVE("⚡ AGRESYWNY (RT+ORB)"),
-    STANDARD("STANDARD (turniej)")
+    STANDARD("STANDARD (turniej)"),
+    AI("🕯️ ŚWIECE + PREDYKCJA AI")
 }
 
 data class Signal(val side: Side, val stopPrice: Double, val takeProfit: Double, val reason: String, val tier: Int = 1)
@@ -319,8 +320,8 @@ class BotOrchestrator(
 
     private suspend fun enterAggressive(
         inst: String, dir: Int, px: Double, rawStop: Double, why: String, ts: Long,
-        tp: Double? = null, tier: Int = Tier.AGGRESSIVE
-    ) {
+        tp: Double? = null, tier: Int = Tier.AGGRESSIVE, tpR: Double = 2.0
+    ): ExecutionResult? {
         // Bot może złożyć zlecenie tylko na instrumencie otwartym w XTB – pozostałe liczy w tle bez prób wejścia.
         val onScreen = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() }?.instrument
         if (onScreen != inst && engine.mode.value != ExecutionMode.DRY_RUN) {
@@ -329,24 +330,221 @@ class BotOrchestrator(
                 lastBlindNote = ts
                 msg("✋ $inst: sygnał ($why), ale nie widzę $inst w XTB – ${AutoExecutionService.diag}")
             }
-            return
+            return null
         }
-        if (onScreen != inst && inst != hudLearningInstrument) return // papier: tylko instrument główny i ten na ekranie
-        sessionBlock(inst, ts)?.let { msg("✋ $inst: $why – pominięte: $it"); return }
+        if (onScreen != inst && inst != hudLearningInstrument) return null // papier: tylko instrument główny i ten na ekranie
+        sessionBlock(inst, ts)?.let { msg("✋ $inst: $why – pominięte: $it"); return null }
         val spread = spreadOf(inst)
         val entry = px + spread / 2 * dir
         val minDist = maxOf(3 * spread, entry * risk.config.minStopDistancePct)
         val stop = if (abs(entry - rawStop) < minDist) entry - dir * minDist else rawStop
-        val takeProfit = tp ?: (entry + dir * 2.0 * abs(entry - stop))
+        val takeProfit = tp ?: (entry + dir * tpR * abs(entry - stop))
         val side = if (dir > 0) Side.BUY else Side.SELL
         risk.closingOrder(inst, side, px)?.let { close ->
             val r = engine.submit(withSpread(close.copy(reason = "ODWRÓCENIE (impuls)"), inst), bypassConfirmation = true)
-            if (r !is ExecutionResult.Filled && r !is ExecutionResult.Submitted) return
+            if (r !is ExecutionResult.Filled && r !is ExecutionResult.Submitted) return r
         }
-        val order = buildOrder(inst, side, entry, stop, takeProfit, why, pointValue(inst), tier) ?: return
+        val order = buildOrder(inst, side, entry, stop, takeProfit, why, pointValue(inst), tier) ?: return null
         decisionCard(inst, order, Signal(side, stop, takeProfit, why, tier), ev = Double.NaN)
-        engine.submit(order)
+        return engine.submit(order)
     }
+
+    // ───────────── ŚWIECE + PREDYKCJA AI: model online, wejście przed zamknięciem świecy, trailing za impulsem ─────────────
+
+    private val predictors = java.util.concurrent.ConcurrentHashMap<String, NextCandlePredictor>()
+    private val predictedBar = HashMap<String, Long>()
+    private val aiNote = HashMap<String, String>()
+
+    private fun predictor(inst: String) = predictors.getOrPut(inst) {
+        NextCandlePredictor().also { p -> prefs.getString("ncp_$inst", null)?.let { p.import(it) } }
+    }
+
+    private fun savePredictor(inst: String) {
+        predictors[inst]?.let { prefs.edit().putString("ncp_$inst", it.export()).apply() }
+    }
+
+    /** „Wolumen” = liczba ticków w świecy 1m (feed złota nie podaje wolumenu). */
+    private class TickStat(var barStart: Long = 0L, var count: Int = 0, val past: ArrayDeque<Int> = ArrayDeque())
+    private val ticks = HashMap<String, TickStat>()
+
+    private fun countTick(inst: String, ts: Long) {
+        val t = ticks.getOrPut(inst) { TickStat() }
+        val start = ts - ts % Learner.M1
+        if (start != t.barStart) {
+            if (t.barStart != 0L) { t.past.addLast(t.count); while (t.past.size > 30) t.past.removeFirst() }
+            t.barStart = start; t.count = 0
+        }
+        t.count++
+    }
+
+    /** Aktywność ticków bieżącej świecy względem średniej (tempo na sekundę); 1.0 = normalnie. */
+    private fun tickRatio(inst: String, ts: Long): Double {
+        val t = ticks[inst] ?: return 1.0
+        if (t.past.size < 5) return 1.0
+        val avg = t.past.average().takeIf { it > 0 } ?: return 1.0
+        val frac = ((ts - t.barStart).toDouble() / Learner.M1).coerceIn(0.15, 1.0)
+        return (t.count / frac) / avg
+    }
+
+    private fun onM1Closed(inst: String, closed: List<Bar>) {
+        val p = predictor(inst)
+        if (p.samples == 0L && closed.size >= 100) p.warmUp(closed) else p.onBarClosed(closed)
+        if (p.samples % 5 == 0L) savePredictor(inst)
+        if (inst == hudLearningInstrument) updatePredictionHud(inst)
+    }
+
+    /** ~10 s przed zamknięciem świecy 1m: prognoza następnej (raz na świecę), w profilu AI – ewentualne wejście. */
+    private suspend fun aiPredictTick(inst: String, px: Double, ts: Long) {
+        val a = aggregators["$inst@${Learner.M1}"] ?: return
+        val cur = a.current() ?: return
+        if (ts - cur.start < AI_PREDICT_AT_MS || predictedBar[inst] == cur.start) return
+        val closed = a.closed()
+        if (closed.size < 60) return
+        predictedBar[inst] = cur.start
+        val p = predictor(inst).predict(closed, cur, tickRatio(inst, ts), Learner.M1, ts) ?: return
+        if (profile.value == BotProfile.AI) aiEntry(inst, p, px, ts)
+        if (inst == hudLearningInstrument) updatePredictionHud(inst)
+    }
+
+    private suspend fun aiEntry(inst: String, p: NextCandlePredictor.Prediction, px: Double, ts: Long) {
+        val (hit, graded) = predictor(inst).hitStats()
+        val acc = if (graded > 0) hit.toDouble() / graded else 0.0
+        val dir = if (p.up) 1 else -1
+        val side = if (dir > 0) Side.BUY else Side.SELL
+        val spread = spreadOf(inst)
+        val pos = risk.position(inst)
+        val why = when {
+            graded < AI_MIN_GRADED -> "model się rozgrzewa (ocenione $graded/$AI_MIN_GRADED)"
+            acc < AI_MIN_ACC -> "trafność %.0f%% < %.0f%% – model nie ma przewagi".format(acc * 100, AI_MIN_ACC * 100)
+            p.prob < AI_MIN_PROB -> "szansa %.0f%% < %.0f%%".format(p.prob * 100, AI_MIN_PROB * 100)
+            p.expBody < AI_MIN_BODY_SPREADS * spread -> "oczekiwany ruch %.2f < %.0f× spread".format(p.expBody, AI_MIN_BODY_SPREADS)
+            pos?.side == side -> "już w pozycji w tę stronę"
+            pos != null && !pos.entryReason.startsWith(AI_TAG) -> "otwarta pozycja innej strategii"
+            risk.cooldownLeftMs() > 0 -> "przerwa po stracie ${risk.cooldownLeftMs() / 1000} s"
+            else -> null
+        }
+        aiNote[inst] = why?.let { "⏸ $it" } ?: "▶️ WCHODZĘ ${if (dir > 0) "LONG" else "SHORT"}"
+        if (why != null) return
+        val stop = px - dir * AI_STOP_ATR * p.atr
+        val reason = "$AI_TAG ${if (dir > 0) "wzrostowa" else "spadkowa"} %.0f%%, korpus ~%.2f".format(p.prob * 100, p.expBody)
+        val r = enterAggressive(inst, dir, px, stop, reason, ts, tpR = AI_SAFETY_TP_R)
+        if (r is ExecutionResult.Filled || r is ExecutionResult.Submitted) aiTrades[inst] = AiTrade(expBody = p.expBody)
+    }
+
+    // ── zarządzanie pozycją AI: TP wirtualny, przesuwanie TP za impulsem, ciasny trailing, wyjście przy wyhamowaniu ──
+
+    private class AiTrade(
+        val expBody: Double,
+        var trailing: Boolean = false,
+        var predChecked: Boolean = false,
+        var brokerSl: Double = Double.NaN,
+        var brokerAt: Long = 0L,
+        var brokerBusy: Boolean = false,
+        var closing: Boolean = false
+    )
+    private val aiTrades = HashMap<String, AiTrade>()
+
+    private suspend fun aiManage(inst: String, px: Double, ts: Long) {
+        val pos = risk.position(inst) ?: run { aiTrades.remove(inst); return }
+        if (!pos.entryReason.startsWith(AI_TAG)) return
+        val t = aiTrades.getOrPut(inst) { AiTrade(expBody = 0.0) } // np. po restarcie aplikacji
+        if (t.closing) return
+        val dir = pos.side.sign
+        val r = abs(pos.entryPrice - pos.initialStop).takeIf { it > 0 } ?: return
+        val a = aggregators["$inst@${Learner.M1}"] ?: return
+        val closed = a.closed()
+        val cur = a.current()
+        val atr = Indicators.atr(closed.takeLast(60))?.takeIf { it > 0 } ?: r
+        val virtualTp = pos.entryPrice + dir * maxOf(AI_MIN_VTP_R * r, t.expBody)
+
+        if (!t.trailing) {
+            if ((px - virtualTp) * dir >= 0) {
+                if (cur != null && impulseStrong(inst, cur, dir, atr, ts)) {
+                    t.trailing = true
+                    risk.moveTakeProfit(inst, null) // TP prowadzi teraz bot (trailing), w XTB odsuwamy go dalej
+                    msg("🚀 $inst: silny impuls przy TP – nie zamykam, TP przesuwam, ciasny trailing")
+                } else {
+                    aiClose(inst, pos, px, t, "TP (AI) – brak impulsu do dalszej jazdy"); return
+                }
+            } else {
+                val predEnd = pos.openedAt - pos.openedAt % Learner.M1 + 2 * Learner.M1
+                if (ts >= predEnd && !t.predChecked) {
+                    val pb = closed.lastOrNull { it.start == predEnd - Learner.M1 }
+                    if (pb != null) {
+                        t.predChecked = true
+                        if ((pb.close - pb.open) * dir < 0) { aiClose(inst, pos, px, t, "prognoza chybiona – świeca zamknęła się przeciwnie"); return }
+                    }
+                }
+                if (ts >= predEnd + AI_MAX_EXTRA_BARS * Learner.M1) { aiClose(inst, pos, px, t, "czas – ruch nie doszedł do TP"); return }
+            }
+        }
+        if (!t.trailing) return
+        val best = if (dir > 0) maxOf(pos.best, px) else minOf(pos.best, px)
+        val trailStop = best - dir * maxOf(AI_TRAIL_ATR * atr, 2 * spreadOf(inst))
+        risk.tightenStop(inst, trailStop) // przecięcie = TRAILING-STOP w risk.onMark (natychmiast, bez czekania na XTB)
+        if (cur != null && slowdown(cur, dir, atr)) { aiClose(inst, pos, px, t, "wyhamowanie impetu"); return }
+        // Zabezpieczenie w XTB (gdyby aplikacja padła): SL za zyskiem + TP odsunięty. Rzadko – to operacje na ekranie.
+        val stopNow = risk.position(inst)?.stopPrice ?: return
+        if (!pos.paper && engine.mode.value != ExecutionMode.DRY_RUN && !t.brokerBusy &&
+            ts - t.brokerAt >= AI_BROKER_EVERY_MS && (t.brokerSl.isNaN() || abs(stopNow - t.brokerSl) >= AI_BROKER_STEP_ATR * atr)
+        ) {
+            t.brokerBusy = true; t.brokerAt = ts
+            val farTp = best + dir * AI_SAFETY_TP_R * r
+            scope.launch {
+                try {
+                    val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
+                    val sh = q?.let { basis(inst, it) } ?: 0.0
+                    val res = AutoExecutionService.instance?.setProtection(inst, stopNow + sh, farTp + sh)
+                    if (res is ExecutionResult.Submitted || res is ExecutionResult.Filled) {
+                        t.brokerSl = stopNow
+                        msg("🛡 $inst: w XTB SL → %.2f, TP → %.2f (za impulsem)".format(stopNow + sh, farTp + sh))
+                    } else if (res != null) msg("⚠️ $inst: nie przesunąłem SL/TP w XTB (${(res as? ExecutionResult.Rejected)?.reason ?: res}) – trailing pilnuje bot")
+                } finally { t.brokerBusy = false }
+            }
+        }
+    }
+
+    /** Silny impuls: świeca w stronę pozycji, duży korpus, brak knota po stronie ruchu, rosnąca aktywność ticków. */
+    private fun impulseStrong(inst: String, cur: Bar, dir: Int, atr: Double, ts: Long): Boolean {
+        val range = cur.high - cur.low
+        if (range < AI_IMPULSE_ATR * atr) return false
+        val body = (cur.close - cur.open) * dir
+        val wick = if (dir > 0) cur.high - cur.close else cur.close - cur.low
+        return body >= 0.6 * range && wick <= 0.15 * range && tickRatio(inst, ts) >= 1.1
+    }
+
+    /** Pierwszy sygnał wyhamowania: duży knot przeciwko pozycji albo świeca zawraca. */
+    private fun slowdown(cur: Bar, dir: Int, atr: Double): Boolean {
+        val range = cur.high - cur.low
+        val wick = if (dir > 0) cur.high - cur.close else cur.close - cur.low
+        return (range >= 0.3 * atr && wick >= 0.4 * range) || (cur.close - cur.open) * dir <= -0.25 * atr
+    }
+
+    private suspend fun aiClose(inst: String, pos: com.example.algohud.core.Position, px: Double, t: AiTrade, why: String) {
+        val close = risk.closingOrder(inst, pos.side.opposite(), px) ?: return
+        t.closing = true
+        msg("🏁 $inst: $why @ %.2f".format(px))
+        val r = engine.submit(withSpread(close.copy(reason = "AI: $why"), inst), bypassConfirmation = true)
+        if (r !is ExecutionResult.Filled && r !is ExecutionResult.Submitted) {
+            t.closing = false // spróbuje ponownie przy kolejnym ticku; pozycję chroni SL w XTB
+            msg("⚠️ $inst: zamknięcie nieudane – ponowię; SL w XTB chroni pozycję")
+        }
+    }
+
+    private fun updatePredictionHud(inst: String) = runCatching {
+        val pr = predictors[inst] ?: return@runCatching
+        val (hit, graded) = pr.hitStats()
+        val acc = if (graded > 0) "%d/%d (%.0f%%)".format(hit, graded, hit * 100.0 / graded) else "brak ocen"
+        val p = pr.last?.takeIf { System.currentTimeMillis() - it.madeAt < 2 * Learner.M1 }
+        val line1 = p?.let {
+            "🔮 Następna świeca 1m: %s | Szansa: %.0f%% | Siła ruchu: %s (~%.2f)".format(
+                if (it.up) "WZROSTOWA" else "SPADKOWA", it.prob * 100, it.strength, it.expBody)
+        } ?: "🔮 Następna świeca 1m: prognoza ~10 s przed zamknięciem bieżącej"
+        val line2 = "🎓 Model: trafność z ost. 20: $acc • nauczony na %,d świecach".format(pr.samples).replace(',', ' ')
+        val line3 = if (profile.value == BotProfile.AI) aiNote[inst] else null
+        _hud.update { it.copy(prediction = listOfNotNull(line1, line2, line3).joinToString("\n"), predictionUp = p?.up) }
+    }
+
     private val binanceFallback = java.util.Collections.synchronizedSet(HashSet<String>())
     private val noHistory = java.util.Collections.synchronizedSet(HashSet<String>())
 
@@ -639,9 +837,12 @@ class BotOrchestrator(
                 msg("⚠️ $inst: zamknięcie (${exit.reason}) nieudane – ponowię za 20 s; pozycję chroni SL w XTB")
             }
         }
+        aiManage(inst, px, ts)
+        countTick(inst, ts)
         for (tf in Learner.TIMEFRAMES) {
             val a = agg(inst, tf)
             val closed = a.onTick(px, ts) ?: continue
+            if (tf == Learner.M1) onM1Closed(inst, a.closed())
             // Instrumenty bez historii (lub bez cen w tle): zapisujemy świece – nauka rośnie z każdym dniem i przetrwa restart.
             if (!hasBackground(inst) || inst in noHistory) runCatching { barStore.append(inst, tf, closed) }
             val (sent, _) = news.sentimentFor(aliasesFor(inst))
@@ -654,8 +855,9 @@ class BotOrchestrator(
         when (profile.value) {
             BotProfile.AGGRESSIVE -> { orbCheck(inst, px, ts); realtimeCheck(inst, px, ts) }
             BotProfile.RANGE -> rangeCheck(inst, px, ts)
-            BotProfile.STANDARD -> Unit
+            BotProfile.STANDARD, BotProfile.AI -> Unit
         }
+        aiPredictTick(inst, px, ts)
     }
 
     private suspend fun handleSignal(inst: String, sig: Signal, px: Double) {
@@ -703,8 +905,8 @@ class BotOrchestrator(
         val cond = aggregators["$inst@$tf"]?.closed()?.let { MarketRead.describe(it) } ?: "?"
         msg(
             "📊 $cond\n➡️ ${if (o.side == Side.BUY) "LONG" else "SHORT"} • ${Tier.name(sig.tier)} " +
-                "(%.1f%% ryzyka, %s lota, %s)\n🎯 E %.2f • SL %.2f • TP %s".format(
-                    risk.tierRiskPct(sig.tier) * 100, BigDecimal.valueOf(o.quantity).toPlainString(), evText,
+                "(stały lot %s, strata przy SL ≈%.2f, %s)\n🎯 E %.2f • SL %.2f • TP %s".format(
+                    BigDecimal.valueOf(o.quantity).toPlainString(), abs(o.referencePrice - o.stopPrice) * o.quantity * o.pointValue, evText,
                     o.referencePrice + sh, o.stopPrice + sh, o.takeProfit?.let { "%.2f".format(it + sh) } ?: "trailing"
                 )
         )
@@ -724,14 +926,19 @@ class BotOrchestrator(
             msg("✋ $symbol: stop %.2f od ceny – za blisko (min. %.2f)".format(abs(price - stop), minDist))
             return null
         }
-        val qty = when (val r = risk.sizingFor(price, stop, pv, tier)) {
-            is com.example.algohud.risk.PositionSizer.Result.Ok -> r.lots
-            is com.example.algohud.risk.PositionSizer.Result.Rejected -> {
-                msg("✋ $symbol (${Tier.name(tier)}): ${r.reason}")
-                return null
+        // Stały wolumen dla KAŻDEJ transakcji (zamiast skalowania wg % ryzyka). Najpierw: czy XTB w ogóle przyjmie depozyt.
+        val qty = FIXED_LOT
+        val funds = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == symbol }?.availableFunds
+            ?: AutoExecutionService.lastAccountFunds
+        val margin = qty * price * pv * MARGIN_RATE_EST
+        if (funds != null && margin > funds * 0.97) {
+            if (rtNotes.add("margin:$symbol:${System.currentTimeMillis() / 60_000}")) {
+                msg("✋ $symbol: na %s lota potrzeba ≈%.0f depozytu, dostępne %.0f – pomijam".format(
+                    BigDecimal.valueOf(qty).toPlainString(), margin, funds))
             }
+            return null
         }
-        return OrderRequest(symbol, side, qty, price, stop, reason, pointValue = pv, takeProfit = takeProfit, tier = tier)
+        return OrderRequest(symbol, side, qty, price, stop, reason, pointValue = pv, takeProfit = takeProfit, tier = tier, fixedSize = true)
     }
 
     /** Symulacja spreadu XTB w handlu papierowym: kupno po ask, sprzedaż po bid. */
@@ -951,6 +1158,27 @@ class BotOrchestrator(
 
     private companion object {
         const val HUD_FEED = "BTCUSDT"
+
+        /** Stały wolumen każdej transakcji (loty XTB). */
+        const val FIXED_LOT = 0.006
+        /** Szacowany depozyt XTB dla złota/CFD (≈5% wartości kontraktu, 1:20) – do sprawdzenia środków przed wejściem. */
+        const val MARGIN_RATE_EST = 0.05
+
+        // ŚWIECE + PREDYKCJA AI
+        const val AI_TAG = "AI"
+        const val AI_PREDICT_AT_MS = 50_000L     // prognoza ~10 s przed zamknięciem świecy 1m
+        const val AI_MIN_GRADED = 20             // min. ocenionych prognoz na żywo
+        const val AI_MIN_ACC = 0.55              // min. trafność z ostatnich 20
+        const val AI_MIN_PROB = 0.58             // min. szansa kierunku
+        const val AI_MIN_BODY_SPREADS = 2.0      // oczekiwany ruch ≥ 2× spread
+        const val AI_STOP_ATR = 0.8              // twardy SL 0,8×ATR (min. 3× spread)
+        const val AI_SAFETY_TP_R = 3.0           // TP w XTB daleko (3R) – właściwe wyjście prowadzi bot
+        const val AI_MIN_VTP_R = 1.0             // TP wirtualny ≥ 1R (lub prognozowany korpus, jeśli większy)
+        const val AI_MAX_EXTRA_BARS = 1          // świeca prognozy + 1 – potem wyjście czasowe
+        const val AI_IMPULSE_ATR = 0.6           // impuls: zasięg świecy ≥ 0,6×ATR
+        const val AI_TRAIL_ATR = 0.35            // ciasny trailing 0,35×ATR za najlepszą ceną
+        const val AI_BROKER_EVERY_MS = 30_000L   // przesuwanie SL/TP w XTB maks. co 30 s
+        const val AI_BROKER_STEP_ATR = 0.5       // …i o ≥ 0,5×ATR
 
         // Profil agresywny – progi wejść w czasie rzeczywistym
         const val RT_RANGE_ATR = 1.2      // zasięg bieżącej świecy ≥ 1,2 × ATR14

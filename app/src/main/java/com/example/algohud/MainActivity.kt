@@ -69,6 +69,7 @@ class MainActivity : ComponentActivity() {
         button("📈 ZAKRES – kup na dole, sprzedaj na górze") { OverlayService.command(this, OverlayService.ACTION_PROFILE, "RANGE") }
         button("⚡ AGRESYWNY – impulsy i otwarcia sesji") { OverlayService.command(this, OverlayService.ACTION_PROFILE, "AGGRESSIVE") }
         button("🧠 STANDARD – zwycięzca turnieju") { OverlayService.command(this, OverlayService.ACTION_PROFILE, "STANDARD") }
+        button("🕯️ ŚWIECE + PREDYKCJA AI – następna świeca, trailing za impulsem") { OverlayService.command(this, OverlayService.ACTION_PROFILE, "AI") }
 
         TextView(this).apply { text = "\nBezpieczeństwo"; textSize = 18f }.also { layout.addView(it) }
         button("Reset KILL (nie działa po dziennym limicie)") { OverlayService.command(this, OverlayService.ACTION_RESET_KILL) }

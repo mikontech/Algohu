@@ -47,6 +47,8 @@ data class OrderRequest(
     val takeProfit: Double? = null,
     /** Poziom agresji: 0 zredukowany, 1 umiarkowany, 2 agresywny (wpływa na ryzyko i dźwignię). */
     val tier: Int = 1,
+    /** Stały wolumen (np. 0.006) – bez skalowania wg % ryzyka i limitu dźwigni poziomu agresji. */
+    val fixedSize: Boolean = false,
     val clientOrderId: String = "hud" + UUID.randomUUID().toString().replace("-", "").take(16)
 )
 
@@ -123,5 +125,9 @@ data class HudState(
     /** Czytelny, wielolinijkowy stan bota (prawdziwe wartości z XTB i księgi bota). */
     val status: String = "",
     val learning: String = "",
+    /** Predykcja następnej świecy + status uczenia modelu (sekcja w HUD). */
+    val prediction: String = "",
+    /** true = wzrostowa (zielona), false = spadkowa (czerwona), null = brak prognozy. */
+    val predictionUp: Boolean? = null,
     val lastMessage: String = "Uruchamianie…"
 )

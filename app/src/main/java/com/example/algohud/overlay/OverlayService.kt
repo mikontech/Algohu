@@ -101,6 +101,7 @@ class OverlayService : LifecycleService() {
     private lateinit var tvMessage: TextView
     private lateinit var tvScreen: TextView
     private lateinit var tvStats: TextView
+    private lateinit var tvPredict: TextView
     private lateinit var btnMode: Button
     private lateinit var btnConfirm: Button
 
@@ -293,6 +294,7 @@ class OverlayService : LifecycleService() {
             maxLines = 4; maxWidth = dp(280); ellipsize = TextUtils.TruncateAt.END
         }
         tvStats = TextView(this).apply { setTextColor(0xFF90CAF9.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 8 }
+        tvPredict = TextView(this).apply { setTextColor(0xFFBDBDBD.toInt()); textSize = 11.5f; visibility = View.GONE }
         tvScreen = TextView(this).apply { setTextColor(0xFFFFE082.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 3 }
         btnConfirm = actionButton("✔ Potwierdź", 0xFF1565C0.toInt()) {
             botScope.launch { engine.confirmPending() }
@@ -306,7 +308,7 @@ class OverlayService : LifecycleService() {
             addView(btnConfirm)
         }
         fun full() = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        listOf(tvStatus, tvStats, tvMessage).forEach { it.maxWidth = Int.MAX_VALUE; it.maxLines = 12 }
+        listOf(tvStatus, tvPredict, tvStats, tvMessage).forEach { it.maxWidth = Int.MAX_VALUE; it.maxLines = 12 }
         tvStatus.setTextColor(0xFFEEEEEE.toInt())
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -314,6 +316,7 @@ class OverlayService : LifecycleService() {
             setPadding(dp(10), dp(8), dp(10), dp(8))
             visibility = View.GONE
             addView(tvStatus, full())
+            addView(tvPredict, full().apply { topMargin = dp(4) })
             addView(tvStats, full().apply { topMargin = dp(4) })
             addView(tvMessage, full().apply { topMargin = dp(4) })
             addView(killRow, wrap().apply { topMargin = dp(6) })
@@ -490,6 +493,11 @@ class OverlayService : LifecycleService() {
             .format(s.dailyPnl)
         tvMessage.text = s.lastMessage
         setKeepScreenOn(s.mode == ExecutionMode.AUTO && !s.killSwitch)
+        tvPredict.visibility = if (s.prediction.isBlank()) View.GONE else View.VISIBLE
+        tvPredict.text = s.prediction
+        tvPredict.setTextColor(
+            when (s.predictionUp) { true -> 0xFF66BB6A.toInt(); false -> 0xFFEF5350.toInt(); null -> 0xFFBDBDBD.toInt() }
+        )
         tvStats.text = listOf(s.learning, s.paperStats).filter { it.isNotBlank() }.joinToString("\n")
         if (s.status.isNotEmpty()) tvStatus.text = s.status
         tvScreen.visibility = View.GONE
