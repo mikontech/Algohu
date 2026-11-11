@@ -386,7 +386,31 @@ class BotOrchestrator(
         return (t.count / frac) / avg
     }
 
+    private val lastM1Close = HashMap<String, Long>()
+
+    /** Co sekundę: domyka świecę 1m po czasie i robi prognozę ~10 s przed końcem – niezależnie od gęstości ticków. */
+    private suspend fun candleClock(now: Long) {
+        for (inst in predictors.keys + hudLearningInstrument) {
+            val a = aggregators["$inst@${Learner.M1}"] ?: continue
+            a.roll(now)?.let { onM1Closed(inst, a.closed()) }
+            val px = lastPx[inst]?.first ?: continue
+            aiPredictTick(inst, px, now)
+            if (inst == hudLearningInstrument) {
+                val lc = lastM1Close[inst] ?: now.also { lastM1Close[inst] = it }
+                if (now - lc > 3 * Learner.M1 && now - lastStallNote > Learner.M1) {
+                    lastStallNote = now
+                    val cur = a.current()
+                    msg("⚠️ $inst: świece 1m stoją od %d min (ostatni tick %s s temu, bieżąca świeca od %s s)".format(
+                        (now - lc) / Learner.M1, lastPx[inst]?.second?.let { (now - it) / 1000 } ?: "?",
+                        cur?.let { (now - it.start) / 1000 } ?: "—"))
+                }
+            }
+        }
+    }
+    private var lastStallNote = 0L
+
     private fun onM1Closed(inst: String, closed: List<Bar>) {
+        lastM1Close[inst] = System.currentTimeMillis()
         val p = predictor(inst)
         if (p.samples == 0L && closed.size >= 100) p.warmUp(closed) else p.onBarClosed(closed)
         if (p.samples % 5 == 0L) savePredictor(inst)
@@ -662,7 +686,20 @@ class BotOrchestrator(
                 else setLoading(inst, "Pyth nie podaje cen na żywo – uczę się tylko przy otwartym XTB")
             }
         }
-        scope.launch { pyth.ticks.collect { t -> guarded("cena ${t.symbol}") { lock.withLock { processPrice(t.symbol, t.price, t.timestamp) } } } }
+        scope.launch {
+            pyth.ticks.collect { t ->
+                // Po przełączeniu na Binance nie mieszamy dwóch źródeł w jednych świecach.
+                if (t.symbol in binanceFallback) return@collect
+                guarded("cena ${t.symbol}") { lock.withLock { processPrice(t.symbol, t.price, t.timestamp) } }
+            }
+        }
+        // Zegar świec 1m: prognoza i ocena co minutę nawet przy rzadkich tickach.
+        scope.launch {
+            while (isActive) {
+                delay(1_000)
+                guarded("zegar świec") { lock.withLock { candleClock(System.currentTimeMillis()) } }
+            }
+        }
         scope.launch {
             pyth.status.collect { st ->
                 // Zapas: jeśli Pyth nie ma instrumentu, który ma też Binance (GOLD → PAXG), wczytaj historię z Binance.
@@ -821,7 +858,9 @@ class BotOrchestrator(
 
     // ───────────── Rdzeń: wyjścia, świece, sygnały ─────────────
 
-    private suspend fun processPrice(inst: String, px: Double, ts: Long) {
+    private suspend fun processPrice(inst: String, px: Double, tsRaw: Long) {
+        // Znacznik z przyszłości (zły zegar źródła) zablokowałby świece – przycinamy do teraz.
+        val ts = minOf(tsRaw, System.currentTimeMillis() + 2_000)
         lastPx[inst] = px to ts
         risk.onMark(inst, px)?.let { exit ->
             val real = engine.mode.value != ExecutionMode.DRY_RUN && risk.position(inst)?.paper == false

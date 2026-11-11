@@ -16,6 +16,7 @@ class BarAggregator(private val periodMs: Long = 5 * 60_000L, private val maxBar
         val start = ts - ts % periodMs
         val c = current
         if (c == null) {
+            if (bars.isNotEmpty() && start <= bars.last().start) return null // spóźniony tick po domknięciu przez zegar
             current = Bar(start, price, price, price, price)
             return null
         }
@@ -23,7 +24,11 @@ class BarAggregator(private val periodMs: Long = 5 * 60_000L, private val maxBar
             current = c.copy(high = max(c.high, price), low = min(c.low, price), close = price)
             return null
         }
-        if (start < c.start) return null // spóźniony tick
+        if (start < c.start) {
+            // Spóźniony tick – pomijamy. Ale świeca „z przyszłości” (zły znacznik czasu) blokowałaby agregator na zawsze.
+            if (c.start - start > 2 * periodMs) current = Bar(start, price, price, price, price)
+            return null
+        }
         bars.addLast(c)
         while (bars.size > maxBars) bars.removeFirst()
         current = Bar(start, price, price, price, price)
@@ -40,6 +45,20 @@ class BarAggregator(private val periodMs: Long = 5 * 60_000L, private val maxBar
 
     @Synchronized
     fun closed(): List<Bar> = bars.toList()
+
+    /**
+     * Zegar ścienny: zamyka bieżącą świecę, gdy jej czas minął, a nowy tick jeszcze nie przyszedł
+     * (rzadkie notowania). Następny tick otworzy nową świecę. Zwraca zamkniętą świecę albo null.
+     */
+    @Synchronized
+    fun roll(now: Long, graceMs: Long = 3_000L): Bar? {
+        val c = current ?: return null
+        if (now < c.start + periodMs + graceMs) return null
+        bars.addLast(c)
+        while (bars.size > maxBars) bars.removeFirst()
+        current = null
+        return c
+    }
 
     /** Bieżąca, jeszcze trwająca świeca (do detekcji impulsu w czasie rzeczywistym). */
     @Synchronized
