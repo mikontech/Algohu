@@ -811,7 +811,8 @@ class AutoExecutionService : AccessibilityService() {
     /** Włącza (jeśli trzeba) sekcję SL/TP, wpisuje cenę i sprawdza, czy XTB ją przyjęło. null = OK. */
     private suspend fun setPriceIn(containerId: String, toggleId: String, price: Double): String? {
         revealById(containerId) ?: return "nie znaleziono sekcji"
-        var field = fieldIn(containerId)
+        var field = revealField(containerId)
+        if (field == null && readEnabled(containerId, toggleId)) return "suwak włączony, ale pole ceny niewidoczne"
         if (field == null) {
             val root = appRoot() ?: return "brak okna"
             val toggleArea = ScreenScanner.findById(root, toggleId).firstOrNull()?.let { n -> Rect().also { n.getBoundsInScreen(it) } }
@@ -889,6 +890,33 @@ class AutoExecutionService : AccessibilityService() {
             delay(450)
         }
         return null
+    }
+
+    /**
+     * Doprowadza na ekran kontener RAZEM z jego polem StepperTextField.
+     * revealById zwraca kontener, gdy wystaje choćby krawędzią – pole w środku bywa wtedy
+     * jeszcze niewidoczne i fieldIn() daje null. Tu dociągamy, aż pole faktycznie jest dostępne.
+     */
+    private suspend fun revealField(containerId: String): AccessibilityNodeInfo? {
+        fieldIn(containerId)?.let { return it }
+        revealById(containerId) ?: return null
+        fieldIn(containerId)?.let { return it }
+        val c = Rect(); val sc = Rect()
+        repeat(4) {
+            val root = appRoot() ?: return null
+            val node = ScreenScanner.findById(root, containerId, visibleOnly = false).firstOrNull() ?: return null
+            val scroller = findScrollable(root)
+            if (!node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_SHOW_ON_SCREEN.id) && scroller != null) {
+                node.getBoundsInScreen(c); scroller.getBoundsInScreen(sc)
+                // przycięty od góry → w górę, w przeciwnym razie w dół
+                val up = c.top <= sc.top + 4
+                scroller.performAction(if (up) AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD else AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+            }
+            delay(400)
+            fieldIn(containerId)?.let { return it }
+            revealById(containerId) ?: return null
+        }
+        return fieldIn(containerId)
     }
 
     // ───────────── Samonaprawa i weryfikacja stanu w XTB ─────────────
@@ -1044,14 +1072,15 @@ class AutoExecutionService : AccessibilityService() {
         val formOp = formBefore?.let { formCoordinator.beginEntry(order.clientOrderId, order.symbol, it) }
         if (formBefore == null) _uiEvents.tryEmit("⚠️ ${order.symbol}: nie odczytano suwaków SL/TP – po wejściu nie zostaną przywrócone")
 
-        revealById("MarketSizeInput") ?: return ExecutionResult.Rejected("nie znaleziono pola wolumenu")
-        val vol = fieldIn("MarketSizeInput") ?: return ExecutionResult.Rejected("nie znaleziono pola wolumenu")
+        restoreTicketTop() // readTicketSlTp() przewinął bilet w dół do SL/TP
+        revealById("MarketSizeInput") ?: return ExecutionResult.Rejected("nie znaleziono sekcji wolumenu")
+        val vol = revealField("MarketSizeInput") ?: return ExecutionResult.Rejected("sekcja wolumenu jest, ale pole niewidoczne")
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, formatQty(order.quantity))
         }
         if (!vol.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return ExecutionResult.Rejected("nie udało się wpisać wolumenu")
         delay(300)
-        val typed = fieldIn("MarketSizeInput")?.text?.toString()?.let { ScreenScanner.parseNumber(it) }
+        val typed = revealField("MarketSizeInput")?.text?.toString()?.let { ScreenScanner.parseNumber(it) }
         if (typed == null || abs(typed - order.quantity) > 1e-9 + order.quantity * 1e-6) {
             return ExecutionResult.Rejected("XTB nie przyjęło wolumenu (jest $typed, miało być ${formatQty(order.quantity)})")
         }
@@ -1160,10 +1189,10 @@ class AutoExecutionService : AccessibilityService() {
     private suspend fun readTicketSlTp(): TicketSlTpState? {
         revealById("StopLossContainer") ?: return null
         val slOn = readEnabled("StopLossContainer", "StopLossToggle")
-        val slVal = fieldIn("StopLossContainer")?.text?.toString()
+        val slVal = (if (slOn) revealField("StopLossContainer") else null)?.text?.toString()
         revealById("TakeProfitContainer") ?: return null
         val tpOn = readEnabled("TakeProfitContainer", "TakeProfitToggle")
-        val tpVal = fieldIn("TakeProfitContainer")?.text?.toString()
+        val tpVal = (if (tpOn) revealField("TakeProfitContainer") else null)?.text?.toString()
         return TicketSlTpState(slOn, slVal, tpOn, tpVal)
     }
 
