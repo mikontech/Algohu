@@ -44,6 +44,19 @@ class NextCandlePredictorTest {
         assertTrue(p.last!!.expBodyAtr >= 0.0)
     }
 
+    /** Kolejność jak na żywo: prognoza dla B+1 w trakcie B, zamknięcie B, prognoza dla B+2 w trakcie B+1, zamknięcie B+1… */
+    @Test fun gradesWhenNextPredictionComesBeforeClose() {
+        val bars = momentumBars(1200, seed = 5)
+        val p = NextCandlePredictor().apply { warmUp(bars.take(1000)) }
+        for (i in 1000 until 1100) {
+            p.predict(bars.subList(0, i), bars[i], 1.0, 60_000L, bars[i].start)!!
+            p.onBarClosed(bars.subList(0, i + 1))
+        }
+        val (h, g) = p.hitStats()
+        assertEquals(NextCandlePredictor.WINDOW, g)
+        assertTrue("trafność na żywo $h/$g", h.toDouble() / g > 0.5)
+    }
+
     @Test fun exportImportRoundTrip() {
         val bars = momentumBars(800, seed = 3)
         val a = NextCandlePredictor().apply { warmUp(bars.take(700)) }

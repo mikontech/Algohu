@@ -48,7 +48,8 @@ class NextCandlePredictor {
     var samples = 0L
         private set
     private var lastTrainedStart = Long.MIN_VALUE
-    private var pending: Prediction? = null
+    /** Prognozy czekające na swoją świecę. Prognoza dla B+1 powstaje w trakcie B, a w trakcie B+1 już kolejna – nie nadpisujemy. */
+    private val pending = ArrayDeque<Prediction>()
     var last: Prediction? = null
         private set
 
@@ -67,12 +68,10 @@ class NextCandlePredictor {
      */
     fun onBarClosed(closed: List<Bar>) {
         val bar = closed.lastOrNull() ?: return
-        pending?.let { p ->
-            if (p.forBarStart == bar.start) {
-                if (bar.close != bar.open) push((bar.close > bar.open) == p.up)
-                pending = null
-            } else if (p.forBarStart < bar.start) pending = null
+        pending.firstOrNull { it.forBarStart == bar.start }?.let { p ->
+            if (bar.close != bar.open) push((bar.close > bar.open) == p.up)
         }
+        pending.removeAll { it.forBarStart <= bar.start }
         train(closed)
     }
 
@@ -93,7 +92,9 @@ class NextCandlePredictor {
             atr = atr,
             madeAt = now
         )
-        pending = p
+        pending.removeAll { it.forBarStart == p.forBarStart }
+        pending.addLast(p)
+        while (pending.size > 5) pending.removeFirst()
         last = p
         return p
     }
