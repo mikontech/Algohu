@@ -379,6 +379,7 @@ class BotOrchestrator(
      * zamknięte przeciwko pozycji (korpus ≥ 0,3×ATR każda) przy stracie = świece nie idą tak, jak powinny.
      */
     private suspend fun candleEarlyExit(inst: String, now: Long) {
+        if (!EARLY_LOSS_EXITS) return
         val pos = risk.position(inst) ?: return
         if (pos.entryReason.startsWith(AI_TAG)) return
         val a = aggregators["$inst@${Learner.M1}"] ?: return
@@ -418,10 +419,10 @@ class BotOrchestrator(
                 val vtp = pos.entryPrice + dir * maxOf(AI_VTP_ATR * (aggregators["$inst@${Learner.M1}"]?.closed()?.takeLast(60)?.let { Indicators.atr(it) } ?: r), t?.expBody ?: 0.0)
                 if (t?.trailing == true) "🚀 jadę za impulsem: trailing $sl – zamknę przy pierwszym wyhamowaniu (knot/zawrócenie świecy)"
                 else "Cel ${f(vtp)}: przy celu z silnym impulsem NIE zamykam (trailing), bez impulsu zamykam. " +
-                    "Wcześniej: gdy świeca prognozy zamknie się przeciwnie przy stracie ≥ 0,5R albo po 4 świecach bez ruchu. $sl"
+                    "Po 4 świecach bez ruchu zamknę tylko na zero/plus; na minusie czekam – stratę zamyka tylko SL. $sl"
             } else {
                 "TP ${pos.takeProfit?.let { f(it) } ?: "—"} • $sl (od +1R stop na wejście, dalej 1R za ceną). " +
-                    "Przy wystrzale świecy (od +0,7×ATR zysku): TP dalej, SL za ceną. Wcześniej: gdy 3 świece 1m zamkną się przeciwko pozycji przy stracie ≥ 0,5R."
+                    "Przy wystrzale świecy (od +0,7×ATR zysku): TP dalej, SL za ceną. Na minusie nie zamykam – stratę zamyka tylko SL."
             }
             "$head\n$exit"
         } else {
@@ -610,10 +611,13 @@ class BotOrchestrator(
                     val pb = closed.lastOrNull { it.start == predEnd - Learner.M1 }
                     if (pb != null) {
                         t.predChecked = true
-                        if ((pb.close - pb.open) * dir < 0 && pnlR <= -AI_WRONG_CANDLE_MIN_LOSS_R) { aiClose(inst, pos, px, t, "prognoza chybiona – świeca przeciwnie, strata %.1fR".format(pnlR)); return }
+                        if (EARLY_LOSS_EXITS && (pb.close - pb.open) * dir < 0 && pnlR <= -AI_WRONG_CANDLE_MIN_LOSS_R) { aiClose(inst, pos, px, t, "prognoza chybiona – świeca przeciwnie, strata %.1fR".format(pnlR)); return }
                     }
                 }
-                if (ts >= predEnd + AI_MAX_EXTRA_BARS * Learner.M1 && pnlR < 0.3) { aiClose(inst, pos, px, t, "czas – ruch nie doszedł do TP"); return }
+                // Wyjście czasowe tylko „na zero lub plus” – stratę zamyka wyłącznie SL (15–20 PLN), cena ma czas odbić.
+                if (ts >= predEnd + AI_MAX_EXTRA_BARS * Learner.M1 && pnlR >= 0.0 && pnlR < 0.3 && px != pos.entryPrice) {
+                    aiClose(inst, pos, px, t, "czas – ruch nie doszedł do celu, zamykam bez straty"); return
+                }
             }
         }
         if (!t.trailing) return
@@ -1340,6 +1344,8 @@ class BotOrchestrator(
         const val IMPULSE_MIN_ATR = 0.7          // przesuwanie TP/SL za impulsem od zysku 0,7×ATR
         const val SL_MIN_PLN = 15.0              // strata przy SL: min. 15 PLN…
         const val SL_MAX_PLN = 20.0              // …maks. 20 PLN (przy stałym locie)
+        /** false = bot sam nie zamyka pozycji na minusie (stratę zamyka tylko SL 15–20 PLN / koniec sesji). */
+        const val EARLY_LOSS_EXITS = false
         const val AI_WRONG_CANDLE_MIN_LOSS_R = 0.5 // „świeca przeciw” zamyka dopiero przy stracie ≥ 0,5R
         const val AI_SAFETY_TP_R = 3.0           // TP w XTB daleko (3R) – właściwe wyjście prowadzi bot
         const val AI_VTP_ATR = 1.0               // TP wirtualny ≥ 1×ATR (lub prognozowany korpus, jeśli większy)
