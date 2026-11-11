@@ -7,7 +7,9 @@ import android.view.Gravity
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import com.example.algohud.BuildConfig
 import com.example.algohud.bot.DirectionModel
+import com.example.algohud.execution.UiActionRecovery
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -18,6 +20,18 @@ class DirectionBarsView(context: Context) : LinearLayout(context) {
     private val status = TextView(context).apply {
         textSize = 10f
         setTextColor(0xFFBBBBBB.toInt())
+    }
+    private val recoveryStatus = TextView(context).apply {
+        textSize = 11f
+        setPadding(0, dp(4), 0, 0)
+        setTextColor(0xFFFFCC80.toInt())
+    }
+    private var lastFailure: UiActionRecovery.Block? = null
+    private val recoveryRefresh = object : Runnable {
+        override fun run() {
+            renderRecovery()
+            if (isAttachedToWindow) postDelayed(this, 1_000L)
+        }
     }
     private val rows: List<Row>
 
@@ -35,7 +49,40 @@ class DirectionBarsView(context: Context) : LinearLayout(context) {
             addRow("Neutralny", 0xFF90A4AE.toInt())
         )
         addView(status)
+        addView(recoveryStatus)
         showPrediction(null)
+        renderRecovery()
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        removeCallbacks(recoveryRefresh)
+        post(recoveryRefresh)
+    }
+
+    override fun onDetachedFromWindow() {
+        removeCallbacks(recoveryRefresh)
+        super.onDetachedFromWindow()
+    }
+
+    private fun renderRecovery() {
+        val active = UiActionRecovery.blocked
+        if (active != null) lastFailure = active
+        recoveryStatus.text = buildString {
+            append("Wersja: ").append(BuildConfig.GIT_SHA)
+            when {
+                active != null -> {
+                    append("\nBILET — NOWE WEJŚCIA ZABLOKOWANE")
+                    active.instrument?.let { append(" (").append(it).append(')') }
+                    append("\n").append(active.reason)
+                }
+                lastFailure != null -> {
+                    append("\nBrak aktywnej blokady. Ostatni błąd tej sesji:")
+                    append("\n").append(lastFailure?.reason)
+                }
+                else -> append("\nBilet: brak zgłoszonej blokady. Nie oznacza to potwierdzonego resetu.")
+            }
+        }
     }
 
     private fun addRow(label: String, color: Int): Row {
