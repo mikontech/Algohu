@@ -157,8 +157,8 @@ class ExecutionEngine(
             return ExecutionResult.Filled("PAPER-${order.clientOrderId}", order.referencePrice, order.quantity)
         }
         (if (_mode.value == ExecutionMode.AUTO) executor.autoReadiness() else executor.readiness())?.let { reason ->
-            _mode.value = ExecutionMode.DRY_RUN
-            log("🔒 Wykonawca niegotowy ($reason) – powrót do DRY_RUN")
+            // Bez przełączania na DRY_RUN: chwilowy stan ekranu (np. po nieudanym wejściu) nie może wyłączać bota na stałe.
+            log("⏳ Wykonawca chwilowo niegotowy ($reason) – pomijam to zlecenie, tryb ${_mode.value} bez zmian")
             return ExecutionResult.Rejected(reason)
         }
         val result = withTimeoutOrNull(executorTimeoutMs) { executor.submit(order) }
@@ -1230,7 +1230,26 @@ class AutoExecutionService : AccessibilityService() {
      * Wejście w XTB: wolumen → Stop Loss → Take Profit (w bilecie, PRZED kliknięciem) → Buy/Sell.
      * Bez poprawnie ustawionego SL zlecenie NIE jest wysyłane.
      */
+    private var entryBaseline: TicketSlTpState? = null
+
+    /** Wejście + sprzątanie: gdy zlecenie NIE poszło, suwaki SL/TP wracają od razu do stanu sprzed wejścia. */
     private suspend fun performXtbEntry(order: OrderRequest): ExecutionResult {
+        entryBaseline = null
+        val r = performXtbEntryInner(order)
+        val base = entryBaseline
+        if (base != null && (r is ExecutionResult.Rejected || (r is ExecutionResult.Failed && appRoot()?.let { findOrderConfirm(it) } == null))) {
+            runCatching {
+                restoreTicketTop()
+                val err = applyFormToggle("StopLossContainer", "StopLossToggle", base.slEnabled, base.slValue)?.let { "SL: $it" }
+                    ?: applyFormToggle("TakeProfitContainer", "TakeProfitToggle", base.tpEnabled, base.tpValue)?.let { "TP: $it" }
+                restoreTicketTop()
+                _uiEvents.tryEmit(if (err == null) "↩️ ${order.symbol}: wejście nieudane – suwaki SL/TP przywrócone" else "⚠️ ${order.symbol}: wejście nieudane, suwaki nie wróciły ($err)")
+            }
+        }
+        return r
+    }
+
+    private suspend fun performXtbEntryInner(order: OrderRequest): ExecutionResult {
         val q = screenQuote.value
         val sidePx = q?.let { if (order.side == Side.BUY) it.ask else it.bid }
             ?: return ExecutionResult.Rejected("brak ceny Buy/Sell na ekranie XTB")
@@ -1241,6 +1260,7 @@ class AutoExecutionService : AccessibilityService() {
 
         // Stan suwaków SL/TP i lista pozycji PRZED wejściem – do weryfikacji i późniejszego przywrócenia formularza.
         val formBefore = runCatching { readTicketSlTp() }.getOrNull()
+        entryBaseline = formBefore
         val rowsBefore = appRoot()?.let { runCatching { readPositionRows(it) }.getOrNull() }.orEmpty()
         val formOp = formBefore?.let { formCoordinator.beginEntry(order.clientOrderId, order.symbol, it) }
         if (formBefore == null) _uiEvents.tryEmit("⚠️ ${order.symbol}: nie odczytano suwaków SL/TP – po wejściu nie zostaną przywrócone")
