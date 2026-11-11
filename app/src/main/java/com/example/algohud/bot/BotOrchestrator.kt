@@ -366,6 +366,7 @@ class BotOrchestrator(
 
     private fun stratName(reason: String) = when {
         reason.startsWith(AI_TAG) -> "🕯️ ŚWIECE+AI"
+        reason.startsWith("SMC") -> "🏦 SMC"
         reason.startsWith("RT") -> "⚡ RT impuls"
         reason.startsWith("ORB") -> "⚡ ORB otwarcie"
         reason.startsWith("ZAKRES") -> "📈 ZAKRES"
@@ -415,7 +416,7 @@ class BotOrchestrator(
                 "(${stratName(pos.entryReason)}) • %+.2fR".format(pnlR)
             val sl = "SL ${f(pos.stopPrice)}" + if (pos.stopPrice != pos.initialStop) " (przesunięty)" else ""
             val exit = if (BROKER_EXITS_ONLY) {
-                "Zamknę WYŁĄCZNIE w XTB: TP ${pos.takeProfit?.let { f(it) } ?: "—"} (zysk) albo $sl (strata). Od +8 zł zysku SL na wejście, dalej 10 zł za ceną; zmiany SL w otwartej pozycji XTB."
+                "Zamknę WYŁĄCZNIE w XTB: TP ${pos.takeProfit?.let { f(it) } ?: "—"} (zysk) albo $sl (strata). +1R → SL na BE, od +1,5R SL 1R za ceną; zmiany SL w otwartej pozycji XTB. Zero ręcznego przesuwania SL na stratę."
             } else if (pos.entryReason.startsWith(AI_TAG)) {
                 val t = aiTrades[inst]
                 val vtp = pos.entryPrice + dir * maxOf(AI_VTP_ATR * (aggregators["$inst@${Learner.M1}"]?.closed()?.takeLast(60)?.let { Indicators.atr(it) } ?: r), t?.expBody ?: 0.0)
@@ -436,7 +437,7 @@ class BotOrchestrator(
             }
             listOfNotNull(
                 "🧭 PLAN: CZEKAM" + (block?.let { " – $it" } ?: " – żadna z 4 strategii nie daje jeszcze sygnału"),
-                "• 🕯️ AI: " + (aiNote[inst]?.removePrefix("⏸ ") ?: "prognoza od 30 s świecy, wejdę gdy szansa i trafność będą wystarczające"),
+                smcPlan(inst, sh),
                 "• ⚡ RT: " + (rtInfo[inst] ?: "zbieram świece 1m…") + (orb?.let { "\n• ⚡ ORB: $it" } ?: ""),
                 "• 📈 " + (rangeInfo[inst] ?: "ZAKRES: zbieram świece 1m…"),
                 traderNote[inst]?.let { "• 🎩 Trader: ostatni sygnał odpuszczony – $it" },
@@ -487,6 +488,7 @@ class BotOrchestrator(
             val px = lastPx[inst]?.first ?: continue
             aiPredictTick(inst, px, now)
             candleEarlyExit(inst, now)
+            smcTick(inst, px, now)
             if (inst == hudLearningInstrument) updatePlan(inst, now)
             if (inst == hudLearningInstrument) {
                 val lc = lastM1Close[inst] ?: now.also { lastM1Close[inst] = it }
@@ -524,7 +526,7 @@ class BotOrchestrator(
         if (closed.size < 60) return
         predictedBar[inst] = key
         val p = predictor(inst).predict(closed, cur, tickRatio(inst, ts), Learner.M1, ts, early = !late) ?: return
-        aiEntry(inst, p, px, ts)
+        if (AI_PREDICTOR_ENTRIES) aiEntry(inst, p, px, ts)
         if (inst == hudLearningInstrument) updatePredictionHud(inst)
     }
 
@@ -593,19 +595,21 @@ class BotOrchestrator(
             val perPrice = pos.quantity * pos.pointValue // PLN za ruch ceny o 1,0
             if (perPrice > 0) {
                 val bestPln = (best - pos.entryPrice) * dir * perPrice
-                if (bestPln >= BE_AT_PLN) {
+                val rPln = r * perPrice
+                if (bestPln >= maxOf(BE_AT_PLN, rPln)) {
+                    // BE dopiero po +1R (wcześniej to tylko oddawanie pozycji szumowi), od +1,5R SL 1R za najlepszą ceną.
                     val be = pos.entryPrice + dir * maxOf(spreadOf(inst), 0.05)
-                    val trail = best - dir * TRAIL_PLN / perPrice
-                    val target = if ((trail - be) * dir > 0) trail else be
+                    val trail = best - dir * r
+                    val target = if (bestPln >= 1.5 * rPln && (trail - be) * dir > 0) trail else be
                     if (risk.tightenStop(inst, target) && !t.beNoted) {
                         t.beNoted = true
-                        msg("🔒 $inst: zysk %.0f zł – SL na wejście, dalej %.0f zł za najlepszą ceną".format(bestPln, TRAIL_PLN))
+                        msg("🔒 $inst: +1R (%.0f zł) – SL na BE; od +1,5R SL 1R za ceną, TP bez zmian".format(bestPln))
                     }
                 }
             }
-            if (!t.trailing && profitAtr >= IMPULSE_MIN_ATR && cur != null && impulseStrong(inst, cur, dir, atr, ts)) {
+            if (!t.trailing && pnlR >= 2.0 && cur != null && impulseStrong(inst, cur, dir, atr, ts)) {
                 t.trailing = true
-                msg("🚀 $inst: wystrzał świecy – SL ciasno za impulsem")
+                msg("🚀 $inst: +2R i wystrzał świecy – SL ciasno za impulsem")
             }
             if (t.trailing) risk.tightenStop(inst, best - dir * maxOf(AI_TRAIL_ATR * atr, 2 * spreadOf(inst)))
             brokerSync(inst, pos, t, ts, perPrice)
@@ -1130,7 +1134,7 @@ class BotOrchestrator(
 
     private suspend fun buildOrder(
         symbol: String, side: Side, price: Double, stop: Double, takeProfit: Double?, reason: String, pointValue: Double?,
-        tier: Int = 1
+        tier: Int = 1, structural: Boolean = false
     ): OrderRequest? {
         risk.closingOrder(symbol, side, price)?.let { return it.copy(reason = "$reason (zamknięcie)") }
         val pv = pointValue ?: run {
@@ -1147,6 +1151,11 @@ class BotOrchestrator(
             val perPrice = FIXED_LOT * pv // PLN za ruch ceny o 1,0
             if (perPrice > 0) {
                 val loss = abs(price - stop) * perPrice
+                if (structural && loss > SL_MAX_PLN) {
+                    // SL strukturalny (za sweepem) – NIE przyciągamy go bliżej, bo wtedy staje się płynnością dla rynku.
+                    smcNote[symbol] = "punkt zanegowania za daleko: SL %.0f zł > %.0f zł – odpuszczam".format(loss, SL_MAX_PLN)
+                    return null
+                }
                 val target = loss.coerceIn(SL_MIN_PLN, SL_MAX_PLN)
                 if (abs(loss - target) > 0.01) stop = price - d * target / perPrice
             }
@@ -1170,7 +1179,15 @@ class BotOrchestrator(
         }
         // TP zamyka z zyskiem, SL ze stratą: TP = TP_R × odległość SL (SL 15–20 zł → TP ok. 22–30 zł).
         val d = if (side == Side.BUY) 1 else -1
-        val tp = price + d * TP_R * abs(price - stop)
+        val tp = if (structural && takeProfit != null) takeProfit else price + d * TP_R * abs(price - stop)
+        if (structural) {
+            val rr = abs(tp - price) / abs(price - stop)
+            if (rr < SmcEngine.MIN_RR) {
+                smcNote[symbol] = "po dociągnięciu SL do 15 zł R:R 1:%.1f < 1:%.1f – odpuszczam".format(rr, SmcEngine.MIN_RR)
+                return null
+            }
+            return OrderRequest(symbol, side, qty, price, stop, reason, pointValue = pv, takeProfit = tp, tier = tier, fixedSize = true)
+        }
         traderCheck(symbol, side, price, stop, tp)?.let { why ->
             if (rtNotes.add("trader:$symbol:$why:${System.currentTimeMillis() / 60_000}")) msg("🎩 $symbol: $reason – odpuszczam: $why")
             traderNote[symbol] = why
@@ -1181,6 +1198,55 @@ class BotOrchestrator(
     }
 
     private val traderNote = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    // ───────────── 🏦 SMC: sweep płynności → CHoCH → wejście, SL za ekstremum, TP na przeciwnej płynności ─────────────
+
+    private val smc = SmcEngine()
+    private val smcResult = java.util.concurrent.ConcurrentHashMap<String, SmcEngine.Result>()
+    private val smcNote = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val smcTaken = java.util.Collections.synchronizedSet(LinkedHashSet<String>())
+    private val smcSessionCount = HashMap<String, Int>()
+
+    private fun smcEligible(inst: String) = inst.contains("GOLD", ignoreCase = true) || inst.contains("XAU", ignoreCase = true)
+
+    /** Co sekundę (zegar świec): ocena SMC i ewentualne wejście. */
+    private suspend fun smcTick(inst: String, px: Double, now: Long) {
+        if (!smcEligible(inst)) return
+        val m1 = aggregators["$inst@${Learner.M1}"]?.closed() ?: return
+        val m5 = aggregators["$inst@${Learner.M5}"]?.closed().orEmpty()
+        val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
+        val sh = q?.let { basis(inst, it) } ?: 0.0
+        val res = smc.evaluate(m1, m5, px, spreadOf(inst), now, sh)
+        smcResult[inst] = res
+        val s = res.setup ?: return
+        if (s.key in smcTaken) return
+        val sessKey = "$inst:${res.session}:${now / 86_400_000L}"
+        val n = smcSessionCount[sessKey] ?: 0
+        if (n >= SMC_MAX_PER_SESSION) { smcNote[inst] = "limit $SMC_MAX_PER_SESSION wejść w tej sesji – bez overtradingu"; return }
+        risk.position(inst)?.let { smcNote[inst] = "setup jest, ale już w pozycji (${stratName(it.entryReason)})"; return }
+        sessionBlock(inst, now)?.let { smcNote[inst] = it; return }
+        if (risk.cooldownLeftMs() > 0) { smcNote[inst] = "przerwa po stracie ${risk.cooldownLeftMs() / 1000} s"; return }
+        smcTaken.add(s.key); while (smcTaken.size > 100) smcTaken.remove(smcTaken.first())
+        smcNote.remove(inst)
+        val order = buildOrder(inst, s.side, px, s.stop, s.target, s.reason, pointValue(inst), Tier.AGGRESSIVE, structural = true) ?: run {
+            msg("🏦 $inst: ${s.reason} – ${smcNote[inst] ?: "odrzucone"}"); return
+        }
+        smcSessionCount[sessKey] = n + 1
+        msg("🏦 $inst: ${s.reason} – WCHODZĘ")
+        decisionCard(inst, order, Signal(s.side, order.stopPrice, order.takeProfit ?: s.target, s.reason, Tier.AGGRESSIVE), ev = Double.NaN)
+        engine.submit(order)
+    }
+
+    private fun smcPlan(inst: String, sh: Double): String {
+        if (!smcEligible(inst)) return "• 🏦 SMC: tylko złoto (XAU/GOLD)"
+        val r = smcResult[inst] ?: return "• 🏦 SMC: zbieram dane…"
+        fun f(v: Double?) = v?.let { "%.2f".format(it + sh) } ?: "—"
+        val lv = r.levels
+        val head = "• 🏦 SMC: ${r.session.label} • H1 ${when (r.bias) { 1 -> "↑ (HH/HL)"; -1 -> "↓ (LH/LL)"; else -> "↔ brak struktury" }}"
+        val levels = lv?.let { "   Asia H/L ${f(it.asiaHigh)} / ${f(it.asiaLow)} • PDH/PDL ${f(it.pdh)} / ${f(it.pdl)} • swing 1h ${f(it.swingHigh)} / ${f(it.swingLow)}" }
+        val note = "   ↳ " + (smcNote[inst] ?: r.note)
+        return listOfNotNull(head, levels, note).plus(r.scenarios.map { "   ↳ $it" }).joinToString("\n")
+    }
 
     /**
      * „Doświadczony trader” – filtr każdego wejścia (wszystkie strategie). Null = wolno wejść, inaczej powód.
@@ -1193,6 +1259,9 @@ class BotOrchestrator(
         val dir = if (side == Side.BUY) 1 else -1
         val m1 = aggregators["$symbol@${Learner.M1}"]?.closed().orEmpty()
         val m5 = aggregators["$symbol@${Learner.M5}"]?.closed().orEmpty()
+        val now = System.currentTimeMillis()
+        smc.newsBlackout(now)?.let { return it }
+        smc.session(now).let { if (!it.tradable) return "${it.label} – handluję tylko w killzone (Londyn 09–12, NY 14:30–17)" }
         val atr1 = Indicators.atr(m1.takeLast(60)) ?: return null // za mało danych – nie blokujemy
         val spread = spreadOf(symbol)
         if (spread > 0 && spread > 0.25 * atr1) return "spread %.2f to > 25%% ruchu świecy – za drogo".format(spread)
@@ -1447,7 +1516,7 @@ class BotOrchestrator(
         const val AI_EARLY_STEP_MS = 5_000L      // …co 5 s
         const val AI_EARLY_MIN_PROB = 0.60       // wcześniejsze wejście wymaga większej pewności
         const val EARLY_EXIT_BODY_ATR = 0.30     // wcześniejsze wyjście: 2 świece przeciw, korpus ≥ 0,3×ATR
-        const val ALL_LABEL = "🤖 WSZYSTKIE 4 (AI + RT/ORB + ZAKRES + TURNIEJ)"
+        const val ALL_LABEL = "🏦 SMC XAU + RT/ORB + ZAKRES + TURNIEJ (filtr killzone, R:R ≥ 1:2,5)"
         const val AI_MIN_GRADED = 20             // min. ocenionych prognoz na żywo
         const val AI_MIN_ACC = 0.55              // min. trafność z ostatnich 20
         const val AI_MIN_PROB = 0.58             // min. szansa kierunku
@@ -1461,7 +1530,9 @@ class BotOrchestrator(
         const val EARLY_LOSS_EXITS = false
         /** Pozycję zamyka WYŁĄCZNIE Stop Loss (przesuwany za zyskiem); bez TP, bez wyjść bota, bez zamykania na koniec sesji. */
         const val BROKER_EXITS_ONLY = true       // zamyka wyłącznie XTB: TP (zysk) albo SL (strata)
-        const val TP_R = 1.5                     // TP = 1,5 × odległość SL
+        const val TP_R = 2.5                     // TP = 2,5 × odległość SL (min. R:R 1:2,5)
+        const val AI_PREDICTOR_ENTRIES = false   // model świec tylko jako informacja – wejścia daje SMC
+        const val SMC_MAX_PER_SESSION = 2        // bez overtradingu: maks. 2 wejścia SMC na killzone
         const val BE_AT_PLN = 8.0                // od 8 zł zysku SL na wejście (+spread)…
         const val TRAIL_PLN = 10.0               // …i dalej 10 zł za najlepszą ceną
         const val BROKER_STEP_PLN = 2.0          // SL w XTB przesuwany o ≥ 2 zł…
