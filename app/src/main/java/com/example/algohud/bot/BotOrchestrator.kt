@@ -886,6 +886,7 @@ class BotOrchestrator(
             setLoading(inst, "historia zastępcza ${tfLabel(tf)} (Binance $feed)…")
             runCatching { news.historyPaged(feed, tfLabel(tf), Learner.historyBars(tf)) }
                 .onSuccess { h ->
+                    if (h.size < MIN_HISTORY_BARS) msg("⚠️ $inst: historia zastępcza ${tfLabel(tf)} tylko ${h.size} świec – zbieram na żywo")
                     val shift = if (live != null && h.isNotEmpty()) live - h.last().close else 0.0
                     val adj = h.map { b -> b.copy(open = b.open + shift, high = b.high + shift, low = b.low + shift, close = b.close + shift) }
                     setLoading(inst, "uczę się na ${adj.size} świecach ${tfLabel(tf)}…")
@@ -960,7 +961,12 @@ class BotOrchestrator(
             val errors = mutableListOf<String>()
             for (tf in Learner.TIMEFRAMES) {
                 setLoading(inst, "pobieram historię ${tfLabel(tf)} z Pyth…")
-                runCatching { pyth.history(r, (tf / 60_000).toInt(), Learner.historyBars(tf)) }
+                runCatching {
+                    pyth.history(r, (tf / 60_000).toInt(), Learner.historyBars(tf)).also { h ->
+                        // Pyth potrafi odpowiedzieć „no_data” (pusta lista) bez błędu – to też brak historii → zastępstwo z Binance.
+                        if (h.size < MIN_HISTORY_BARS) error("Pyth zwrócił tylko ${h.size} świec")
+                    }
+                }
                     .onSuccess { h ->
                         setLoading(inst, "uczę się na ${h.size} świecach ${tfLabel(tf)}…")
                         lock.withLock {
@@ -1641,6 +1647,8 @@ class BotOrchestrator(
         const val HUD_FEED = "BTCUSDT"
 
         /** Stały wolumen każdej transakcji (loty XTB). */
+        /** Minimum świec historii, żeby uznać źródło za działające (mniej = zastępstwo). */
+        const val MIN_HISTORY_BARS = 100
         const val FIXED_LOT = 0.006
         /** Szacowany depozyt XTB dla złota/CFD (≈5% wartości kontraktu, 1:20) – do sprawdzenia środków przed wejściem. */
         const val MARGIN_RATE_EST = 0.05
