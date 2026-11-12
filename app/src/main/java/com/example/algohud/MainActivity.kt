@@ -1,6 +1,7 @@
 package com.example.algohud
 
 import android.Manifest
+import android.app.AlertDialog
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -62,11 +63,20 @@ class MainActivity : ComponentActivity() {
         }
 
         TextView(this).apply { text = "\nTryb handlu"; textSize = 18f }.also { layout.addView(it) }
-        button("🤖 AUTO – bot sam handluje w XTB") { OverlayService.command(this, OverlayService.ACTION_MODE, "AUTO") }
+        button("🤖 AUTO – bot sam handluje w XTB") {
+            if (!Settings.canDrawOverlays(this) || AutoExecutionService.instance == null) {
+                Toast.makeText(this, "Najpierw nadaj uprawnienie nakładki i włącz usługę ułatwień dostępu", Toast.LENGTH_LONG).show()
+            } else AlertDialog.Builder(this)
+                .setTitle("Włączyć handel AUTO?")
+                .setMessage("Bot będzie mógł wykonywać prawdziwe zlecenia w XTB. Zapisany tryb AUTO jest przywracany po ponownym uruchomieniu HUD. Sprawdź konto i ustawienia przed włączeniem.")
+                .setNegativeButton("Anuluj", null)
+                .setPositiveButton("Włącz AUTO") { _, _ -> OverlayService.command(this, OverlayService.ACTION_MODE, "AUTO") }
+                .show()
+        }
         button("🧪 DRY_RUN – tylko symulacja") { OverlayService.command(this, OverlayService.ACTION_MODE, "DRY_RUN") }
 
         TextView(this).apply {
-            text = "\nStrategia: wszystkie 4 działają razem automatycznie\n🕯️ Świece + AI • ⚡ RT/ORB • 📈 Zakres • 🧠 Turniej\nPierwsza z sygnałem otwiera pozycję (stały lot 0.006); plan widać w HUD."
+            text = "\nProfil AGRESYWNY+: wcześniejsze wejścia, ochrona zysku przy odwróceniu\n🕯️ Świece + AI • ⚡ RT/ORB • 📈 Zakres • 🧠 Turniej\nLot 0.006; BUY: ochrona zysku przy spadku, SELL: przy wzroście. Szacowany zysk po spreadzie, bez gwarancji ceny wykonania. Plan w HUD."
             textSize = 15f
         }.also { layout.addView(it) }
 
@@ -162,7 +172,8 @@ class MainActivity : ComponentActivity() {
         status.text = buildString {
             appendLine("Nakładka: " + if (Settings.canDrawOverlays(this@MainActivity)) "✅" else "❌")
             appendLine("Ułatwienia dostępu: " + if (AutoExecutionService.instance != null) "✅" else "❌ (potrzebne tylko w Wariancie B)")
-            append("Domyślny tryb: DRY_RUN (paper trading)")
+            appendLine("Zapisany tryb: " + getSharedPreferences("ui", MODE_PRIVATE).getString("mode", "DRY_RUN"))
+            append("Aktualny tryb sprawdzisz w HUD lub powiadomieniu. Wersja ${BuildConfig.VERSION_NAME} (${BuildConfig.GIT_SHA})")
         }
     }
 }

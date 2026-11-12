@@ -416,7 +416,7 @@ class BotOrchestrator(
                 "(${stratName(pos.entryReason)}) • %+.2fR".format(pnlR)
             val sl = "SL ${f(pos.stopPrice)}" + if (pos.stopPrice != pos.initialStop) " (przesunięty)" else ""
             val exit = if (BROKER_EXITS_ONLY) {
-                "Zamknę WYŁĄCZNIE w XTB: TP ${pos.takeProfit?.let { f(it) } ?: "—"} (zysk) albo $sl (strata). +1R → SL na BE, od +1,5R SL 1R za ceną; zmiany SL w otwartej pozycji XTB. Zero ręcznego przesuwania SL na stratę."
+                "Ochrona zysku: przy 3 kolejnych cofnięciach przez ≥4 s i dodatnim wyniku po spreadzie zamykam wcześniej. Zostają TP ${pos.takeProfit?.let { f(it) } ?: "—"} (zysk) albo $sl (strata). +1R → SL na BE, od +1,5R SL 1R za ceną; zmiany SL w otwartej pozycji XTB. Zero ręcznego przesuwania SL na stratę."
             } else if (pos.entryReason.startsWith(AI_TAG)) {
                 val t = aiTrades[inst]
                 val vtp = pos.entryPrice + dir * maxOf(AI_VTP_ATR * (aggregators["$inst@${Learner.M1}"]?.closed()?.takeLast(60)?.let { Indicators.atr(it) } ?: r), t?.expBody ?: 0.0)
@@ -572,9 +572,51 @@ class BotOrchestrator(
         var brokerAt: Long = 0L,
         var brokerBusy: Boolean = false,
         var closing: Boolean = false,
-        var beNoted: Boolean = false
+        var beNoted: Boolean = false,
+        val profitGuard: ProfitReversalGuard = ProfitReversalGuard(),
+        var nextProfitAttemptAt: Long = 0L
     )
     private val aiTrades = HashMap<String, AiTrade>()
+    private val profitReentryAfter = HashMap<String, Long>()
+
+    /** A profitable reversal is an exception to broker-only exits; protective SL/TP remain in place. */
+    private suspend fun protectProfit(inst: String, pos: com.example.algohud.core.Position,
+                                      px: Double, ts: Long, atr: Double, t: AiTrade): Boolean {
+        val now = System.currentTimeMillis()
+        if (now < t.nextProfitAttemptAt) return false
+        val real = !pos.paper && engine.mode.value != ExecutionMode.DRY_RUN
+        val q = AutoExecutionService.screenQuote.value
+        // Real exits require a fresh quote of this instrument and both valid sides.
+        if (real && (q == null || q.instrument != inst || q.timestamp > now + 2_000 ||
+                now - q.timestamp > 8_000 || q.bid == null || q.ask == null ||
+                !q.bid.isFinite() || !q.ask.isFinite() || q.bid <= 0 || q.ask <= q.bid)) return false
+        val spread = if (real) q!!.ask!! - q.bid!! else spreadOf(inst)
+        // Ledger entry and feed share a coordinate system. Quote spread gives the executable exit side.
+        val exitPx = px - pos.side.sign * spread / 2
+        if (!t.profitGuard.shouldClose(pos, exitPx, spread, atr, ts, now)) return false
+        if (t.brokerBusy || AutoExecutionService.actionActive.value) return false
+        val close = risk.closingOrder(inst, pos.side.opposite(), exitPx) ?: return false
+        t.nextProfitAttemptAt = now + 20_000
+        t.closing = true
+        val reason = "OCHRONA ZYSKU: potwierdzone odwrócenie przeciw pozycji"
+        msg("🏁 $inst: $reason – szacowany wynik po spreadzie dodatni")
+        try {
+            val result = engine.submit(close.copy(reason = reason), bypassConfirmation = true)
+            if (result is ExecutionResult.Filled || result is ExecutionResult.Submitted) {
+                profitReentryAfter[inst] = System.currentTimeMillis() + 30_000
+            } else {
+                t.closing = false
+                msg("⚠️ $inst: zamknięcie zysku niepotwierdzone; ponowna ocena za 20 s, SL/TP pozostają")
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            t.closing = false
+            throw e
+        } catch (e: Exception) {
+            t.closing = false
+            msg("⚠️ $inst: błąd zamknięcia zysku; ponowna ocena za 20 s, SL/TP pozostają")
+        }
+        return true
+    }
 
     private suspend fun aiManage(inst: String, px: Double, ts: Long) {
         val pos = risk.position(inst) ?: run { aiTrades.remove(inst); return }
@@ -591,6 +633,7 @@ class BotOrchestrator(
         val profitAtr = (px - pos.entryPrice) * dir / atr
 
         val pnlR = (px - pos.entryPrice) * dir / r
+        if (protectProfit(inst, pos, px, ts, atr, t)) return
         if (BROKER_EXITS_ONLY) {
             // Tylko SL: stop prowadzony w złotówkach i przesuwany W OTWARTEJ POZYCJI w XTB (ekran edycji pozycji).
             val best = if (dir > 0) maxOf(pos.best, px) else minOf(pos.best, px)
@@ -1168,10 +1211,15 @@ class BotOrchestrator(
     // ───────────── Rdzeń: wyjścia, świece, sygnały ─────────────
 
     private suspend fun processPrice(inst: String, px: Double, tsRaw: Long) {
-        // Znacznik z przyszłości (zły zegar źródła) zablokowałby świece – przycinamy do teraz.
-        val ts = minOf(tsRaw, System.currentTimeMillis() + 2_000)
+        // Never base a profit exit or new candle on invalid, stale or out-of-order ticks.
+        val now = System.currentTimeMillis()
+        if (!px.isFinite() || px <= 0 || tsRaw <= 0 || tsRaw > now + 2_000 ||
+            now - tsRaw > DataQuality.FEED_MAX_AGE_MS || tsRaw <= (lastPx[inst]?.second ?: 0L)) return
+        val ts = tsRaw
         lastPx[inst] = px to ts
+        var protectiveExit = false
         risk.onMark(inst, px)?.let { exit ->
+            protectiveExit = true
             val real = engine.mode.value != ExecutionMode.DRY_RUN && risk.position(inst)?.paper == false
             if (real && AutoExecutionService.instance?.xtbPositionExists(inst) == false) {
                 // XTB zamknęło pozycję własnym SL/TP szybciej niż bot – tylko księgujemy.
@@ -1185,7 +1233,7 @@ class BotOrchestrator(
                 msg("⚠️ $inst: zamknięcie (${exit.reason}) nieudane – ponowię za 20 s; pozycję chroni SL w XTB")
             }
         }
-        aiManage(inst, px, ts)
+        if (!protectiveExit) aiManage(inst, px, ts)
         countTick(inst, ts)
         for (tf in Learner.TIMEFRAMES) {
             val a = agg(inst, tf)
@@ -1260,6 +1308,7 @@ class BotOrchestrator(
         tier: Int = 1, structural: Boolean = false
     ): OrderRequest? {
         risk.closingOrder(symbol, side, price)?.let { return it.copy(reason = "$reason (zamknięcie)") }
+        if (System.currentTimeMillis() < (profitReentryAfter[symbol] ?: 0L)) return null
         dataBlock(symbol)?.let { why ->
             if (rtNotes.add("data:$symbol:$why:${System.currentTimeMillis() / 60_000}")) { msg("📡 $symbol: $reason – wstrzymane: $why"); countBlock("📡 $why") }
             return null
@@ -1661,7 +1710,7 @@ class BotOrchestrator(
         const val AI_EARLY_STEP_MS = 5_000L      // …co 5 s
         const val AI_EARLY_MIN_PROB = 0.60       // wcześniejsze wejście wymaga większej pewności
         const val EARLY_EXIT_BODY_ATR = 0.30     // wcześniejsze wyjście: 2 świece przeciw, korpus ≥ 0,3×ATR
-        const val ALL_LABEL = "🏦 SMC XAU + RT/ORB + ZAKRES + TURNIEJ (całą dobę, R:R ≥ 1:2,5)"
+        const val ALL_LABEL = "⚡ AGRESYWNY+ • SMC + RT/ORB + ZAKRES + TURNIEJ • ochrona zysku"
         const val AI_MIN_GRADED = 20             // min. ocenionych prognoz na żywo
         const val AI_MIN_ACC = 0.55              // min. trafność z ostatnich 20
         const val AI_MIN_PROB = 0.58             // min. szansa kierunku
@@ -1674,11 +1723,11 @@ class BotOrchestrator(
         const val SMC_SL_MIN_PLN = 8.0           // SMC: SL strukturalny, min. 8 PLN (szum), maks. 20 PLN
         /** false = bot sam nie zamyka pozycji na minusie (stratę zamyka tylko SL 15–20 PLN / koniec sesji). */
         const val EARLY_LOSS_EXITS = false
-        /** Pozycję zamyka WYŁĄCZNIE Stop Loss (przesuwany za zyskiem); bez TP, bez wyjść bota, bez zamykania na koniec sesji. */
-        const val BROKER_EXITS_ONLY = true       // zamyka wyłącznie XTB: TP (zysk) albo SL (strata)
+        /** Bazowe SL/TP u brokera; protectProfit może wcześniej zamknąć zysk przy odwróceniu. */
+        const val BROKER_EXITS_ONLY = true       // SL/TP + wyjątek: potwierdzona ochrona zysku
         const val TP_R = 2.5                     // TP = 2,5 × odległość SL (min. R:R 1:2,5)
         const val AI_PREDICTOR_ENTRIES = false   // model świec tylko jako informacja – wejścia daje SMC
-        const val SMC_MAX_PER_SESSION = 2        // bez overtradingu: maks. 2 wejścia SMC na sesję
+        const val SMC_MAX_PER_SESSION = 3        // maks. 3 odrębne setupy SMC na sesję
         const val TRADE_ALL_SESSIONS = true      // handel cały czas (Azja, Londyn, NY); blackout tylko wokół danych USA
         const val BE_AT_PLN = 8.0                // od 8 zł zysku SL na wejście (+spread)…
         const val TRAIL_PLN = 10.0               // …i dalej 10 zł za najlepszą ceną
@@ -1694,18 +1743,18 @@ class BotOrchestrator(
         const val AI_BROKER_STEP_ATR = 0.5       // …i o ≥ 0,5×ATR
 
         // Profil agresywny – progi wejść w czasie rzeczywistym
-        const val RT_RANGE_ATR = 1.2      // zasięg bieżącej świecy ≥ 1,2 × ATR14
+        const val RT_RANGE_ATR = 1.0      // wcześniejszy impuls: zasięg ≥ 1,0 × ATR14
         const val AGGRESSIVE_COOLDOWN_MS = 3 * 60_000L // przerwa po stracie w profilu agresywnym / zakres
         // ZAKRES (dół → góra)
         const val RANGE_LOOKBACK = 30          // zakres = High/Low ostatnich 30 świec 1m
         const val RANGE_ZONE = 0.20            // dolne/górne 20% zakresu
-        const val RANGE_CONFIRM_ATR = 0.3      // odbicie o ≥ 0,3×ATR od dołka/szczytu = potwierdzenie
+        const val RANGE_CONFIRM_ATR = 0.25      // odbicie o ≥ 0,3×ATR od dołka/szczytu = potwierdzenie
         const val RANGE_MAX_TREND_ATR = 1.0    // silny trend → nie gramy zakresu
         const val RANGE_MIN_WIDTH_ATR = 2.0    // zakres musi mieć ≥ 2×ATR
         const val RANGE_MIN_REWARD_R = 1.0     // cel ≥ 1× ryzyko
-        const val RT_BODY_RATIO = 0.70    // korpus ≥ 70% zasięgu
-        const val RT_MAX_WICK = 0.15      // knot po stronie ruchu ≤ 15% zasięgu
-        const val RT_LOOKBACK = 10        // wybicie High/Low ostatnich 10 świec 1m
+        const val RT_BODY_RATIO = 0.65    // korpus ≥ 65% zasięgu
+        const val RT_MAX_WICK = 0.20      // knot po stronie ruchu ≤ 20% zasięgu
+        const val RT_LOOKBACK = 8         // wybicie High/Low ostatnich 8 świec 1m
         const val ORB_RANGE_MIN = 5L      // zasięg otwarcia = pierwsze 5 min
         const val ORB_ACTIVE_MIN = 15L    // tryb Open Breakout przez 15 min od otwarcia
         const val SESSION_NO_ENTRY_MIN = 30L // brak nowych wejść 30 min przed zamknięciem sesji
