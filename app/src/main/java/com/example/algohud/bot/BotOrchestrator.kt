@@ -185,7 +185,7 @@ class BotOrchestrator(
 
     /**
      * on_tick: zakres = High/Low ostatnich [RANGE_LOOKBACK] świec 1m.
-     *  LONG: cena zeszła do dolnych 20% zakresu, potem odbiła o ≥ 0,3×ATR od najniższego punktu (potwierdzenie dołka)
+     *  LONG: cena zeszła do dolnych 20% zakresu, potem odbiła o ≥ 0,25×ATR od najniższego punktu (potwierdzenie dołka)
      *        → wejście; SL pod dołkiem (−0,3×ATR); TP przy górze zakresu (górne 20%).
      *  SHORT: lustrzanie przy górze. Silny trend (|EMA20−EMA50| > 1×ATR) = brak gry w zakresie (zakres się "rozjeżdża").
      */
@@ -257,7 +257,7 @@ class BotOrchestrator(
 
     /**
      * on_candle_update dla świecy 1m: wejście W TRAKCIE świecy, gdy
-     *  zasięg ≥ 1,2×ATR14, korpus ≥ 70% zasięgu, knot po stronie ruchu ≤ 15% zasięgu
+     *  zasięg ≥ 1,0×ATR14, korpus ≥ 65% zasięgu, knot po stronie ruchu ≤ 20% zasięgu
      *  i cena wybija High/Low ostatnich [RT_LOOKBACK] zamkniętych świec. Jedno wejście na świecę.
      */
     private suspend fun realtimeCheck(inst: String, px: Double, ts: Long) {
@@ -1442,6 +1442,7 @@ class BotOrchestrator(
         // Koszt względem ryzyka transakcji (SL 15–20 zł ≈ 6–8 USD), a nie względem świecy 1m.
         if (spread > 0 && spread > 0.2 * abs(price - stop)) return "spread %.2f to > 20%% odległości SL – za drogo".format(spread)
         if (spread > 0 && atr1 < spread) return "rynek martwy (świeca 1m %.2f < spread)".format(atr1)
+        if (!TRADER_STRICT) return null
         if (m5.size >= 60) {
             val c5 = m5.map { it.close }
             val e20 = Indicators.ema(c5, 20); val e50 = Indicators.ema(c5, 50); val atr5 = Indicators.atr(m5.takeLast(60))
@@ -1712,7 +1713,10 @@ class BotOrchestrator(
         const val BROKER_EXITS_ONLY = true       // zamyka wyłącznie XTB: TP (zysk) albo SL (strata)
         const val TP_R = 2.5                     // TP = 2,5 × odległość SL (min. R:R 1:2,5)
         const val AI_PREDICTOR_ENTRIES = false   // model świec tylko jako informacja – wejścia daje SMC
-        const val SMC_MAX_PER_SESSION = 2        // bez overtradingu: maks. 2 wejścia SMC na sesję
+        const val SMC_MAX_PER_SESSION = 3        // maks. 3 wejścia SMC na sesję
+        /** false = więcej wejść: bez filtrów „pod prąd trendu 5m”, „nie gonię” i „opór/wsparcie za blisko”.
+         *  Zawsze zostają: przerwa wokół danych USA, koszt spreadu i martwy rynek. */
+        const val TRADER_STRICT = false
         /**
          * Bramka prawdziwych zleceń RT/ORB/ZAKRES/SMC ([StrategyProof]): LIVE – handel od razu, strategia z ujemną średnią
          * ostatnich 20 prób „na sucho” jest wstrzymana do poprawy; STRICT – dopiero po udowodnionej przewadze; OFF – bez bramki.
@@ -1733,18 +1737,18 @@ class BotOrchestrator(
         const val AI_BROKER_STEP_ATR = 0.5       // …i o ≥ 0,5×ATR
 
         // Profil agresywny – progi wejść w czasie rzeczywistym
-        const val RT_RANGE_ATR = 1.2      // zasięg bieżącej świecy ≥ 1,2 × ATR14
+        const val RT_RANGE_ATR = 1.0      // zasięg bieżącej świecy ≥ 1,0 × ATR14
         const val AGGRESSIVE_COOLDOWN_MS = 3 * 60_000L // przerwa po stracie w profilu agresywnym / zakres
         // ZAKRES (dół → góra)
         const val RANGE_LOOKBACK = 30          // zakres = High/Low ostatnich 30 świec 1m
         const val RANGE_ZONE = 0.20            // dolne/górne 20% zakresu
-        const val RANGE_CONFIRM_ATR = 0.3      // odbicie o ≥ 0,3×ATR od dołka/szczytu = potwierdzenie
+        const val RANGE_CONFIRM_ATR = 0.25     // odbicie o ≥ 0,25×ATR od dołka/szczytu = potwierdzenie
         const val RANGE_MAX_TREND_ATR = 1.0    // silny trend → nie gramy zakresu
         const val RANGE_MIN_WIDTH_ATR = 2.0    // zakres musi mieć ≥ 2×ATR
         const val RANGE_MIN_REWARD_R = 1.0     // cel ≥ 1× ryzyko
-        const val RT_BODY_RATIO = 0.70    // korpus ≥ 70% zasięgu
-        const val RT_MAX_WICK = 0.15      // knot po stronie ruchu ≤ 15% zasięgu
-        const val RT_LOOKBACK = 10        // wybicie High/Low ostatnich 10 świec 1m
+        const val RT_BODY_RATIO = 0.65    // korpus ≥ 65% zasięgu
+        const val RT_MAX_WICK = 0.20      // knot po stronie ruchu ≤ 20% zasięgu
+        const val RT_LOOKBACK = 8         // wybicie High/Low ostatnich 8 świec 1m
         const val ORB_RANGE_MIN = 5L      // zasięg otwarcia = pierwsze 5 min
         const val ORB_ACTIVE_MIN = 15L    // tryb Open Breakout przez 15 min od otwarcia
         const val SESSION_NO_ENTRY_MIN = 30L // brak nowych wejść 30 min przed zamknięciem sesji

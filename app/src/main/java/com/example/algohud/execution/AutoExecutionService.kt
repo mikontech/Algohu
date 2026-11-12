@@ -378,6 +378,11 @@ class AutoExecutionService : AccessibilityService() {
     companion object {
         @Volatile var instance: AutoExecutionService? = null
             private set
+        /** Wejście bez przewijania biletu (z automatycznym powrotem do wolnej ścieżki, gdy coś się nie zgadza). */
+        const val FAST_ENTRY = true
+        const val FAST_ENTRY_SETTLE_MS = 250L
+        /** Odczyt cen z ekranu XTB. */
+        const val SCREEN_POLL_MS = 500L
         @Volatile var activeProfile: UiTargetProfile? = null
         /** Aplikacje, których ekran HUD odczytuje (dopasowanie po nazwie widocznej w launcherze). */
         @Volatile var targetAppLabels: Set<String> = setOf("XTB")
@@ -704,18 +709,18 @@ class AutoExecutionService : AccessibilityService() {
         return true
     }
 
-    /** Pętla: odczyt co 1 s; gdy okno XTB jest niedostępne (np. zasłonięte tarczą), prosi o chwilowe uchylenie tarczy. */
+    /** Pętla: odczyt co [SCREEN_POLL_MS]; gdy okno XTB jest niedostępne (np. zasłonięte tarczą), prosi o chwilowe uchylenie tarczy. */
     private fun startPolling() {
         pollJob?.cancel()
         pollJob = serviceScope.launch {
             var misses = 0
             while (isActive) {
                 val ok = runCatching { scanNow() }.getOrDefault(false)
-                if (ok) { misses = 0; _peek.value = false } else if (++misses >= 3) { _peek.value = true; misses = 0 }
+                if (ok) { misses = 0; _peek.value = false } else if (++misses >= (3_000 / SCREEN_POLL_MS).toInt()) { _peek.value = true; misses = 0 }
                 runCatching { selfHeal() }
                 runCatching { maybeAcceptRemoteRequest() }
                 runCatching { keepXtbFront() }
-                delay(1_000)
+                delay(SCREEN_POLL_MS)
             }
         }
     }
@@ -1264,13 +1269,23 @@ class AutoExecutionService : AccessibilityService() {
         val t0 = SystemClock.uptimeMillis()
         // Stan suwaków SL/TP PRZED wejściem: zapamiętany (z ostatniego przywrócenia/odczytu, < 10 min) – bez przewijania biletu.
         val cached = cachedForm?.takeIf { SystemClock.uptimeMillis() - it.first < 10 * 60_000 }?.second
-        val formBefore = cached ?: runCatching { readTicketSlTp() }.getOrNull()
+        val formBefore = cached ?: readTicketSlTpHidden() ?: runCatching { readTicketSlTp() }.getOrNull()
         formBefore?.let { cachedForm = SystemClock.uptimeMillis() to it }
         entryBaseline = formBefore
         val rowsBefore = appRoot()?.let { runCatching { readPositionRows(it) }.getOrNull() }.orEmpty()
         val formOp = formBefore?.let { formCoordinator.beginEntry(order.clientOrderId, order.symbol, it) }
         if (formBefore == null) _uiEvents.tryEmit("⚠️ ${order.symbol}: nie odczytano suwaków SL/TP – po wejściu nie zostaną przywrócone")
 
+        // Szybka ścieżka: SL, TP i wolumen wpisane bez przewijania biletu (każda wartość sprawdzona odczytem zwrotnym).
+        // Gdy cokolwiek się nie zgadza – pełna, wolna ścieżka z przewijaniem poniżej.
+        val fast = FAST_ENTRY && tp != null && try {
+            fastPrepareTicket(sl, tp, order.quantity)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            false
+        }
+        if (!fast) {
         // Kolejność dla szybkości: SL/TP (dół biletu) → góra biletu → wolumen → przycisk (jedno przewinięcie mniej).
         revealById("StopLossContainer") ?: return ExecutionResult.Rejected("nie znaleziono Stop Loss w bilecie")
         setPriceIn("StopLossContainer", "StopLossToggle", sl)?.let { return ExecutionResult.Rejected("SL: $it – nie otwieram bez stopu") }
@@ -1308,6 +1323,7 @@ class AutoExecutionService : AccessibilityService() {
         if (typed == null || abs(typed - order.quantity) > 1e-9 + order.quantity * 1e-6) {
             return ExecutionResult.Rejected("XTB nie przyjęło wolumenu (jest $typed, miało być ${formatQty(order.quantity)})")
         }
+        }
 
         // Poślizg: jeśli w trakcie ustawiania biletu cena uciekła o > 30% ryzyka w stronę SL/za wejściem – nie wchodzimy późno.
         val pxNow = screenQuote.value?.let { if (order.side == Side.BUY) it.ask else it.bid }
@@ -1324,7 +1340,8 @@ class AutoExecutionService : AccessibilityService() {
         val btn = revealById(if (order.side == Side.BUY) "TradingBuyButton" else "TradingSellButton")
             ?: return ExecutionResult.Rejected("nie znaleziono przycisku ${order.side}")
         if (!click(btn)) return ExecutionResult.Rejected("kliknięcie ${order.side} nie powiodło się")
-        _uiEvents.tryEmit("⏱ ${order.symbol}: od decyzji do kliknięcia %.1f s".format((SystemClock.uptimeMillis() - t0) / 1000.0))
+        _uiEvents.tryEmit("⏱ ${order.symbol}: od decyzji do kliknięcia %.1f s (%s)".format(
+            (SystemClock.uptimeMillis() - t0) / 1000.0, if (fast) "szybka ścieżka" else "z przewijaniem"))
 
         // XTB może pokazać ekran "Nowe zlecenie Market" z przyciskiem "Potwierdź zlecenie Market" (np. przy SL/TP).
         val confirm = withTimeoutOrNull(3_000) {
@@ -1386,6 +1403,86 @@ class AutoExecutionService : AccessibilityService() {
     // ───────────── Suwaki SL/TP w bilecie: zapis stanu, weryfikacja przy pozycji, przywracanie ─────────────
 
     private val formCoordinator by lazy { SlTpFormCoordinator(serviceScope) }
+
+    // ───────────── Szybkie wejście: bilet ustawiany bez przewijania ─────────────
+
+    /** Odpytuje [probe] co [stepMs], aż zwróci wartość albo minie [timeoutMs]. */
+    private suspend fun <T : Any> pollFor(timeoutMs: Long, stepMs: Long = 50, probe: () -> T?): T? {
+        val end = SystemClock.uptimeMillis() + timeoutMs
+        while (true) {
+            probe()?.let { return it }
+            if (SystemClock.uptimeMillis() >= end) return null
+            delay(stepMs)
+        }
+    }
+
+    /** Element [childId] leżący wewnątrz [containerId] – także poza widoczną częścią ekranu. */
+    private fun hiddenIn(containerId: String, childId: String): AccessibilityNodeInfo? {
+        val root = appRoot() ?: return null
+        val area = Rect()
+        ScreenScanner.findById(root, containerId, visibleOnly = false).firstOrNull()?.getBoundsInScreen(area) ?: return null
+        if (area.isEmpty) return null
+        val r = Rect()
+        val inside = ScreenScanner.findById(root, childId, visibleOnly = false).filter { n ->
+            n.getBoundsInScreen(r); !r.isEmpty && area.contains(r.centerX(), r.centerY())
+        }
+        return inside.singleOrNull() // niejednoznaczne dopasowanie = nie ryzykujemy
+    }
+
+    private fun fieldNumber(containerId: String): Double? =
+        hiddenIn(containerId, "StepperTextField")?.text?.toString()?.let { ScreenScanner.parseNumber(it) }
+
+    /** Wpisuje wartość do pola bez przewijania; w razie potrzeby włącza sekcję. Zwraca wartość, którą XTB pokazuje, albo null. */
+    private suspend fun fastSetField(containerId: String, toggleId: String?, value: Double, fixedText: String? = null): Double? {
+        var field = hiddenIn(containerId, "StepperTextField")
+        if (field == null) {
+            if (toggleId == null) return null
+            val sw = hiddenIn(toggleId, "ToggleRowSwitch") ?: return null
+            if (sw.isCheckable && sw.isChecked) return null // włączone, a pola nie widać – niech rozstrzygnie wolna ścieżka
+            var c: AccessibilityNodeInfo? = sw
+            while (c != null && !c.isClickable) c = c.parent
+            if (c == null || !c.isEnabled || !c.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return null
+            field = pollFor(900) { hiddenIn(containerId, "StepperTextField") } ?: return null
+        }
+        val decimals = field.text?.toString()?.substringAfter('.', "")?.length?.takeIf { it in 1..6 } ?: 2
+        val txt = fixedText ?: BigDecimal(value).setScale(decimals, RoundingMode.HALF_UP).toPlainString()
+        val want = txt.toDouble()
+        val tol = if (fixedText != null) 1e-9 + want * 1e-6 else BigDecimal.ONE.movePointLeft(decimals).toDouble() / 2
+        if (fieldNumber(containerId)?.let { abs(it - want) <= tol } == true) return want
+        val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, txt) }
+        if (!field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return null
+        return pollFor(600) { fieldNumber(containerId)?.takeIf { abs(it - want) <= tol } }?.let { want }
+    }
+
+    /**
+     * SL → TP → wolumen bez przewijania biletu. Zwraca true tylko wtedy, gdy po krótkiej pauzie wszystkie trzy
+     * pola nadal pokazują oczekiwane wartości, a przyciski Buy/Sell są widoczne. Niczego nie wysyła.
+     */
+    private suspend fun fastPrepareTicket(sl: Double, tp: Double, qty: Double): Boolean {
+        val slSet = fastSetField("StopLossContainer", "StopLossToggle", sl) ?: return false
+        val tpSet = fastSetField("TakeProfitContainer", "TakeProfitToggle", tp) ?: return false
+        fastSetField("MarketSizeInput", null, qty, fixedText = formatQty(qty)) ?: return false
+        delay(FAST_ENTRY_SETTLE_MS) // XTB musi przyjąć wpisane wartości, zanim klikniemy
+        fun near(id: String, want: Double) = fieldNumber(id)?.let { abs(it - want) <= 1e-9 + want * 1e-6 } == true
+        val root = appRoot() ?: return false
+        return near("StopLossContainer", slSet) && near("TakeProfitContainer", tpSet) &&
+            near("MarketSizeInput", qty) &&
+            ScreenScanner.findById(root, "TradingBuyButton").isNotEmpty()
+    }
+
+    /** Stan suwaków SL/TP odczytany bez przewijania. null = nie da się ustalić (wtedy odczyt z przewijaniem). */
+    private fun readTicketSlTpHidden(): TicketSlTpState? {
+        fun one(containerId: String, toggleId: String): Pair<Boolean, String?>? {
+            val sw = hiddenIn(toggleId, "ToggleRowSwitch") ?: return null
+            val field = hiddenIn(containerId, "StepperTextField")
+            val on = if (sw.isCheckable) sw.isChecked else field != null
+            if (on && field == null) return null
+            return on to (if (on) field?.text?.toString() else null)
+        }
+        val slState = one("StopLossContainer", "StopLossToggle") ?: return null
+        val tpState = one("TakeProfitContainer", "TakeProfitToggle") ?: return null
+        return TicketSlTpState(slState.first, slState.second, tpState.first, tpState.second)
+    }
 
     /** Przełącznik ("suwak") w wierszu sekcji SL/TP biletu. */
     private fun switchIn(toggleId: String): AccessibilityNodeInfo? {
