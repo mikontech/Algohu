@@ -61,14 +61,19 @@ online) jest obecnie **tylko informacją w HUD** – nie otwiera pozycji.
 
 Wartości są stałymi w `BotOrchestrator.kt` (blok `companion object`):
 
-- **Wolumen:** stały `0.006` lota na każdą transakcję, z wstępnym sprawdzeniem depozytu.
-- **Stop loss:** liczony w złotówkach – 15–20 PLN straty, a dla SMC 8–20 PLN (SL strukturalny).
+- **Wolumen:** dobierany do wolnych środków XTB (`bot/Sizing.kt`) – największy od `0.006` w górę (krok 0.001,
+  bez górnego limitu), przy którym depozyt + strata na SL + 20 zł zapasu mieszczą się w wolnych środkach.
+  Gdy nie mieści się nawet 0.006 – brak wejścia, komunikat w HUD i powiadomienie ntfy (maks. raz na godzinę).
+- **Stop loss:** odległość od ceny jak dla 0.006 lota przy stracie 15–20 PLN (dla SMC 8–20 PLN, SL strukturalny);
+  przy większym wolumenie SL stoi tak samo daleko, a strata w złotówkach rośnie (0.008 ≈ 20–27 zł).
 - **Take profit:** 2,5 × odległość SL (minimalne R:R 1:2,5).
 - **Zamykanie:** TP albo SL w XTB, a do tego bot sam zamyka pozycję przy **potwierdzonym odwróceniu
   trendu** (`bot/ReversalGuard.kt`): ≥ 2 z 3 sygnałów (struktura przeciw, momentum przeciw, kompas przeciw)
   na 2 kolejnych zamkniętych świecach 1m, min. 2 świece od wejścia i cofnięcie ≥ 0,5×ATR od najlepszej ceny.
   Pojedyncza świeca przeciw nie zamyka pozycji. Wyłącznik: `TREND_EXIT` w `BotOrchestrator`.
-- **Prowadzenie SL:** po +1R (min. 8 PLN zysku) SL trafia na cenę wejścia, od +1,5R idzie 1R za
+- **Schodki SL:** co `SL_STEP_PLN` = 8 zł zysku SL idzie wyżej: +8 zł → wejście + spread (bez straty),
+  +16 zł → +8 zł zablokowane, +24 zł → +16 zł… SL tylko się zaciska.
+- **Prowadzenie SL:** dodatkowo po +1R SL trafia na cenę wejścia, od +1,5R idzie 1R za
   najlepszą ceną. Zmiana jest wpisywana do otwartej pozycji w XTB (krok ≥ 2 PLN, najwyżej co 20 s).
 - **Duży ruch:** silny impuls w stronę pozycji przy zysku ≥ 1R → TP odsuwany na najlepszą cenę
   + max(1,5×ATR, 1R) (maks. raz na świecę), SL 0,6×ATR za najlepszą ceną. Nowy TP trafia do otwartej
@@ -126,7 +131,8 @@ połączony z telefonem bota. Na głównym telefonie zainstaluj aplikację **ntf
 kanału z HUD-a (linia `🔔 ntfy: algohud-…`; kanał jest losowy, generowany raz na instalację).
 
 - 🚨 awarie (pilne, z dźwiękiem): zawieszone XTB, pozycja bez nadzoru, nie znaleziony bilet, KILL-SWITCH,
-- 🟢/🔴 wejście (kierunek, świeca, cena, SL/TP, strategia) i 🏁 wyjście (cena, wynik w zł i R),
+- 🟢/🔴 wejście (kierunek, wolumen, świeca, cena, SL/TP, strategia) i 🏁 wyjście (cena, wynik w zł i R),
+- 📊 cichy raport stanu (bez dźwięku) co 15 min i przy zmianie stanu; poza godzinami rynku – jeden raport,
 - ⏳ „za chwilę mogę wejść” (cicho, maks. raz na 5 min) i ❌ „odpuściłem silny ruch” (świeca ≥ 1,5×ATR).
 
 ## Uproszczony HUD
@@ -217,8 +223,9 @@ formularz SL/TP i parser wierszy pozycji. `BotOrchestrator` i obsługa ekranu XT
 
 ## Znane ograniczenia
 
-- **Dzienny limit straty jest wyłączony.** `RiskManager.Config.maxDailyLossPct` ma wartość
-  nieskończoną, więc kill-switch nie zadziała sam po serii strat.
+- **Dzienny kill-switch: 15% kapitału z początku dnia** (`RiskManager.Config.maxDailyLossPct`). Przy ryzyku
+  ok. 3–4% na transakcję to ok. 4 straty z rzędu; nowe wejście jest też odrzucane, gdy trafienie SL
+  przekroczyłoby limit.
 - **Brak bramki przed AUTO.** `autoGate` w `OverlayService` zawsze przepuszcza – tryb AUTO można
   włączyć bez dodatniego wyniku na papierze.
 - **Automatyzacja zależy od wyglądu XTB.** Identyfikatory widoków pochodzą ze zrzutów ekranu;
