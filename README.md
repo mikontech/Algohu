@@ -81,8 +81,9 @@ Wartości są stałymi w `BotOrchestrator.kt` (blok `companion object`):
 
 Aplikacja nie ma podłączonego kalendarza makro. Zamiast niego działają:
 
-- stałe okna danych z USA liczone w czasie Nowego Jorku: 8:25–8:40, 9:55–10:10, 13:55–14:35 ET
-  (zwykle 14:25, 15:55, 19:55 PL) – w `bot/UsSession.kt`,
+- 2-minutowe przerwy na nowe wejścia w momencie danych z USA, liczone w czasie Nowego Jorku:
+  8:30, 10:00 i 14:00 ET (zwykle 14:30, 16:00, 20:00 PL) – w `bot/UsSession.kt` (`DATA_PAUSE_MIN`);
+  otwartych pozycji nie dotyczą,
 - **ręczna** lista publikacji w `bot/MacroWindows.kt` – trzeba ją samodzielnie uzupełniać.
 
 ## Bramka jakości danych
