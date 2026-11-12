@@ -133,5 +133,7 @@ data class HudState(
     val prediction: String = "",
     /** true = wzrostowa (zielona), false = spadkowa (czerwona), null = brak prognozy. */
     val predictionUp: Boolean? = null,
+    /** Uproszczony widok HUD: pozycja (wejście, świeca, cena, kierunek), „co dalej”, ostatnie transakcje, alarmy. */
+    val compact: String = "",
     val lastMessage: String = "Uruchamianie…"
 )
