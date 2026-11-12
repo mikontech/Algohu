@@ -699,7 +699,7 @@ class AutoExecutionService : AccessibilityService() {
         val torn = qb != null && qa != null && qa < qb
         if (torn) {
             tornReads++
-            if (tornReads % 20 == 1) Log.i(TAG, "Pominięty rozjechany odczyt Sell/Buy ($qb / $qa), łącznie $tornReads")
+            if (tornReads % 20 == 1L) Log.i(TAG, "Pominięty rozjechany odczyt Sell/Buy ($qb / $qa), łącznie $tornReads")
             return true
         }
         if (quote != null) {
