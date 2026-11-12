@@ -418,6 +418,8 @@ class AutoExecutionService : AccessibilityService() {
         val gestureActive: StateFlow<Boolean> = _gestureActive.asStateFlow()
 
         private const val TAG = "AutoExecutionService"
+        private const val ALERT_CHANNEL = "algo_hud_alert"
+        private const val ALERT_NOTIF_ID = 4242
 
         /** Diagnostyka: ostatnio widziane okno nagrywania (do skopiowania z aplikacji, gdy auto-akceptacja nie trafi). */
         @Volatile var lastCaptureDump: String? = null
@@ -690,6 +692,16 @@ class AutoExecutionService : AccessibilityService() {
                 ScreenScanner.scan(root, pkg, label, ts)
             }
         }.getOrNull()
+        // XTB odświeża Sell i Buy osobno: w szybkim ruchu przez ułamek sekundy widać nową cenę Sell i starą Buy
+        // (Buy < Sell). Taki odczyt pomijamy – zostaje poprzedni, a bramka danych nie blokuje wejść przez chwilowy artefakt.
+        val qb = quote?.bid
+        val qa = quote?.ask
+        val torn = qb != null && qa != null && qa < qb
+        if (torn) {
+            tornReads++
+            if (tornReads % 20 == 1) Log.i(TAG, "Pominięty rozjechany odczyt Sell/Buy ($qb / $qa), łącznie $tornReads")
+            return true
+        }
         if (quote != null) {
             _screenQuote.value = quote
             quote.availableFunds?.let { lastAccountFunds = it; lastAccountCurrency = quote.accountCurrency }
@@ -712,6 +724,7 @@ class AutoExecutionService : AccessibilityService() {
             while (isActive) {
                 val ok = runCatching { scanNow() }.getOrDefault(false)
                 if (ok) { misses = 0; _peek.value = false } else if (++misses >= 3) { _peek.value = true; misses = 0 }
+                runCatching { recoverFromXtbError() }
                 runCatching { selfHeal() }
                 runCatching { maybeAcceptRemoteRequest() }
                 runCatching { keepXtbFront() }
@@ -1092,6 +1105,7 @@ class AutoExecutionService : AccessibilityService() {
 
     // ───────────── Samonaprawa i weryfikacja stanu w XTB ─────────────
 
+    private var tornReads = 0L
     private var staleSince = 0L
     private var notVisibleSince = 0L
     private var lastFrontAttempt = 0L
@@ -1175,6 +1189,79 @@ class AutoExecutionService : AccessibilityService() {
         } finally {
             uiMutex.unlock()
         }
+    }
+
+    // ───────────── Ekran błędu XTB („Coś poszło nie tak … Odśwież”) ─────────────
+
+    private val xtbError = XtbErrorRecovery()
+
+    /** true = XTB pokazuje teraz ekran błędu (bot nie może handlować ani zamykać pozycji). */
+    @Volatile var xtbErrorVisible: Boolean = false
+        private set
+
+    /**
+     * Co sekundę: gdy XTB pokazuje ekran błędu, bot sam naciska „Odśwież”, a gdy to nie pomaga –
+     * otwiera XTB od nowa (jak ręczne wyłącz/włącz). Przy restarcie i dalej co minutę – alarm z dźwiękiem.
+     */
+    private suspend fun recoverFromXtbError() {
+        val root = appRoot() ?: return
+        if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) return // nie widać XTB – nie oceniamy
+        val nodes = textNodes(root, 250)
+        val error = XtbErrorRecovery.isErrorText(nodes.map { it.second })
+        xtbErrorVisible = error
+        if (error) diag = "XTB pokazuje ekran błędu „Coś poszło nie tak” – naprawiam"
+        when (xtbError.onScan(error, SystemClock.uptimeMillis())) {
+            XtbErrorRecovery.Action.NONE -> Unit
+            XtbErrorRecovery.Action.TAP_REFRESH -> {
+                if (!selfHealEnabled) { remoteNote("⚠️ XTB: ekran błędu – naciśnij „Odśwież” (samonaprawa działa tylko w AUTO)"); return }
+                val btn = nodes.firstOrNull { (_, t) -> XtbErrorRecovery.REFRESH_TEXTS.any { t.equals(it, ignoreCase = true) } }?.first
+                if (btn == null) { remoteNote("⚠️ XTB: ekran błędu bez przycisku „Odśwież” – spróbuję restartu XTB"); return }
+                if (!uiMutex.tryLock()) return
+                val ok = try { click(btn) } finally { uiMutex.unlock() }
+                remoteNote(if (ok) "🔄 XTB: ekran błędu – naciskam „Odśwież”" else "⚠️ XTB: nie udało się nacisnąć „Odśwież”", force = true)
+            }
+            XtbErrorRecovery.Action.RESTART_APP -> {
+                if (!selfHealEnabled) { alert("XTB pokazuje błąd – uruchom XTB ponownie"); return }
+                restartXtb()
+                alert("XTB się zawiesiło („Coś poszło nie tak”) – otwieram XTB od nowa (${xtbError.restartCount}×). Sprawdź otwarte pozycje!")
+            }
+            XtbErrorRecovery.Action.ALERT -> alert("XTB nadal pokazuje błąd – sprawdź telefon i otwarte pozycje!")
+            XtbErrorRecovery.Action.RECOVERED -> remoteNote("✅ XTB wróciło po błędzie – bot znów widzi aplikację", force = true)
+        }
+    }
+
+    /** Otwiera XTB od nowa: zamyka bieżące ekrany aplikacji i startuje ją od ekranu startowego. */
+    private fun restartXtb() {
+        val intent = packageManager.getLaunchIntentForPackage(ScreenScanner.XTB_PACKAGE) ?: return
+        intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        runCatching { startActivity(intent) }
+            .onFailure { Log.w(TAG, "Restart XTB nieudany", it) }
+        Log.i(TAG, "Ekran błędu XTB – restart aplikacji")
+    }
+
+    /**
+     * Alarm dla użytkownika: wiadomość w HUD + powiadomienie z dźwiękiem i wibracją (osobny kanał o wysokim priorytecie).
+     * Używane, gdy bot nie może sam dokończyć sprawy (zawieszone XTB, pozycja bez nadzoru).
+     */
+    fun alert(text: String) {
+        _uiEvents.tryEmit("🚨 $text")
+        runCatching {
+            val nm = getSystemService(android.app.NotificationManager::class.java)
+            nm.createNotificationChannel(
+                android.app.NotificationChannel(ALERT_CHANNEL, "Algo HUD – alarmy", android.app.NotificationManager.IMPORTANCE_HIGH)
+                    .apply { enableVibration(true) }
+            )
+            val n = androidx.core.app.NotificationCompat.Builder(this, ALERT_CHANNEL)
+                .setSmallIcon(android.R.drawable.stat_sys_warning)
+                .setContentTitle("Algo HUD – wymaga uwagi")
+                .setContentText(text)
+                .setStyle(androidx.core.app.NotificationCompat.BigTextStyle().bigText(text))
+                .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+                .setCategory(androidx.core.app.NotificationCompat.CATEGORY_ALARM)
+                .setAutoCancel(true)
+                .build()
+            nm.notify(ALERT_NOTIF_ID, n)
+        }.onFailure { Log.w(TAG, "Alarm nieudany", it) }
     }
 
     /** W trybie AUTO: jeśli XTB zniknęło z ekranu na ponad 20 s, przywraca je na pierwszy plan. */
