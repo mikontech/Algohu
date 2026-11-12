@@ -200,7 +200,7 @@ class StrategyProof(
         /** …liczona od [LIVE_MIN] prób; ujemna = strategia wstrzymana. */
         const val LIVE_MIN = 10
 
-        val STRATEGIES = listOf("SMC", "RT", "ORB", "ZAKRES")
+        val STRATEGIES = listOf("SMC", "RT", "ORB", "ZAKRES", "SCORE")
 
         /** Klucz strategii z opisu wejścia; null = wejście nie podlega bramce (ręczne, turniej – ma własną). */
         fun keyOf(reason: String): String? = STRATEGIES.firstOrNull { reason.startsWith(it) }

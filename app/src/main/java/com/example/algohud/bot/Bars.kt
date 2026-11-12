@@ -38,7 +38,8 @@ class BarAggregator(private val periodMs: Long = 5 * 60_000L, private val maxBar
     /** Historia z REST (bez trwającej świecy) – strategia nie musi czekać godzinami na rozgrzewkę. */
     @Synchronized
     fun seed(history: List<Bar>) {
-        val live = bars.filter { b -> history.none { it.start == b.start } }
+        val known = history.mapTo(HashSet()) { it.start }
+        val live = bars.filter { it.start !in known }
         bars.clear()
         (history + live).sortedBy { it.start }.takeLast(maxBars).forEach { bars.addLast(it) }
     }
@@ -105,5 +106,106 @@ object Indicators {
         }
         if (loss == 0.0) return 100.0
         return 100 - 100 / (1 + gain / loss)
+    }
+
+    /** Seria EMA; element i odpowiada values[i + period − 1]. Pusta, gdy danych jest za mało. */
+    fun emaSeries(values: List<Double>, period: Int): List<Double> {
+        if (values.size < period) return emptyList()
+        val k = 2.0 / (period + 1)
+        val out = ArrayList<Double>(values.size - period + 1)
+        var e = 0.0
+        for (i in 0 until period) e += values[i]
+        e /= period
+        out.add(e)
+        for (i in period until values.size) { e = values[i] * k + e * (1 - k); out.add(e) }
+        return out
+    }
+
+    /** Histogram MACD (linia MACD − linia sygnału) dla kolejnych świec; pusta lista = za mało danych. */
+    fun macdHist(closes: List<Double>, fast: Int = 12, slow: Int = 26, signal: Int = 9): List<Double> {
+        val f = emaSeries(closes, fast)
+        val s = emaSeries(closes, slow)
+        if (s.isEmpty()) return emptyList()
+        val off = slow - fast
+        val macd = s.indices.map { f[it + off] - s[it] }
+        val sig = emaSeries(macd, signal)
+        if (sig.isEmpty()) return emptyList()
+        return sig.indices.map { macd[it + signal - 1] - sig[it] }
+    }
+
+    /** Składa świece wyższego interwału z niższego (np. H1 z M5). Grupy z mniej niż [minParts] świec są pomijane. */
+    fun resample(bars: List<Bar>, periodMs: Long, minParts: Int = 1): List<Bar> {
+        val out = ArrayList<Bar>()
+        var i = 0
+        while (i < bars.size) {
+            val key = bars[i].start / periodMs
+            var j = i
+            var hi = bars[i].high
+            var lo = bars[i].low
+            while (j + 1 < bars.size && bars[j + 1].start / periodMs == key) { j++; hi = max(hi, bars[j].high); lo = min(lo, bars[j].low) }
+            if (j - i + 1 >= minParts) out.add(Bar(key * periodMs, bars[i].open, hi, lo, bars[j].close))
+            i = j + 1
+        }
+        return out
+    }
+}
+
+/** Struktura rynku z fraktali: swingi, wybicia (BOS) i zmiany charakteru (CHoCH). Czysta logika. */
+object Structure {
+    data class Swing(val index: Int, val price: Double, val high: Boolean)
+
+    /** Wybicie zamknięciem świecy [index] ponad/poniżej swingu [level]. [choch] = pierwsze wybicie przeciw dotychczasowej strukturze. */
+    data class Event(val dir: Int, val choch: Boolean, val index: Int, val level: Double)
+
+    data class State(
+        /** +1 = ostatnie wybicie w górę, −1 = w dół, 0 = brak wybić. */
+        val trend: Int,
+        val lastEvent: Event?,
+        val lastSwingHigh: Swing?,
+        val lastSwingLow: Swing?
+    )
+
+    private fun isSwing(bars: List<Bar>, i: Int, high: Boolean, wing: Int): Boolean {
+        if (i < wing || i + wing >= bars.size) return false
+        val v = if (high) bars[i].high else bars[i].low
+        for (d in -wing..wing) {
+            if (d == 0) continue
+            val o = if (high) bars[i + d].high else bars[i + d].low
+            if (if (high) v < o else v > o) return false
+        }
+        return true
+    }
+
+    /** Potwierdzone swingi (fraktal: [wing] świec z każdej strony), w kolejności czasu. */
+    fun swings(bars: List<Bar>, wing: Int = 2): List<Swing> {
+        val out = ArrayList<Swing>()
+        for (i in wing until bars.size - wing) {
+            if (isSwing(bars, i, true, wing)) out.add(Swing(i, bars[i].high, true))
+            if (isSwing(bars, i, false, wing)) out.add(Swing(i, bars[i].low, false))
+        }
+        return out
+    }
+
+    /** Przechodzi po świecach i śledzi wybicia ostatnich swingów zamknięciem świecy. */
+    fun analyze(bars: List<Bar>, wing: Int = 2): State {
+        var trend = 0
+        var ev: Event? = null
+        var hi: Swing? = null          // ostatni niewybity swing high
+        var lo: Swing? = null
+        var lastHi: Swing? = null      // ostatni swing high w ogóle (do trailingu)
+        var lastLo: Swing? = null
+        for (i in bars.indices) {
+            val j = i - wing            // swing j potwierdza się dopiero na świecy i
+            if (j >= wing) {
+                if (isSwing(bars, j, true, wing)) { hi = Swing(j, bars[j].high, true); lastHi = hi }
+                if (isSwing(bars, j, false, wing)) { lo = Swing(j, bars[j].low, false); lastLo = lo }
+            }
+            val c = bars[i].close
+            val h = hi
+            val l = lo
+            if (h != null && c > h.price) { ev = Event(1, trend < 0, i, h.price); trend = 1; hi = null }
+            else if (l != null && c < l.price) { ev = Event(-1, trend > 0, i, l.price); trend = -1; lo = null }
+        }
+        return State(trend, ev, lastHi, lastLo)
     }
 }

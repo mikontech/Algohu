@@ -26,7 +26,7 @@ object MarketHours {
     )
 
     private fun t(h: Int, m: Int) = LocalTime.of(h, m)
-    private val COMMODITY = Hours(listOf(Session(WEEKDAYS, t(0, 5), t(23, 0))), listOf(t(9, 0), t(15, 30)))
+    private val COMMODITY = Hours(listOf(Session(WEEKDAYS, t(0, 5), t(23, 0))), listOf(t(9, 0))) // otwarcie USA obsługuje UsOpenSession (czas NY)
     private val ALWAYS = Hours(emptyList(), emptyList())
 
     val TABLE: Map<String, Hours> = mapOf(

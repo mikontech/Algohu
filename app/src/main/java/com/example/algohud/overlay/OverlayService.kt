@@ -224,7 +224,8 @@ class OverlayService : LifecycleService() {
         val journal = TradeJournal(getSharedPreferences("journal", MODE_PRIVATE))
         risk = RiskManager(
             prefs = getSharedPreferences("risk_state", MODE_PRIVATE),
-            config = RiskManager.Config(),
+            // Dzienny kill-switch: −25% kapitału z początku dnia (ostrzeżenie w HUD przy −10%); stop prowadzi TrailingManager.
+            config = RiskManager.Config(maxDailyLossPct = com.example.algohud.bot.BotConfig.Risk.DAILY_KILL_PCT, autoTrail = false),
             marketBlackout = { news.isInMacroBlackout() },
             journal = journal
         )
@@ -242,6 +243,8 @@ class OverlayService : LifecycleService() {
             autoGate = { null }
         )
 
+        // Dziennik decyzji (CSV): Android/data/<pakiet>/files/decisions – dostępny z komputera / menedżera plików.
+        com.example.algohud.bot.DecisionLog.attach(java.io.File(getExternalFilesDir(null) ?: filesDir, "decisions"))
         bot = BotOrchestrator(
             scope = botScope,
             news = news,
@@ -311,6 +314,7 @@ class OverlayService : LifecycleService() {
         }
         fun full() = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         listOf(tvStatus, tvPlan, tvPredict, tvStats, tvMessage).forEach { it.maxWidth = Int.MAX_VALUE; it.maxLines = 12 }
+        tvPlan.maxLines = 24 // score, US Open, SL/TP z historią, ostatnie wejście/wyjście + plan
         tvStatus.setTextColor(0xFFEEEEEE.toInt())
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -496,7 +500,7 @@ class OverlayService : LifecycleService() {
             .format(s.dailyPnl)
         tvMessage.text = s.lastMessage
         setKeepScreenOn(s.mode == ExecutionMode.AUTO && !s.killSwitch)
-        val planText = listOf(s.dataStatus, s.plan).filter { it.isNotBlank() }.joinToString("\n")
+        val planText = listOf(s.dataStatus, s.signal, s.plan).filter { it.isNotBlank() }.joinToString("\n")
         tvPlan.visibility = if (planText.isBlank()) View.GONE else View.VISIBLE
         tvPlan.text = planText
         tvPredict.visibility = if (s.prediction.isBlank()) View.GONE else View.VISIBLE
