@@ -17,8 +17,21 @@ class StrategyProof(
     private val minTrades: Int = MIN_TRADES,
     private val window: Int = WINDOW,
     private val minAvgR: Double = MIN_AVG_R,
-    private val minTStat: Double = MIN_T_STAT
+    private val minTStat: Double = MIN_T_STAT,
+    private val liveWindow: Int = LIVE_WINDOW,
+    private val liveMin: Int = LIVE_MIN
 ) {
+    /**
+     * Kiedy strategia może składać prawdziwe zlecenia:
+     *  [LIVE] – od razu; ocena na bieżąco: wstrzymana, gdy średnia z ostatnich prób jest ujemna, wraca po poprawie,
+     *  [STRICT] – dopiero po udowodnionej przewadze (min. liczba prób, dodatni i istotny wynik),
+     *  [OFF] – zawsze (tylko pomiar).
+     */
+    enum class Policy { LIVE, STRICT, OFF }
+
+    /** Ocena bieżąca: wynik z ostatnich [LIVE_WINDOW] prób. */
+    data class Live(val trades: Int, val avgR: Double, val paused: Boolean)
+
     data class Closed(val strategy: String, val symbol: String, val r: Double, val reason: String, val closedAt: Long)
 
     data class Verdict(val trades: Int, val avgR: Double, val tStat: Double, val proven: Boolean, val needed: Int) {
@@ -120,13 +133,44 @@ class StrategyProof(
 
     fun proven(strategy: String): Boolean = verdict(strategy).proven
 
-    /** Krótki stan wszystkich strategii do HUD-a. */
-    fun summary(): String = STRATEGIES.joinToString(" • ") { k ->
-        val v = verdict(k)
-        when {
-            v.trades == 0 -> "$k 0/${v.needed}"
-            v.trades < v.needed -> "%s %d/%d E=%+.2fR".format(k, v.trades, v.needed, v.avgR)
-            else -> "%s %d E=%+.2fR %s".format(k, v.trades, v.avgR, if (v.proven) "✓" else "✗")
+    @Synchronized
+    fun live(strategy: String): Live {
+        val rs = results[strategy]?.toList()?.takeLast(liveWindow)?.map { it.r }.orEmpty()
+        val avg = if (rs.isEmpty()) 0.0 else rs.average()
+        return Live(rs.size, avg, rs.size >= liveMin && avg < 0.0)
+    }
+
+    /** Czy strategia może teraz złożyć prawdziwe zlecenie. */
+    fun allows(strategy: String, policy: Policy): Boolean = when (policy) {
+        Policy.OFF -> true
+        Policy.STRICT -> verdict(strategy).proven
+        Policy.LIVE -> !live(strategy).paused
+    }
+
+    /** Opis stanu jednej strategii (do komunikatów). */
+    fun status(strategy: String, policy: Policy): String {
+        if (policy == Policy.STRICT) return verdict(strategy).line()
+        val l = live(strategy)
+        return when {
+            l.trades == 0 -> "brak wyników"
+            policy == Policy.LIVE && l.paused -> "ostatnie %d prób E=%+.2fR – wstrzymana do poprawy wyniku".format(l.trades, l.avgR)
+            else -> "ostatnie %d prób E=%+.2fR".format(l.trades, l.avgR)
+        }
+    }
+
+    /** Krótki stan wszystkich strategii do HUD-a: ✓ = może składać zlecenia, ✗ = tylko pomiar. */
+    fun summary(policy: Policy = Policy.STRICT): String = STRATEGIES.joinToString(" • ") { k ->
+        val mark = if (allows(k, policy)) "✓" else "✗"
+        if (policy == Policy.STRICT) {
+            val v = verdict(k)
+            when {
+                v.trades == 0 -> "$k 0/${v.needed}"
+                v.trades < v.needed -> "%s %d/%d E=%+.2fR".format(k, v.trades, v.needed, v.avgR)
+                else -> "%s %d E=%+.2fR %s".format(k, v.trades, v.avgR, mark)
+            }
+        } else {
+            val l = live(k)
+            if (l.trades == 0) "$k – $mark" else "%s %d E=%+.2fR %s".format(k, l.trades, l.avgR, mark)
         }
     }
 
@@ -151,6 +195,10 @@ class StrategyProof(
         const val MIN_AVG_R = 0.10
         /** …i istotny statystycznie (t ≥ 2). */
         const val MIN_T_STAT = 2.0
+        /** Ocena bieżąca ([Policy.LIVE]): średnia z ostatnich [LIVE_WINDOW] prób… */
+        const val LIVE_WINDOW = 20
+        /** …liczona od [LIVE_MIN] prób; ujemna = strategia wstrzymana. */
+        const val LIVE_MIN = 10
 
         val STRATEGIES = listOf("SMC", "RT", "ORB", "ZAKRES")
 

@@ -364,18 +364,17 @@ class BotOrchestrator(
 
     /**
      * Każdy sygnał RT/ORB/ZAKRES/SMC, który przeszedł filtry, trafia do pomiaru „na sucho” (te same SL/TP, koszt spreadu).
-     * Prawdziwe zlecenie (AUTO/CONFIRM) przechodzi tylko dla strategii z potwierdzoną przewagą po kosztach.
+     * O prawdziwym zleceniu (AUTO/CONFIRM) decyduje [PROOF_POLICY]: LIVE – handel od razu, strategia z ujemnym wynikiem
+     * ostatnich prób jest wstrzymana do poprawy; STRICT – dopiero po udowodnionej przewadze; OFF – bez bramki.
      * Tryb papierowy (DRY_RUN) działa bez zmian. [fill] – cena wykonania (ask dla kupna, bid dla sprzedaży).
      */
     private fun proofAllows(inst: String, o: OrderRequest, fill: Double, why: String, ts: Long): Boolean {
         val key = StrategyProof.keyOf(why) ?: return true
         o.takeProfit?.let { tp -> proof.open(key, inst, o.side.sign, fill, o.stopPrice, tp) }
-        if (!REQUIRE_PROVEN_EDGE || engine.mode.value == ExecutionMode.DRY_RUN) return true
-        val v = proof.verdict(key)
-        if (v.proven) return true
+        if (engine.mode.value == ExecutionMode.DRY_RUN || proof.allows(key, PROOF_POLICY)) return true
         if (rtNotes.add("proof:$inst:$key:${ts / 60_000}")) {
-            msg("🧪 $inst: $why – tylko pomiar na sucho, bez zlecenia w XTB ($key: ${v.line()})")
-            countBlock("🧪 $key bez potwierdzonej przewagi – pomiar na sucho")
+            msg("🧪 $inst: $why – tylko pomiar na sucho, bez zlecenia w XTB ($key: ${proof.status(key, PROOF_POLICY)})")
+            countBlock("🧪 $key wstrzymana – pomiar na sucho")
         }
         return false
     }
@@ -469,8 +468,7 @@ class BotOrchestrator(
                 "• 📈 " + (rangeInfo[inst] ?: "ZAKRES: zbieram świece 1m…"),
                 traderNote[inst]?.let { "• 🎩 Trader: ostatni sygnał odpuszczony – $it" },
                 "• 🧠 TURNIEJ: " + (l?.summary()?.substringBefore('\n')?.substringAfter(": ")?.take(90) ?: "uczę się…"),
-                "• 🧪 Dowód przewagi (na sucho): " + proof.summary() +
-                    if (REQUIRE_PROVEN_EDGE) " – zlecenia w XTB tylko dla ✓" else ""
+                "• 🧪 Wyniki strategii (na sucho): " + proof.summary(PROOF_POLICY) + " – zlecenia w XTB tylko dla ✓"
             ).joinToString("\n")
         }
         if (_plan[inst] != text) { _plan[inst] = text; _hud.update { it.copy(plan = text) } }
@@ -1216,7 +1214,7 @@ class BotOrchestrator(
         aiManage(inst, px, ts)
         for (c in proof.onPrice(inst, px, spreadOf(inst), ts)) {
             // Nie zasłaniamy komunikatów prawdziwej pozycji wynikami prób „na sucho”.
-            if (risk.position(inst) == null) msg("🧪 $inst: ${c.strategy} na sucho – ${c.reason} %+.2fR (${proof.verdict(c.strategy).line()})".format(c.r))
+            if (risk.position(inst) == null) msg("🧪 $inst: ${c.strategy} na sucho – ${c.reason} %+.2fR (${proof.status(c.strategy, PROOF_POLICY)})".format(c.r))
         }
         countTick(inst, ts)
         for (tf in Learner.TIMEFRAMES) {
@@ -1406,7 +1404,7 @@ class BotOrchestrator(
         }
         smcSessionCount[sessKey] = n + 1
         if (!proofAllows(inst, order, px + spreadOf(inst) / 2 * s.side.sign, s.reason, now)) {
-            smcNote[inst] = "setup ✓ – tylko pomiar na sucho (SMC: ${proof.verdict("SMC").line()})"
+            smcNote[inst] = "setup ✓ – tylko pomiar na sucho (SMC: ${proof.status("SMC", PROOF_POLICY)})"
             return
         }
         msg("🏦 $inst: ${s.reason} – WCHODZĘ")
@@ -1715,8 +1713,11 @@ class BotOrchestrator(
         const val TP_R = 2.5                     // TP = 2,5 × odległość SL (min. R:R 1:2,5)
         const val AI_PREDICTOR_ENTRIES = false   // model świec tylko jako informacja – wejścia daje SMC
         const val SMC_MAX_PER_SESSION = 2        // bez overtradingu: maks. 2 wejścia SMC na sesję
-        /** true = RT/ORB/ZAKRES/SMC składają prawdziwe zlecenia dopiero po dodatnim, istotnym wyniku „na sucho” ([StrategyProof]). */
-        const val REQUIRE_PROVEN_EDGE = true
+        /**
+         * Bramka prawdziwych zleceń RT/ORB/ZAKRES/SMC ([StrategyProof]): LIVE – handel od razu, strategia z ujemną średnią
+         * ostatnich 20 prób „na sucho” jest wstrzymana do poprawy; STRICT – dopiero po udowodnionej przewadze; OFF – bez bramki.
+         */
+        val PROOF_POLICY = StrategyProof.Policy.LIVE
         const val TRADE_ALL_SESSIONS = true      // handel cały czas (Azja, Londyn, NY); blackout tylko wokół danych USA
         const val BE_AT_PLN = 8.0                // od 8 zł zysku SL na wejście (+spread)…
         const val TRAIL_PLN = 10.0               // …i dalej 10 zł za najlepszą ceną

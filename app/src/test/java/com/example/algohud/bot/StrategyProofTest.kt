@@ -115,6 +115,36 @@ class StrategyProofTest {
         assertEquals(a.verdict("ZAKRES").avgR, b.verdict("ZAKRES").avgR, 1e-9)
     }
 
+    @Test fun livePolicyTradesFromTheStart() {
+        val p = StrategyProof()
+        assertTrue(p.allows("RT", StrategyProof.Policy.LIVE))
+        assertFalse(p.allows("RT", StrategyProof.Policy.STRICT))
+        feed(p, "RT", wins = 0, losses = 9) // za mało prób, żeby wstrzymać
+        assertTrue(p.allows("RT", StrategyProof.Policy.LIVE))
+    }
+
+    @Test fun livePolicyPausesLosingStrategyAndResumes() {
+        val p = StrategyProof()
+        feed(p, "RT", wins = 0, losses = 10)
+        assertTrue(p.live("RT").paused)
+        assertFalse(p.allows("RT", StrategyProof.Policy.LIVE))
+        assertTrue(p.allows("SMC", StrategyProof.Policy.LIVE)) // inne strategie bez zmian
+        assertTrue(p.allows("RT", StrategyProof.Policy.OFF))
+        feed(p, "RT", wins = 3, losses = 0)   // −10R + 7,5R – nadal na minusie
+        assertFalse(p.allows("RT", StrategyProof.Policy.LIVE))
+        feed(p, "RT", wins = 2, losses = 0)   // −10R + 12,5R – wynik dodatni, wraca
+        assertTrue(p.allows("RT", StrategyProof.Policy.LIVE))
+    }
+
+    @Test fun livePolicyLooksOnlyAtRecentTrades() {
+        val p = StrategyProof()
+        feed(p, "RT", wins = 0, losses = 15)
+        feed(p, "RT", wins = 20, losses = 0)  // ostatnie 20 prób to same zyski
+        val l = p.live("RT")
+        assertEquals(20, l.trades)
+        assertFalse(l.paused)
+    }
+
     @Test fun strategyKeyFromEntryReason() {
         assertEquals("RT", StrategyProof.keyOf("RT impuls 1.4×ATR, korpus 80%"))
         assertEquals("ORB", StrategyProof.keyOf("ORB wybicie zasięgu otwarcia"))
