@@ -104,6 +104,9 @@ przyciskiem „Skopiuj raport danych”.
 - **KILL:** przytrzymanie przycisku w HUD albo akcja w powiadomieniu blokuje nowe wejścia
   i próbuje zamknąć otwartą pozycję przez ekran pozycji w XTB. Kill-switch włącza się też sam,
   gdy po kliknięciu nie da się zweryfikować stanu zlecenia w XTB.
+- **Szukanie instrumentu:** gdy XTB jest na wierzchu, ale nie pokazuje żadnego biletu (np. Portfolio po restarcie),
+  bot sam otwiera ostatni instrument: Rynki → CFD → wiersz (z przewijaniem), potem Odkryj → Popularne, na końcu
+  wyszukiwarka. Przy otwartej pozycji po 5 s, bez pozycji po 20 s; po 3 nieudanych próbach – alarm.
 - **Zawieszone XTB:** gdy XTB pokaże ekran „Coś poszło nie tak … Odśwież”, bot sam naciska „Odśwież”
   (2 próby), a gdy to nie pomaga – otwiera XTB od nowa (maks. raz na minutę) i wysyła alarm z dźwiękiem
   (`execution/XtbErrorRecovery.kt`). Działa w trybie AUTO.
@@ -115,6 +118,31 @@ przyciskiem „Skopiuj raport danych”.
 - **Zakres usługi ułatwień dostępu:** aplikacja brokera jest rozpoznawana po nazwie (XTB),
   a zdarzenia z innych aplikacji są odrzucane bez czytania treści. Wyjątkiem są okna AnyDesk
   i systemowe okno nagrywania ekranu, opisane niżej.
+
+## Powiadomienia na główny telefon (ntfy)
+
+Bot wysyła powiadomienia przez [ntfy](https://ntfy.sh) – bez konta, działają też wtedy, gdy nie jesteś
+połączony z telefonem bota. Na głównym telefonie zainstaluj aplikację **ntfy**, naciśnij „+” i wpisz nazwę
+kanału z HUD-a (linia `🔔 ntfy: algohud-…`; kanał jest losowy, generowany raz na instalację).
+
+- 🚨 awarie (pilne, z dźwiękiem): zawieszone XTB, pozycja bez nadzoru, nie znaleziony bilet, KILL-SWITCH,
+- 🟢/🔴 wejście (kierunek, świeca, cena, SL/TP, strategia) i 🏁 wyjście (cena, wynik w zł i R),
+- ⏳ „za chwilę mogę wejść” (cicho, maks. raz na 5 min) i ❌ „odpuściłem silny ruch” (świeca ≥ 1,5×ATR).
+
+## Uproszczony HUD
+
+Domyślnie HUD pokazuje tylko: instrument, cenę i wynik dnia; pozycję (kierunek, świeca wejścia, cena, SL/TP,
+bieżący wynik) albo linię „co dalej” (⏳ szykuję się / ❌ nie wejdę, bo…); 3 ostatnie transakcje; ostatni alarm
+i kanał ntfy. Wszystkie szczegóły (kompas, SMC, model, powody) – przycisk **ℹ️ Szczegóły**.
+
+## Filtry z testów na żywo
+
+- **🔁 Odwrócenie:** wejście mimo przeciwnego trendu 5m, gdy 1m potwierdza odwrócenie (BOS, 3 świece za EMA20,
+  MACD) i EMA20 na 5m przestała iść przeciw (`bot/EntryFilters.kt`).
+- **ZAKRES** nie gra przeciw silnemu impulsowi 1m (RSI ≥ 65 / ≤ 35 z MACD w stronę impulsu), chyba że pojawi się
+  świeca odrzucenia.
+- **Wyjście przy odwróceniu** jest wyłączone dla pozycji z ZAKRESU i w konsolidacji (chroni SL) oraz nie zamyka
+  na zamknięciu świecy impulsowej przeciw pozycji – czeka na następną; jeśli ta cofnie impuls o ≥ 50%, trzyma.
 
 ## Zdalny dostęp (AnyDesk)
 
