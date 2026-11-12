@@ -22,11 +22,12 @@ object Ntfy {
     private const val SERVER = "https://ntfy.sh/"
     private const val TAG = "Ntfy"
 
-    /** Priorytety ntfy: 5 = pilne (dźwięk mimo trybu cichego), 4 = wysoki, 3 = zwykły, 2 = cichy. */
+    /** Priorytety ntfy: 5 = pilne (dźwięk mimo trybu cichego), 4 = wysoki, 3 = zwykły, 2 = cichy, 1 = bez powiadomienia (tylko lista). */
     const val URGENT = 5
     const val HIGH = 4
     const val NORMAL = 3
     const val QUIET = 2
+    const val MIN = 1
 
     @Volatile var topic: String? = null
         private set
