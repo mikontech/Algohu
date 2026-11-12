@@ -437,6 +437,7 @@ class BotOrchestrator(
             }
             listOfNotNull(
                 "🧭 PLAN: CZEKAM" + (block?.let { " – $it" } ?: " – żadna z 4 strategii nie daje jeszcze sygnału"),
+                topBlocks()?.let { "• ⏳ Ostatnia godzina – najczęstsze powody: $it" },
                 smcPlan(inst, sh),
                 "• ⚡ RT: " + (rtInfo[inst] ?: "zbieram świece 1m…") + (orb?.let { "\n• ⚡ ORB: $it" } ?: ""),
                 "• 📈 " + (rangeInfo[inst] ?: "ZAKRES: zbieram świece 1m…"),
@@ -1251,7 +1252,7 @@ class BotOrchestrator(
     ): OrderRequest? {
         risk.closingOrder(symbol, side, price)?.let { return it.copy(reason = "$reason (zamknięcie)") }
         dataBlock(symbol)?.let { why ->
-            if (rtNotes.add("data:$symbol:$why:${System.currentTimeMillis() / 60_000}")) msg("📡 $symbol: $reason – wstrzymane: $why")
+            if (rtNotes.add("data:$symbol:$why:${System.currentTimeMillis() / 60_000}")) { msg("📡 $symbol: $reason – wstrzymane: $why"); countBlock("📡 $why") }
             return null
         }
         val pv = pointValue ?: run {
@@ -1273,7 +1274,8 @@ class BotOrchestrator(
                     smcNote[symbol] = "punkt zanegowania za daleko: SL %.0f zł > %.0f zł – odpuszczam".format(loss, SL_MAX_PLN)
                     return null
                 }
-                val target = loss.coerceIn(SL_MIN_PLN, SL_MAX_PLN)
+                // SMC: SL za ekstremum sweepu to punkt zanegowania – poszerzanie go do 15 zł psuło R:R i blokowało każde wejście.
+                val target = loss.coerceIn(if (structural) SMC_SL_MIN_PLN else SL_MIN_PLN, SL_MAX_PLN)
                 if (abs(loss - target) > 0.01) stop = price - d * target / perPrice
             }
         }
@@ -1306,7 +1308,7 @@ class BotOrchestrator(
             return OrderRequest(symbol, side, qty, price, stop, reason, pointValue = pv, takeProfit = tp, tier = tier, fixedSize = true)
         }
         traderCheck(symbol, side, price, stop, tp)?.let { why ->
-            if (rtNotes.add("trader:$symbol:$why:${System.currentTimeMillis() / 60_000}")) msg("🎩 $symbol: $reason – odpuszczam: $why")
+            if (rtNotes.add("trader:$symbol:$why:${System.currentTimeMillis() / 60_000}")) { msg("🎩 $symbol: $reason – odpuszczam: $why"); countBlock("🎩 $why") }
             traderNote[symbol] = why
             return null
         }
@@ -1315,6 +1317,18 @@ class BotOrchestrator(
     }
 
     private val traderNote = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** Powody „nie wchodzę” z ostatniej godziny (znormalizowane, liczone raz na minutę) – do HUD-a. */
+    private val blockLog = java.util.Collections.synchronizedList(ArrayList<Pair<Long, String>>())
+    private fun countBlock(reason: String) {
+        val now = System.currentTimeMillis()
+        val key = reason.replace(Regex("[0-9]+([.,][0-9]+)?"), "#").take(70)
+        synchronized(blockLog) { blockLog.add(now to key); blockLog.removeAll { now - it.first > 3_600_000 } }
+    }
+    private fun topBlocks(): String? = synchronized(blockLog) {
+        blockLog.groupingBy { it.second }.eachCount().entries.sortedByDescending { it.value }.take(3)
+            .takeIf { it.isNotEmpty() }?.joinToString(" • ") { "${it.value} min: ${it.key}" }
+    }
 
     // ───────────── 🏦 SMC: sweep płynności → CHoCH → wejście, SL za ekstremum, TP na przeciwnej płynności ─────────────
 
@@ -1335,6 +1349,7 @@ class BotOrchestrator(
         val sh = q?.let { basis(inst, it) } ?: 0.0
         val res = smc.evaluate(m1, m5, px, spreadOf(inst), now, sh, aggregators["$inst@${Learner.M1}"]?.current())
         smcResult[inst] = res
+        if (res.setup == null && rtNotes.add("smcwhy:${res.note.replace(Regex("[0-9.,]+"), "#")}:${now / 60_000}")) countBlock("🏦 ${res.note.removePrefix("NO TRADE – ")}")
         val s = res.setup ?: return
         if (s.key in smcTaken) return
         val sessKey = "$inst:${res.session}:${now / 86_400_000L}"
@@ -1346,7 +1361,7 @@ class BotOrchestrator(
         smcTaken.add(s.key); while (smcTaken.size > 100) smcTaken.remove(smcTaken.first())
         smcNote.remove(inst)
         val order = buildOrder(inst, s.side, px, s.stop, s.target, s.reason, pointValue(inst), Tier.AGGRESSIVE, structural = true) ?: run {
-            msg("🏦 $inst: ${s.reason} – ${smcNote[inst] ?: "odrzucone"}"); return
+            msg("🏦 $inst: ${s.reason} – ${smcNote[inst] ?: "odrzucone"}"); countBlock("🏦 ${smcNote[inst] ?: "odrzucone"}"); return
         }
         smcSessionCount[sessKey] = n + 1
         msg("🏦 $inst: ${s.reason} – WCHODZĘ")
@@ -1402,8 +1417,9 @@ class BotOrchestrator(
             val room = (wall - price) * dir
             val need = abs(tp - price)
             // Tylko gdy ekstremum jest przed nami (nie wybicie) – TP musi zmieścić się choć w 60% drogi.
-            if (room > 0 && room < 0.6 * need) return "%s %.2f za blisko (miejsce %.2f, TP potrzebuje %.2f)".format(
-                if (dir > 0) "opór" else "wsparcie", wall, room, need)
+            val oneR = abs(price - stop)
+            if (room > 0 && room < oneR) return "%s %.2f za blisko (miejsce %.2f < 1R %.2f)".format(
+                if (dir > 0) "opór" else "wsparcie", wall, room, oneR)
         }
         return null
     }
@@ -1643,6 +1659,7 @@ class BotOrchestrator(
         const val IMPULSE_MIN_ATR = 0.7          // przesuwanie TP/SL za impulsem od zysku 0,7×ATR
         const val SL_MIN_PLN = 15.0              // strata przy SL: min. 15 PLN…
         const val SL_MAX_PLN = 20.0              // …maks. 20 PLN (przy stałym locie)
+        const val SMC_SL_MIN_PLN = 8.0           // SMC: SL strukturalny, min. 8 PLN (szum), maks. 20 PLN
         /** false = bot sam nie zamyka pozycji na minusie (stratę zamyka tylko SL 15–20 PLN / koniec sesji). */
         const val EARLY_LOSS_EXITS = false
         /** Pozycję zamyka WYŁĄCZNIE Stop Loss (przesuwany za zyskiem); bez TP, bez wyjść bota, bez zamykania na koniec sesji. */
