@@ -11,3 +11,5 @@
 *.keystore
 *.jks
 secrets.properties
+/tools/replay/data/
+__pycache__/
