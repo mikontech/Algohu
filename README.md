@@ -104,6 +104,11 @@ przyciskiem „Skopiuj raport danych”.
 - **KILL:** przytrzymanie przycisku w HUD albo akcja w powiadomieniu blokuje nowe wejścia
   i próbuje zamknąć otwartą pozycję przez ekran pozycji w XTB. Kill-switch włącza się też sam,
   gdy po kliknięciu nie da się zweryfikować stanu zlecenia w XTB.
+- **Zawieszone XTB:** gdy XTB pokaże ekran „Coś poszło nie tak … Odśwież”, bot sam naciska „Odśwież”
+  (2 próby), a gdy to nie pomaga – otwiera XTB od nowa (maks. raz na minutę) i wysyła alarm z dźwiękiem
+  (`execution/XtbErrorRecovery.kt`). Działa w trybie AUTO.
+- **Strażnik pozycji:** gdy bot ma otwartą pozycję, a od 45 s nie widzi jej biletu w XTB, wysyła alarm
+  (powiadomienie „Algo HUD – alarmy”) i powtarza go co 2 min, dopóki nie wrócisz do biletu.
 - **Weryfikacja instrumentu:** przed kliknięciem bot sprawdza, czy na ekranie XTB jest instrument ze zlecenia.
 - **Tarcza dotyku:** w trybie AUTO ekran może ignorować dotknięcia; 3× „głośność w dół”
   odblokowuje ją na 5 minut.
