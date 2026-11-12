@@ -16,6 +16,10 @@ import com.example.algohud.core.Side
  *  • od wejścia minęły ≥ [MIN_BARS_IN_TRADE] pełne świece (nie reagujemy na szum zaraz po wejściu),
  *  • cena cofnęła się od najlepszego punktu o ≥ [MIN_RETRACE_ATR]×ATR (pojedyncze szarpnięcie to nie odwrócenie).
  * Pojedyncza świeca przeciw nigdy nie zamyka pozycji – stratę w szumie dalej zamyka SL w XTB.
+ *
+ * Świeca impulsowa przeciw pozycji (≥ [IMPULSE_ATR]×ATR): nie zamykamy na jej zamknięciu (po wystrzale
+ * często przychodzi cofnięcie – test 12.11, 19:13). Czekamy na kolejną świecę; jeśli cofnie impuls o ≥ 50%,
+ * licznik potwierdzeń się zeruje i pozycja zostaje.
  */
 class ReversalGuard {
 
@@ -33,6 +37,7 @@ class ReversalGuard {
     private var lastBar = 0L
     private var streak = 0
     private var last: Verdict? = null
+    private var deferredBar = -1L
 
     /**
      * @param positionKey stały identyfikator pozycji (np. czas otwarcia) – zmiana zeruje licznik potwierdzeń.
@@ -47,7 +52,7 @@ class ReversalGuard {
         m1: List<Bar>,
         score: TrendScore.Score?
     ): Verdict? {
-        if (key != positionKey) { key = positionKey; lastBar = 0L; streak = 0; last = null }
+        if (key != positionKey) { key = positionKey; lastBar = 0L; streak = 0; last = null; deferredBar = -1L }
         val bar = m1.lastOrNull() ?: return last
         if (bar.start == lastBar) return last
         lastBar = bar.start
@@ -76,6 +81,14 @@ class ReversalGuard {
             if (momentum) "momentum przeciw" else null,
             if (compass) "kompas %+.0f".format((score?.value ?: 0.0) * 100) else null
         )
+        val prev = if (m1.size >= 2) m1[m1.size - 2] else null
+        if (prev != null && EntryFilters.isImpulse(prev, atr, -dir, IMPULSE_ATR)) {
+            val retraced = (prev.close - closedBar.close) * (-dir) >= 0.5 * (prev.high - prev.low)
+            if (retraced) {
+                streak = 0
+                return Verdict(false, met, 0, "impuls przeciw pozycji cofnięty o ≥ 50% – trzymam pozycję")
+            }
+        }
         if (met < 2 || retrace < MIN_RETRACE_ATR) {
             streak = 0
             val why = when {
@@ -86,6 +99,12 @@ class ReversalGuard {
         }
         streak++
         val text = "${names.joinToString(" + ")}, cofnięcie %.1f×ATR".format(retrace)
+        // Odroczenie tylko raz: seria impulsów jedna po drugiej to już prawdziwe odwrócenie, nie pojedynczy wystrzał.
+        if (EntryFilters.isImpulse(closedBar, atr, -dir, IMPULSE_ATR) && deferredBar != prev?.start) {
+            deferredBar = closedBar.start
+            streak = minOf(streak, CONFIRM_BARS - 1)
+            return Verdict(false, met, streak, "świeca impulsowa przeciw pozycji – nie zamykam na jej szczycie, czekam na następną ($text)")
+        }
         return if (streak >= CONFIRM_BARS) Verdict(true, met, streak, "odwrócenie trendu potwierdzone: $text")
         else Verdict(false, met, streak, "możliwe odwrócenie ($streak/$CONFIRM_BARS świec): $text")
     }
@@ -109,5 +128,6 @@ class ReversalGuard {
         const val CONFIRM_BARS = 2
         const val MIN_RETRACE_ATR = 0.5
         const val SCORE_AGAINST = 0.35
+        const val IMPULSE_ATR = 1.5
     }
 }
