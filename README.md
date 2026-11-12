@@ -44,7 +44,7 @@ Wybrany tryb jest zapamiętywany i przywracany po restarcie usługi.
 
 | Strategia | Opis | Plik |
 |---|---|---|
-| SMC XAU | Sweep płynności (Asia High/Low, PDH/PDL, swingi z 60 min) → CHoCH na M1, SL za ekstremum sweepu, TP na przeciwnej płynności, kontekst H1. Tylko dla GOLD/XAU. Maks. 2 wejścia na sesję. | `bot/SmcEngine.kt` |
+| SMC XAU | Sweep płynności (Asia High/Low, PDH/PDL, swingi z 60 min) → CHoCH na M1, SL za ekstremum sweepu, TP na przeciwnej płynności, kontekst H1. Tylko dla GOLD/XAU. Maks. 3 wejścia na sesję. | `bot/SmcEngine.kt` |
 | RT / ORB | Impuls świecy 1m w czasie rzeczywistym i wybicie z zakresu otwarcia (pierwsze 5 min, aktywne 15 min). | `bot/BotOrchestrator.kt` |
 | Zakres | Kupno po odbiciu od dolnych 20% zakresu z 30 świec 1m, sprzedaż przy górze; wyłączona w silnym trendzie. | `bot/BotOrchestrator.kt` |
 | Turniej | Warianty strategii (5m i 1m) handlują „na sucho”; handluje tylko zwycięzca z dodatnim, statystycznie istotnym wynikiem. | `bot/Learning.kt` |
@@ -86,6 +86,21 @@ Wartości są stałymi w `BotOrchestrator.kt` (blok `companion object`):
 - **Sesje:** handel przez całą dobę (Azja, Londyn, Nowy Jork), bez nowych wejść 30 min przed
   zamknięciem sesji instrumentu.
 - **Spread:** filtr względem odległości SL oraz względem typowego spreadu instrumentu (`bot/SpreadGuard.kt`).
+
+### Szybkość i częstość wejść
+
+- **Szybkie wejście:** SL, TP i wolumen są wpisywane do biletu XTB bez przewijania ekranu, każda
+  wartość jest sprawdzana odczytem zwrotnym, a potem bot klika Buy/Sell. Gdy cokolwiek się nie
+  zgadza, bot wraca do pełnej ścieżki z przewijaniem (`FAST_ENTRY` w `AutoExecutionService.kt`).
+  HUD pokazuje czas „od decyzji do kliknięcia” i użytą ścieżkę.
+- **Odczyt ceny z ekranu** co 0,5 s (`SCREEN_POLL_MS`).
+- **Luźniejsze progi:** RT – świeca ≥ 1,0×ATR, korpus ≥ 65%, knot ≤ 20%, wybicie 8 świec;
+  Zakres – odbicie ≥ 0,25×ATR; SMC – do 3 wejść na sesję.
+- **Mniej filtrów:** `TRADER_STRICT = false` wyłącza filtry „pod prąd trendu 5m”, „nie gonię”
+  i „opór/wsparcie za blisko”. Zostają: przerwa wokół danych USA, koszt spreadu i martwy rynek.
+
+Więcej wejść to więcej zapłaconych spreadów; w symulacji liczba transakcji rośnie o ok. 50%,
+a wynik na transakcję pozostaje ujemny (`tools/replay/freq.py`).
 
 ### Okna publikacji danych
 
@@ -197,6 +212,8 @@ formularz SL/TP i parser wierszy pozycji. `BotOrchestrator` i obsługa ekranu XT
 - **Ocena na bieżąco nie daje przewagi.** Tryb `LIVE` tylko wstrzymuje strategię po serii słabych
   wyników; w symulacji strategie nie miały przewagi po spreadzie, więc oczekiwany wynik
   pozostaje ujemny. Tryb `STRICT` blokuje zlecenia do czasu udowodnienia przewagi.
+- **Szybkie wejście nie było testowane na telefonie.** Zostało zbudowane i przechodzi testy
+  jednostkowe, ale klikanie w XTB wymaga sprawdzenia na koncie demo.
 - **Automatyzacja zależy od wyglądu XTB.** Identyfikatory widoków pochodzą ze zrzutów ekranu;
   aktualizacja aplikacji brokera może zepsuć odczyt lub klikanie.
 - **Godziny sesji** w `bot/MarketHours.kt` są wpisane ręcznie i wymagają weryfikacji w XTB.
