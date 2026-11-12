@@ -799,8 +799,9 @@ class BotOrchestrator(
         )
     }
 
-    private fun dataBlock(inst: String): String? = DataQuality.entryBlock(gateInput(inst)).also { dataNote[inst] = it }
-    private val dataNote = java.util.concurrent.ConcurrentHashMap<String, String?>()
+    // ConcurrentHashMap nie przyjmuje null – „dane OK” = usunięcie wpisu (wcześniej NullPointerException przy KAŻDYM wejściu).
+    private fun dataBlock(inst: String): String? = DataQuality.entryBlock(gateInput(inst)).also { if (it == null) dataNote.remove(inst) else dataNote[inst] = it }
+    private val dataNote = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     /** Przerwa w danych > 30 s → po powrocie najpierw uzgodnienie pozycji z XTB, dopiero potem nowe wejścia. */
     private suspend fun watchDataOutage(inst: String, now: Long) {
