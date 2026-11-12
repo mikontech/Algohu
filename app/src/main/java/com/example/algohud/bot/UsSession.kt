@@ -79,22 +79,26 @@ object UsSession {
     }
 
     /**
-     * Blackout wokół publikacji danych z USA (czas ET): 8:30 (NFP/CPI/PPI…), 10:00 (ISM, JOLTS…), 14:00 (FOMC).
+     * Krótka przerwa na NOWE wejścia w samym momencie publikacji danych z USA (czas ET):
+     * 8:30 (NFP/CPI/PPI, zasiłki…), 10:00 (ISM, JOLTS…), 14:00 (FOMC) – przez [DATA_PAUSE_MIN] min.
+     * Bot omija tylko pierwszy wystrzał i szeroki spread, a zaraz potem może grać ruch po danych.
      * Null = można otwierać pozycje. Wyjść z pozycji nie blokuje.
      */
     fun dataBlackout(nowMs: Long): String? {
         val t = Instant.ofEpochMilli(nowMs).atZone(NY)
         if (t.dayOfWeek == DayOfWeek.SATURDAY || t.dayOfWeek == DayOfWeek.SUNDAY) return null
         val m = t.hour * 60 + t.minute
-        val pl = { h: Int, min: Int ->
-            val z = t.toLocalDate().atTime(h, min).atZone(NY).withZoneSameInstant(PL)
-            "%02d:%02d".format(z.hour, z.minute)
+        for ((h, min, name) in DATA_TIMES) {
+            val start = h * 60 + min
+            if (m in start until start + DATA_PAUSE_MIN) {
+                val z = t.toLocalDate().atTime(h, min).atZone(NY).withZoneSameInstant(PL)
+                val end = z.plusMinutes(DATA_PAUSE_MIN.toLong())
+                return "%s %02d:%02d – przerwa na wejścia do %02d:%02d (spajk i szeroki spread)".format(name, z.hour, z.minute, end.hour, end.minute)
+            }
         }
-        return when {
-            m in (8 * 60 + 25) until (8 * 60 + 40) -> "dane USA ${pl(8, 30)} – nie handluję w spajku"
-            m in (9 * 60 + 55) until (10 * 60 + 10) -> "dane USA ${pl(10, 0)} – blackout 15 min"
-            m in (13 * 60 + 55) until (14 * 60 + 35) -> "okno FOMC ${pl(14, 0)} – blackout"
-            else -> null
-        }
+        return null
     }
+
+    const val DATA_PAUSE_MIN = 2
+    private val DATA_TIMES = listOf(Triple(8, 30, "dane USA"), Triple(10, 0, "dane USA"), Triple(14, 0, "decyzja FOMC"))
 }
