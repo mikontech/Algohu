@@ -1496,7 +1496,7 @@ class BotOrchestrator(
     private val eventsPrimed = HashSet<String>()
 
     /** Setup „prawie gotowy” – do linii „co dalej” w HUD i cichego powiadomienia (maks. raz na 5 min). */
-    private fun arm(inst: String, text: String) {
+    private suspend fun arm(inst: String, text: String) {
         armedNote[inst] = System.currentTimeMillis() to text
         if (risk.position(inst) == null && inst == hudLearningInstrument) {
             Ntfy.send("⏳ $inst: za chwilę mogę wejść", text, Ntfy.QUIET, "hourglass", key = "arm:$inst", minGapMs = ARM_NOTIFY_GAP_MS)
@@ -1525,7 +1525,7 @@ class BotOrchestrator(
     private fun sideName(s: Side) = if (s == Side.BUY) "LONG" else "SHORT"
 
     /** Co sekundę: nowa/zamknięta pozycja → powiadomienie ntfy (wejście: kierunek, świeca, cena, SL/TP; wyjście: wynik). */
-    private fun tradeEvents(inst: String, sh: Double) {
+    private suspend fun tradeEvents(inst: String, sh: Double) {
         val pos = risk.position(inst)
         val key = pos?.let { "${it.openedAt}:${it.entryPrice}" }
         if (eventsPrimed.add(inst)) { // pierwszy odczyt po starcie – bez powiadomień o pozycji sprzed restartu
@@ -1561,7 +1561,7 @@ class BotOrchestrator(
     }
 
     /** Uproszczony HUD: tylko pozycja, „co dalej”, ostatnie transakcje, alarm i kanał ntfy. */
-    private fun compactView(inst: String, now: Long, sh: Double): String {
+    private suspend fun compactView(inst: String, now: Long, sh: Double): String {
         val px = lastPx[inst]?.first
         val lines = ArrayList<String>()
         val day = journal.all().filter { !it.paper && now - it.closedAt < 24 * 3_600_000 && java.time.Instant.ofEpochMilli(it.closedAt).atZone(UsSession.PL).toLocalDate() == java.time.Instant.ofEpochMilli(now).atZone(UsSession.PL).toLocalDate() }
