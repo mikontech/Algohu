@@ -501,6 +501,7 @@ class BotOrchestrator(
             watchDataOutage(inst, now)
             smcTick(inst, px, now)
             usOpenTick(inst, px, now)
+            positionWatch(inst, now)
             if (inst == hudLearningInstrument) updatePlan(inst, now)
             if (inst == hudLearningInstrument) {
                 val lc = lastM1Close[inst] ?: now.also { lastM1Close[inst] = it }
@@ -903,7 +904,9 @@ class BotOrchestrator(
             DataQuality.Field("Godziny handlu", MarketHours.status(inst, now).let { st -> if (st.open) "otwarte, do zamknięcia ${st.minutesToClose ?: "?"} min" else "zamknięte" }, "wbudowany harmonogram (nie z XTB)", now, "", Long.MAX_VALUE),
             DataQuality.Field("Kalendarz / wiadomości", null, "nie zintegrowane z XTB; stałe okna danych USA", null, "", 0)
         )
-        val block = dataNote[inst] ?: DataQuality.entryBlock(g)
+        // Zawsze świeża ocena: wcześniej HUD pokazywał powód z OSTATNIEJ próby wejścia (np. chwilowe „Buy < Sell”)
+        // aż do następnej próby – wyglądało to, jakby błąd trwał cały czas.
+        val block = DataQuality.entryBlock(g).also { if (it == null) dataNote.remove(inst) else dataNote[inst] = it }
         DataQuality.lastReport = buildString {
             appendLine("📡 Dane $inst – ${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.ROOT).format(java.util.Date(now))}")
             appendLine("Wejścia: " + (block?.let { "⛔ $it" } ?: "✓ dane wiarygodne"))
@@ -1418,6 +1421,33 @@ class BotOrchestrator(
         if (r is ExecutionResult.Filled || r is ExecutionResult.Submitted) res.status.openMs?.let { orb.markTaken(it) }
     }
 
+    private val blindSince = HashMap<String, Long>()
+    private val blindAlertAt = HashMap<String, Long>()
+
+    /**
+     * Strażnik pozycji: bot ma prawdziwą pozycję, a od [BLIND_ALERT_MS] nie widzi biletu tego instrumentu w XTB
+     * (zawieszone XTB, inny ekran, telefon zablokowany) – nie może jej zamknąć ani przesunąć SL/TP. Alarm co [BLIND_ALERT_EVERY_MS].
+     */
+    private suspend fun positionWatch(inst: String, now: Long) {
+        val pos = risk.position(inst)
+        if (pos == null || pos.paper || engine.mode.value == ExecutionMode.DRY_RUN) { blindSince.remove(inst); return }
+        val q = AutoExecutionService.screenQuote.value
+        val sees = q != null && q.isFresh(now) && q.instrument == inst
+        if (sees) {
+            if (blindSince.remove(inst) != null && blindAlertAt.remove(inst) != null) msg("✅ $inst: znów widzę bilet w XTB – pozycja pod nadzorem")
+            return
+        }
+        val since = blindSince.getOrPut(inst) { now }
+        if (now - since < BLIND_ALERT_MS) return
+        if (now - (blindAlertAt[inst] ?: 0L) < BLIND_ALERT_EVERY_MS) return
+        blindAlertAt[inst] = now
+        val why = if (AutoExecutionService.instance?.xtbErrorVisible == true) "XTB pokazuje błąd" else AutoExecutionService.diag
+        val side = if (pos.side == Side.BUY) "LONG" else "SHORT"
+        AutoExecutionService.instance?.alert(
+            "Pozycja $side $inst bez nadzoru od ${(now - since) / 1000} s ($why). Otwórz w XTB bilet $inst – SL w XTB nadal chroni pozycję."
+        ) ?: msg("🚨 $inst: pozycja bez nadzoru – $why")
+    }
+
     private fun compassLine(inst: String): String =
         "• 🧭 Kompas: " + (compass(inst)?.describe() ?: "zbieram świece…")
 
@@ -1770,6 +1800,8 @@ class BotOrchestrator(
         const val EARLY_LOSS_EXITS = false
         /** Pozycję zamyka WYŁĄCZNIE Stop Loss (przesuwany za zyskiem); bez TP, bez wyjść bota, bez zamykania na koniec sesji. */
         const val BROKER_EXITS_ONLY = true       // wyjścia: TP/SL w XTB (+ odwrócenie trendu, gdy TREND_EXIT)
+        const val BLIND_ALERT_MS = 45_000L        // alarm: pozycja otwarta, a bot nie widzi biletu w XTB od 45 s…
+        const val BLIND_ALERT_EVERY_MS = 120_000L //  …i potem co 2 min, dopóki trwa
         const val TREND_EXIT = true              // bot sam zamyka przy POTWIERDZONEJ tendencji przeciwnej (ReversalGuard)
         const val BIG_MOVE_MIN_R = 1.0           // „duży wzrost”: silny impuls przy zysku ≥ 1R…
         const val TP_EXTEND_ATR = 1.5            // …TP odsuwany na najlepszą cenę + max(1,5×ATR, 1R)
