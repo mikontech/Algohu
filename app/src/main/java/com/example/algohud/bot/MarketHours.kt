@@ -26,7 +26,8 @@ object MarketHours {
     )
 
     private fun t(h: Int, m: Int) = LocalTime.of(h, m)
-    private val COMMODITY = Hours(listOf(Session(WEEKDAYS, t(0, 5), t(23, 0))), listOf(t(9, 0), t(15, 30)))
+    // Otwarcie USA (9:30 ET) obsługuje osobno UsOpenOrb – liczone w czasie Nowego Jorku, nie na sztywno 15:30.
+    private val COMMODITY = Hours(listOf(Session(WEEKDAYS, t(0, 5), t(23, 0))), listOf(t(9, 0)))
     private val ALWAYS = Hours(emptyList(), emptyList())
 
     val TABLE: Map<String, Hours> = mapOf(
@@ -36,14 +37,17 @@ object MarketHours {
         "OIL.WTI" to COMMODITY,
         "COFFEE" to Hours(listOf(Session(WEEKDAYS, t(10, 15), t(19, 30))), listOf(t(10, 15))),
         "COCOA" to Hours(listOf(Session(WEEKDAYS, t(10, 45), t(19, 30))), listOf(t(10, 45))),
-        "DE40" to Hours(listOf(Session(WEEKDAYS, t(8, 0), t(22, 0))), listOf(t(9, 0), t(15, 30))),
+        "DE40" to Hours(listOf(Session(WEEKDAYS, t(8, 0), t(22, 0))), listOf(t(9, 0))),
         "W20" to Hours(listOf(Session(WEEKDAYS, t(9, 0), t(16, 50))), listOf(t(9, 0))),
-        "US100" to Hours(listOf(Session(WEEKDAYS, t(0, 5), t(23, 0))), listOf(t(15, 30))),
-        "US500" to Hours(listOf(Session(WEEKDAYS, t(0, 5), t(23, 0))), listOf(t(15, 30))),
-        "US30" to Hours(listOf(Session(WEEKDAYS, t(0, 5), t(23, 0))), listOf(t(15, 30))),
+        "US100" to Hours(listOf(Session(WEEKDAYS, t(0, 5), t(23, 0))), emptyList()),
+        "US500" to Hours(listOf(Session(WEEKDAYS, t(0, 5), t(23, 0))), emptyList()),
+        "US30" to Hours(listOf(Session(WEEKDAYS, t(0, 5), t(23, 0))), emptyList()),
         "BITCOIN" to ALWAYS,
         "ETHEREUM" to ALWAYS
     )
+
+    /** Instrumenty, na których bot gra otwarcie sesji w USA (UsOpenOrb). */
+    val US_OPEN_TRADED = setOf("GOLD", "SILVER", "OIL", "OIL.WTI", "DE40", "US100", "US500", "US30")
 
     fun status(inst: String, nowMs: Long): Status {
         val h = TABLE[inst] ?: COMMODITY

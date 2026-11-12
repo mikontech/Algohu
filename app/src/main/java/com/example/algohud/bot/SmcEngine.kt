@@ -90,16 +90,8 @@ class SmcEngine(
     }
 
     /** Okna publikacji danych USA (czas PL): 14:30 (CPI/NFP/PPI/GDP), 16:00 (ISM/JOLTS/UoM), 20:00 (FOMC). */
-    fun newsBlackout(ts: Long): String? {
-        val t = Instant.ofEpochMilli(ts).atZone(zone)
-        val m = t.hour * 60 + t.minute
-        return when {
-            m in (14 * 60 + 25) until (14 * 60 + 40) -> "dane USA 14:30 – nie handluję w spajku (14:25–14:40)"
-            m in (15 * 60 + 55) until (16 * 60 + 10) -> "dane USA 16:00 – blackout 15:55–16:10"
-            m in (19 * 60 + 55) until (20 * 60 + 35) -> "okno FOMC 20:00 – blackout 19:55–20:35"
-            else -> null
-        }
-    }
+    /** Blackout wokół danych z USA – liczony w czasie Nowego Jorku (poprawny także w tygodniach przesunięcia czasu). */
+    fun newsBlackout(ts: Long): String? = UsSession.dataBlackout(ts)
 
     /** PDH/PDL z poprzedniego dnia handlowego, Asia High/Low z dzisiejszych 01:00–08:00, swingi z ostatnich 60 min (bez ostatnich 10). */
     fun levels(m5: List<Bar>, m1: List<Bar>, now: Long): Levels {
