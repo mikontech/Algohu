@@ -1260,7 +1260,10 @@ class AutoExecutionService : AccessibilityService() {
         if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) { offTargetSince = 0L; return }
         val now = SystemClock.uptimeMillis()
         val q = _screenQuote.value
-        if (q != null && q.isFresh() && q.instrument != null) { offTargetSince = 0L; navFails = 0; return } // jest bilet (jakikolwiek)
+        // Bilet = tytuł instrumentu I ceny Sell/Buy (lista Rynki ma ten sam identyfikator tytułu – np. „Ohmyhome”).
+        val onTicket = q != null && q.isFresh() && q.instrument != null && q.bid != null && q.ask != null
+        // Bez pozycji wystarczy dowolny bilet (użytkownik mógł sam zmienić instrument); z pozycją – bilet TEJ pozycji.
+        if (onTicket && (!wantedUrgent || q?.instrument.equals(target, ignoreCase = true))) { offTargetSince = 0L; navFails = 0; return }
         if (findOrderConfirm(root) != null) return // trwa składanie zlecenia
         if (offTargetSince == 0L) { offTargetSince = now; return }
         val wait = if (wantedUrgent) NAV_WAIT_URGENT_MS else NAV_WAIT_MS
@@ -1271,6 +1274,8 @@ class AutoExecutionService : AccessibilityService() {
         if (ok) {
             navFails = 0; offTargetSince = 0L
             remoteNote("🧭 XTB: sam otworzyłem bilet $target", force = true)
+            if (wantedUrgent) com.example.algohud.bot.Ntfy.send("🧭 XTB: wróciłem na bilet $target", "pozycja znów pod nadzorem bota",
+                com.example.algohud.bot.Ntfy.NORMAL, "compass")
         } else {
             navFails++
             remoteNote("🧭 XTB: nie znalazłem $target (próba $navFails) – spróbuję ponownie", force = true)
@@ -1294,12 +1299,22 @@ class AutoExecutionService : AccessibilityService() {
         }
     }
 
+    /** Otwarty bilet [target]: tytuł instrumentu i przyciski Sell/Buy (na liście Rynki tytuły wierszy mają ten sam identyfikator). */
     private suspend fun onTarget(target: String): Boolean {
         repeat(6) {
             delay(400)
-            if (xtbTitle(appRoot()).equals(target, ignoreCase = true)) return true
+            val r = appRoot()
+            if (r != null && xtbTitle(r).equals(target, ignoreCase = true) && hasTradeButtons(r)) return true
         }
         return false
+    }
+
+    /** Przyciski „Sell …” / „Buy …” biletu (nie „Sellas Life Sciences” z listy – po słowie musi być koniec albo odstęp). */
+    private fun hasTradeButtons(root: AccessibilityNodeInfo): Boolean = listOf("Sell", "Buy").any { word ->
+        root.findAccessibilityNodeInfosByText(word).any { n ->
+            val t = (n.text ?: n.contentDescription)?.toString()?.trim().orEmpty()
+            n.isVisibleToUser && t.startsWith(word) && (t.length == word.length || t[word.length].isWhitespace())
+        }
     }
 
     private suspend fun navigateTo(target: String): Boolean {
