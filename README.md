@@ -52,6 +52,24 @@ Wybrany tryb jest zapamiętywany i przywracany po restarcie usługi.
 Model predykcji następnej świecy (`bot/NextCandlePredictor.kt`, regresja logistyczna ucząca się
 online) jest obecnie **tylko informacją w HUD** – nie otwiera pozycji.
 
+### Dowód przewagi (pomiar „na sucho”)
+
+Strategie SMC, RT, ORB i Zakres nie składają prawdziwych zleceń, dopóki nie pokażą przewagi po
+kosztach. Każdy sygnał, który przeszedł filtry, jest prowadzony „na sucho” – z tym samym SL, TP
+i prowadzeniem stopu co prawdziwa pozycja, z wejściem i wyjściem po gorszej stronie spreadu
+(`bot/StrategyProof.kt`). Zlecenie w XTB (tryb AUTO/CONFIRM) przechodzi dopiero, gdy strategia ma:
+
+- co najmniej 30 zamkniętych prób,
+- średni wynik z ostatnich 100 prób ≥ +0,10R,
+- wynik istotny statystycznie (t ≥ 2).
+
+Stan każdej strategii widać w planie na HUD (`🧪 Dowód przewagi`). Wyniki są trwałe i przeżywają
+restart. Tryb `DRY_RUN` działa bez zmian. Turniej ma własną, analogiczną bramkę. Bramkę wyłącza
+stała `REQUIRE_PROVEN_EDGE` w `BotOrchestrator.kt`.
+
+Powód: odtworzenie reguł wejść na miesiącu świec 1m złota (`tools/replay/`) dało wynik zbliżony
+do losowych wejść z tym samym SL/TP, czyli średnio stratę rzędu spreadu na transakcji.
+
 ### Parametry wejść i wyjść
 
 Wartości są stałymi w `BotOrchestrator.kt` (blok `companion object`):
@@ -150,6 +168,7 @@ app/src/main/java/com/example/algohud/
 │   ├── Learning.kt                    – strategie turniejowe, ShadowTrader, Learner
 │   ├── NextCandlePredictor.kt         – predykcja następnej świecy (informacyjnie)
 │   ├── DataQuality.kt                 – raport pochodzenia danych i bramka wejść
+│   ├── StrategyProof.kt               – pomiar strategii „na sucho” i bramka prawdziwych zleceń
 │   ├── Bars.kt, CandleEvaluator.kt    – agregacja świec, wskaźniki, ocena impulsu
 │   ├── SpreadGuard.kt, MarketHours.kt, MacroWindows.kt – filtry spreadu, sesji i publikacji
 │   └── CandleRecorder.kt, BarStore.kt – zapis świec do CSV w pamięci aplikacji
@@ -164,7 +183,7 @@ app/src/main/java/com/example/algohud/
 └── overlay/OverlayService.kt          – usługa pierwszoplanowa i pływający HUD
 ```
 
-Testy jednostkowe (`app/src/test/`) obejmują silnik SMC, predyktor świec, bramkę jakości danych,
+Testy jednostkowe (`app/src/test/`) obejmują silnik SMC, predyktor świec, bramkę jakości danych, dowód przewagi strategii,
 formularz SL/TP i parser wierszy pozycji. `BotOrchestrator` i obsługa ekranu XTB nie mają testów.
 
 ## Znane ograniczenia
@@ -172,7 +191,11 @@ formularz SL/TP i parser wierszy pozycji. `BotOrchestrator` i obsługa ekranu XT
 - **Dzienny limit straty jest wyłączony.** `RiskManager.Config.maxDailyLossPct` ma wartość
   nieskończoną, więc kill-switch nie zadziała sam po serii strat.
 - **Brak bramki przed AUTO.** `autoGate` w `OverlayService` zawsze przepuszcza – tryb AUTO można
-  włączyć bez dodatniego wyniku na papierze.
+  włączyć bez dodatniego wyniku na papierze. Prawdziwe zlecenia strategii ogranicza dopiero
+  dowód przewagi (`StrategyProof`).
+- **Dowód przewagi nie gwarantuje zysku.** Przy czterech strategiach i ciągłym sprawdzaniu próg
+  może zostać przekroczony przypadkiem; wynik jest liczony z ostatnich 100 prób, więc bramka
+  zamknie się ponownie, gdy przewaga zniknie.
 - **Automatyzacja zależy od wyglądu XTB.** Identyfikatory widoków pochodzą ze zrzutów ekranu;
   aktualizacja aplikacji brokera może zepsuć odczyt lub klikanie.
 - **Godziny sesji** w `bot/MarketHours.kt` są wpisane ręcznie i wymagają weryfikacji w XTB.
