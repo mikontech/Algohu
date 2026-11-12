@@ -84,6 +84,24 @@ object SlTpVerifier {
     /** Tolerancja: zaokrąglenie do 0,01 przy wpisywaniu ceny (złoto ma 2 miejsca po przecinku). */
     const val DEFAULT_TOLERANCE = 0.011
 
+    /**
+     * Po modyfikacji otwartej pozycji: czy wiersz pozycji pokazuje nowe wartości. null = tej wartości nie zmienialiśmy
+     * (nie sprawdzamy jej).
+     */
+    fun checkModified(row: PositionRowInfo, expectedSl: Double?, expectedTp: Double?, tolerance: Double = DEFAULT_TOLERANCE): SlTpCheck {
+        val problems = ArrayList<String>()
+        fun one(name: String, shown: Double?, expected: Double?) {
+            if (expected == null) return
+            when {
+                shown == null -> problems += "XTB nie pokazuje $name przy pozycji (oczekiwano %.2f)".format(expected)
+                abs(shown - expected) > tolerance -> problems += "XTB pokazuje $name %.2f zamiast %.2f".format(shown, expected)
+            }
+        }
+        one("SL", row.sl, expectedSl)
+        one("TP", row.tp, expectedTp)
+        return if (problems.isEmpty()) SlTpCheck.Ok else SlTpCheck.Mismatch(problems)
+    }
+
     /** Czy przy tej konkretnej pozycji zapisano oczekiwane SL i TP. expectedTp == null → TP nie może być ustawiony. */
     fun check(row: PositionRowInfo, expectedSl: Double, expectedTp: Double?, tolerance: Double = DEFAULT_TOLERANCE): SlTpCheck {
         val problems = ArrayList<String>()

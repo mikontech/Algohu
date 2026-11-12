@@ -40,6 +40,8 @@ class RiskManager(
         val tierRiskPct: List<Double> = listOf(0.005, 0.01, 0.025), // agresywny = 2,5% (profil momentum / RT / ORB)
         /** Maks. dźwignia wg poziomu agresji. */
         val tierLeverage: List<Double> = listOf(3.0, 5.0, 8.0),
+        /** false = stop prowadzi wyłącznie TrailingManager (bot), bez wbudowanego „1R za ceną”. */
+        val autoTrail: Boolean = true,
         val maxOpenPositions: Int = 1,
         val maxOrdersPerMinute: Int = Int.MAX_VALUE,
         val minStopDistancePct: Double = 0.0005,     // min. 0,05% ceny (złoto ≈ 2 USD); RT dodatkowo ≥ 3× spread
@@ -302,16 +304,19 @@ class RiskManager(
         if (r <= 0) return p
         return if (p.side == Side.BUY) {
             val best = max(p.best, price)
-            val stop = if (best - p.entryPrice >= r) max(p.stopPrice, max(p.entryPrice, best - r)) else p.stopPrice
+            val stop = if (config.autoTrail && best - p.entryPrice >= r) max(p.stopPrice, max(p.entryPrice, best - r)) else p.stopPrice
             p.copy(best = best, stopPrice = stop)
         } else {
             val best = min(p.best, price)
-            val stop = if (p.entryPrice - best >= r) min(p.stopPrice, min(p.entryPrice, best + r)) else p.stopPrice
+            val stop = if (config.autoTrail && p.entryPrice - best >= r) min(p.stopPrice, min(p.entryPrice, best + r)) else p.stopPrice
             p.copy(best = best, stopPrice = stop)
         }
     }
 
     suspend fun position(symbol: String): Position? = mutex.withLock { positions[symbol] }
+
+    /** Kapitał z początku dnia (podstawa dziennego limitu straty); 0 = jeszcze nieznany. */
+    fun dayStartEquityValue(): Double = dayStartEquity
 
     /** Dociąga stop pozycji (trailing z zarządzania transakcją) – wyłącznie w stronę zysku. true = przesunięto. */
     suspend fun tightenStop(symbol: String, stop: Double): Boolean = mutex.withLock {

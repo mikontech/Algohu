@@ -44,4 +44,20 @@ class SlTpVerifierTest {
         val same = row(sl = 4069.25)
         assertEquals(1, SlTpVerifier.newRows(listOf(same), listOf(same, same), Side.BUY, 0.001).size)
     }
+
+    @Test fun `modified position - new values shown means accepted`() {
+        val row = PositionRowInfo(Side.BUY, 0.007, "@ 4 000.00", sl = 4000.30, tp = 4021.25)
+        assertEquals(SlTpCheck.Ok, SlTpVerifier.checkModified(row, 4000.3, 4021.25))
+        assertEquals(SlTpCheck.Ok, SlTpVerifier.checkModified(row, 4000.305, null)) // TP nie był zmieniany – nie sprawdzamy
+        assertEquals(SlTpCheck.Ok, SlTpVerifier.checkModified(row, null, 4021.25))
+    }
+
+    @Test fun `modified position - old value still shown or missing means rejected`() {
+        val old = PositionRowInfo(Side.BUY, 0.007, "@ 4 000.00", sl = 3993.0, tp = 4017.5)
+        val c = SlTpVerifier.checkModified(old, 4000.3, 4021.25) as SlTpCheck.Mismatch
+        assertEquals(2, c.problems.size)
+        assertTrue(c.problems[0].contains("SL 3993.00 zamiast 4000.30"))
+        val none = PositionRowInfo(Side.BUY, 0.007, "@ 4 000.00", sl = null, tp = 4017.5)
+        assertTrue(SlTpVerifier.checkModified(none, 4000.3, null) is SlTpCheck.Mismatch)
+    }
 }

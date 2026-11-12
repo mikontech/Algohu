@@ -903,10 +903,50 @@ class AutoExecutionService : AccessibilityService() {
             ?: return ExecutionResult.Rejected("brak przycisku Modyfikuj pozycję")
         if (!click(modify)) return ExecutionResult.Rejected("nie udało się dotknąć Modyfikuj pozycję")
         delay(1_200)
+        // Odczyt ekranu po zmianie: sukces dopiero, gdy wiersz pozycji w XTB pokazuje nowe wartości.
+        val problem = verifyProtection(sl, tp)
+        restoreTicketTop()
+        if (problem != null) return ExecutionResult.Rejected(problem)
         return ExecutionResult.Submitted(
-            "Ustawiono w XTB" + (sl?.let { " SL %.2f".format(it) } ?: "") + (tp?.let { " TP %.2f".format(it) } ?: "") +
-                " – sprawdź na wykresie"
+            "XTB potwierdził" + (sl?.let { " SL %.2f".format(it) } ?: "") + (tp?.let { " TP %.2f".format(it) } ?: "")
         )
+    }
+
+    /**
+     * Po „Modyfikuj pozycję”: wraca z ekranu pozycji na bilet (jeśli XTB sam nie wrócił), odczytuje wiersz pozycji
+     * i porównuje SL/TP z oczekiwanymi. null = XTB przyjął wartości; inaczej opis problemu.
+     */
+    private suspend fun verifyProtection(sl: Double?, tp: Double?): String? {
+        var last = "nie udało się odczytać SL/TP przy pozycji po modyfikacji"
+        var backed = false
+        val deadline = SystemClock.uptimeMillis() + 8_000
+        while (SystemClock.uptimeMillis() < deadline) {
+            val root = appRoot()
+            if (root != null && root.packageName?.toString() == ScreenScanner.XTB_PACKAGE) {
+                if (ScreenScanner.findById(root, "ModifyPositionButton").isNotEmpty()) {
+                    // Nadal ekran pozycji – po chwili wracamy na bilet, gdzie widać wiersz pozycji z SL/TP.
+                    if (!backed && SystemClock.uptimeMillis() > deadline - 6_500) {
+                        backed = true
+                        performGlobalAction(GLOBAL_ACTION_BACK)
+                    }
+                } else {
+                    var rows = readPositionRows(root)
+                    if (rows.isEmpty()) {
+                        revealById("PositionRow0")
+                        rows = appRoot()?.let { readPositionRows(it) }.orEmpty()
+                    }
+                    when {
+                        rows.size > 1 -> last = "kilka pozycji na ekranie – nie wiem, którą sprawdzić"
+                        rows.size == 1 -> when (val c = SlTpVerifier.checkModified(rows[0], sl, tp)) {
+                            SlTpCheck.Ok -> return null
+                            is SlTpCheck.Mismatch -> last = c.problems.joinToString("; ") // XTB mogło jeszcze nie odświeżyć
+                        }
+                    }
+                }
+            }
+            delay(600)
+        }
+        return last
     }
 
     private suspend fun doClosePosition(instrument: String): ExecutionResult {

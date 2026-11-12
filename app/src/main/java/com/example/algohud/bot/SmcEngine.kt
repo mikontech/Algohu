@@ -89,14 +89,18 @@ class SmcEngine(
         }
     }
 
-    /** Okna publikacji danych USA (czas PL): 14:30 (CPI/NFP/PPI/GDP), 16:00 (ISM/JOLTS/UoM), 20:00 (FOMC). */
+    /**
+     * Okna publikacji danych USA liczone w czasie Nowego Jorku: 8:30 (CPI/NFP/PPI/GDP), 10:00 (ISM/JOLTS/UoM), 14:00 (FOMC).
+     * W Polsce to zwykle 14:30 / 16:00 / 20:00, a w tygodniach różnej zmiany czasu – godzinę wcześniej.
+     */
     fun newsBlackout(ts: Long): String? {
-        val t = Instant.ofEpochMilli(ts).atZone(zone)
+        val t = Instant.ofEpochMilli(ts).atZone(UsOpenSession.ZONE)
         val m = t.hour * 60 + t.minute
+        fun local(h: Int, min: Int) = t.withHour(h).withMinute(min).withZoneSameInstant(zone).toLocalTime().toString()
         return when {
-            m in (14 * 60 + 25) until (14 * 60 + 40) -> "dane USA 14:30 – nie handluję w spajku (14:25–14:40)"
-            m in (15 * 60 + 55) until (16 * 60 + 10) -> "dane USA 16:00 – blackout 15:55–16:10"
-            m in (19 * 60 + 55) until (20 * 60 + 35) -> "okno FOMC 20:00 – blackout 19:55–20:35"
+            m in (8 * 60 + 25) until (8 * 60 + 40) -> "dane USA ${local(8, 30)} – nie handluję w spajku (${local(8, 25)}–${local(8, 40)})"
+            m in (9 * 60 + 55) until (10 * 60 + 10) -> "dane USA ${local(10, 0)} – blackout ${local(9, 55)}–${local(10, 10)}"
+            m in (13 * 60 + 55) until (14 * 60 + 35) -> "okno FOMC ${local(14, 0)} – blackout ${local(13, 55)}–${local(14, 35)}"
             else -> null
         }
     }

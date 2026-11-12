@@ -72,20 +72,71 @@ Odtworzenie reguł wejść na miesiącu świec 1m złota (`tools/replay/`) dało
 losowych wejść z tym samym SL/TP, czyli średnio stratę rzędu spreadu na transakcji. Tryb `LIVE`
 zmniejszył w tej symulacji liczbę transakcji o ok. połowę, ale nie poprawił wyniku na transakcję.
 
+### SignalEngine – jedna decyzja LONG / SHORT / BRAK
+
+`bot/SignalEngine.kt` łączy trzy warstwy w wynik punktowy (score) osobno dla LONG i SHORT. Liczy się
+przy każdym zamknięciu świecy M1:
+
+| Warstwa | Co liczy |
+|---|---|
+| Trend wyższego interwału (H1, M15 – składane ze świec M5) | struktura HH/HL vs LH/LL, EMA 50/200, nachylenie EMA |
+| Momentum (M5, M1) | RSI, histogram MACD |
+| Price action / SMC (M1) | BOS / CHoCH, liquidity sweep, odrzucenie strefy popytu/podaży |
+
+- **Własne wejście „SCORE”**: score ≥ `ENTRY_SCORE` z przewagą `ENTRY_LEAD` nad stroną przeciwną,
+  kierunek zgodny z trendem H1/M15 (wyjątek: świeży CHoCH na M1).
+- **Bramka dla pozostałych strategii** (SMC, RT, ORB, Zakres, Turniej): wejście tylko wtedy, gdy
+  score po tej stronie ≥ `CONFIRM_SCORE` i trend wyższego interwału się zgadza.
+- **Filtry**: brak wejść przy spreadzie > `MAX_SPREAD_ATR_M5` × ATR(M5) oraz gdy ATR M1 jest poza
+  zakresem `ATR_RATIO_MIN`…`ATR_RATIO_MAX` względem swojej normy.
+
+Wszystkie progi i wagi są w jednym pliku: **`bot/BotConfig.kt`**.
+
+### Tryb US Open
+
+`bot/UsOpenSession.kt` liczy otwarcie giełdy w USA przez `ZoneId.of("America/New_York")` (9:30 NY),
+więc w Polsce jest to 15:30, a w tygodniach różnej zmiany czasu – 14:30.
+
+- Okno: od 5 min przed do 60 min po otwarciu (`WINDOW_BEFORE_MIN`, `WINDOW_AFTER_MIN`).
+- Pierwsze 2 min po otwarciu: żadna strategia nie otwiera pozycji (`NO_ENTRY_MIN`).
+- Opening Range Breakout: zakres z pierwszych 5 min (`RANGE_MIN`, można ustawić do 15), wejście po
+  zamknięciu świecy M1 poza zakresem, w kierunku zgodnym ze score. SL za przeciwną krawędzią
+  zakresu; gdy strata na SL przekroczyłaby 20 PLN, setup jest pomijany. Jedno wejście na sesję.
+- Dni bez sesji: weekendy i święta NYSE z listy `HOLIDAYS` (lata 2026–2028; listę trzeba co jakiś
+  czas uzupełnić).
+
 ### Parametry wejść i wyjść
 
-Wartości są stałymi w `BotOrchestrator.kt` (blok `companion object`):
-
-- **Wolumen:** stały `0.006` lota na każdą transakcję, z wstępnym sprawdzeniem depozytu.
+- **Wolumen:** stały `0.007` lota na każdą transakcję, z wstępnym sprawdzeniem depozytu.
 - **Stop loss:** liczony w złotówkach – 15–20 PLN straty, a dla SMC 8–20 PLN (SL strukturalny).
 - **Take profit:** 2,5 × odległość SL (minimalne R:R 1:2,5).
-- **Zamykanie:** pozycję zamyka wyłącznie XTB – przez TP albo SL. Bot nie zamyka pozycji na
-  minusie z własnej inicjatywy.
-- **Prowadzenie SL:** po +1R (min. 8 PLN zysku) SL trafia na cenę wejścia, od +1,5R idzie 1R za
-  najlepszą ceną. Zmiana jest wpisywana do otwartej pozycji w XTB (krok ≥ 2 PLN, najwyżej co 20 s).
+- **Zamykanie:** TP albo SL w XTB, a wcześniej tylko przy **potwierdzonym odwróceniu tendencji**
+  (`bot/ReversalDetector.kt`): co najmniej 2 z 3 warunków naraz – (a) BOS/CHoCH przeciw pozycji na
+  M1, (b) zamknięcie po drugiej stronie EMA 20/50 z rosnącym przeciwnym momentum, (c) score strony
+  przeciwnej ponad progiem – utrzymane przez 2 kolejne zamknięte świece, przy ruchu ≥ 0,5×ATR(M5)
+  od najlepszej ceny. Pojedyncza świeca cofnięcia, szum i odbicie w trakcie potwierdzania nie
+  zamykają pozycji. Powód zamknięcia jest w HUD i w dzienniku.
+- **Prowadzenie SL/TP** (`bot/TrailingManager.kt`): od +1R SL na wejście + spread; od +1,5R SL za
+  ostatni swing (albo k×ATR za najlepszą ceną); przy silnym impulsie (świeca ≥ 1,5×ATR, pełny
+  korpus, wybicie) TP przesuwa się do kolejnej strefy płynności albo o 1,5×ATR(M5). SL nigdy nie
+  wraca w stronę straty. Zmiany są wpisywane do otwartej pozycji w XTB najwyżej co 45 s i o krok
+  ≥ 2 PLN; po zmianie bot odczytuje wiersz pozycji i sprawdza wartości. Przy błędzie ponawia
+  (15 s, 30 s, 60 s…), a po 2 błędach z rzędu pokazuje alert w HUD.
+- **Dzienny kill-switch:** ostrzeżenie w HUD przy stracie 10% kapitału z początku dnia, twarde
+  zatrzymanie nowych wejść przy 25% (`DAILY_WARN_PCT`, `DAILY_KILL_PCT`).
 - **Sesje:** handel przez całą dobę (Azja, Londyn, Nowy Jork), bez nowych wejść 30 min przed
   zamknięciem sesji instrumentu.
 - **Spread:** filtr względem odległości SL oraz względem typowego spreadu instrumentu (`bot/SpreadGuard.kt`).
+
+### Tryb papierowy i dziennik decyzji
+
+- **Tryb papierowy (demo)** to `DRY_RUN`: bot liczy wszystko tak samo, ale niczego nie klika w XTB –
+  wejścia, przesunięcia SL/TP i wyjścia są tylko księgowane i logowane.
+- **Dziennik decyzji** (`bot/DecisionLog.kt`): plik CSV na każdy dzień,
+  `Android/data/com.example.algohud/files/decisions/decisions-RRRR-MM-DD.csv`, kolumny
+  `czas;tryb;instrument;typ;cena;score_long;score_short;trend_htf;powod`. Typy wpisów: `SCORE`
+  (co minutę), `WEJŚCIE`, `ODMOWA`, `WYJŚCIE`, `ODWRÓCENIE`, `TRAILING`, `US_OPEN`, `RYZYKO`.
+  Pliki starsze niż 14 dni są usuwane.
 
 ### Szybkość i częstość wejść
 
@@ -106,7 +157,8 @@ a wynik na transakcję pozostaje ujemny (`tools/replay/freq.py`).
 
 Aplikacja nie ma podłączonego kalendarza makro. Zamiast niego działają:
 
-- stałe okna danych z USA (czas polski): 14:25–14:40, 15:55–16:10, 19:55–20:35 – w `SmcEngine.kt`,
+- stałe okna danych z USA liczone w czasie Nowego Jorku: 8:25–8:40, 9:55–10:10, 13:55–14:35
+  (w Polsce zwykle 14:25–14:40, 15:55–16:10, 19:55–20:35) – w `SmcEngine.kt`,
 - **ręczna** lista publikacji w `bot/MacroWindows.kt` – trzeba ją samodzielnie uzupełniać.
 
 ## Bramka jakości danych
@@ -181,6 +233,12 @@ app/src/main/java/com/example/algohud/
 │   └── MarketNewsEngine.kt            – strumienie Binance, RSS, sentyment słów kluczowych
 ├── bot/
 │   ├── BotOrchestrator.kt             – spina dane, strategie, ryzyko i wykonanie; parametry handlu
+│   ├── BotConfig.kt                   – WSZYSTKIE progi i wagi do strojenia (ryzyko, score, odwrócenie, trailing, US Open)
+│   ├── SignalEngine.kt                – score LONG/SHORT z trzech warstw (trend H1/M15, momentum, price action)
+│   ├── ReversalDetector.kt            – potwierdzone odwrócenie tendencji (2 z 3 warunków, 2 świece)
+│   ├── TrailingManager.kt             – plan przesunięć SL/TP + ProtectionSync (limit częstości, ponowienia, historia)
+│   ├── UsOpenSession.kt               – okno US Open w czasie Nowego Jorku, święta NYSE, Opening Range Breakout
+│   ├── DecisionLog.kt                 – dziennik decyzji do pliku CSV
 │   ├── SmcEngine.kt                   – silnik Smart Money Concepts dla XAU/USD
 │   ├── Learning.kt                    – strategie turniejowe, ShadowTrader, Learner
 │   ├── NextCandlePredictor.kt         – predykcja następnej świecy (informacyjnie)
@@ -201,12 +259,19 @@ app/src/main/java/com/example/algohud/
 ```
 
 Testy jednostkowe (`app/src/test/`) obejmują silnik SMC, predyktor świec, bramkę jakości danych, ocenę strategii na sucho,
-formularz SL/TP i parser wierszy pozycji. `BotOrchestrator` i obsługa ekranu XTB nie mają testów.
+formularz SL/TP, parser wierszy pozycji oraz nowe moduły: `SignalEngine`, `ReversalDetector` (także przypadki, w których bot
+nie zamyka), `TrailingManager`, `UsOpenSession` (w tym tygodnie zmiany czasu) i `DecisionLog`. Moduły te nie zależą od Androida.
+`BotOrchestrator` i obsługa ekranu XTB nie mają testów.
 
 ## Znane ograniczenia
 
-- **Dzienny limit straty jest wyłączony.** `RiskManager.Config.maxDailyLossPct` ma wartość
-  nieskończoną, więc kill-switch nie zadziała sam po serii strat.
+- **Dzienny kill-switch** zatrzymuje nowe wejścia po stracie 25% kapitału z początku dnia
+  (ostrzeżenie przy 10%). Wartości w `BotConfig.Risk`.
+- **Edycja SL/TP w otwartej pozycji, odczyt zwrotny i zamykanie przy odwróceniu nie były testowane
+  na telefonie.** Najpierw sprawdź je w `DRY_RUN`, potem na koncie demo.
+- **Wolumen 0.007** – nie zweryfikowano, czy XTB przyjmuje taki krok wolumenu dla złota.
+- **Bramka score zmniejsza liczbę wejść.** Przy neutralnym trendzie H1/M15 bot nie wchodzi
+  (`ALLOW_NEUTRAL_HTF`), chyba że na M1 jest świeży CHoCH.
 - **Brak bramki przed AUTO.** `autoGate` w `OverlayService` zawsze przepuszcza – tryb AUTO można
   włączyć bez dodatniego wyniku na papierze.
 - **Ocena na bieżąco nie daje przewagi.** Tryb `LIVE` tylko wstrzymuje strategię po serii słabych

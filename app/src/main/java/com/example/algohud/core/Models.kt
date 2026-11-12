@@ -47,7 +47,7 @@ data class OrderRequest(
     val takeProfit: Double? = null,
     /** Poziom agresji: 0 zredukowany, 1 umiarkowany, 2 agresywny (wpływa na ryzyko i dźwignię). */
     val tier: Int = 1,
-    /** Stały wolumen (np. 0.006) – bez skalowania wg % ryzyka i limitu dźwigni poziomu agresji. */
+    /** Stały wolumen (np. 0.007) – bez skalowania wg % ryzyka i limitu dźwigni poziomu agresji. */
     val fixedSize: Boolean = false,
     val clientOrderId: String = "hud" + UUID.randomUUID().toString().replace("-", "").take(16)
 )
@@ -127,6 +127,8 @@ data class HudState(
     val learning: String = "",
     /** Jedna linia: czy dane są wiarygodne i jak świeże (XTB / feed). */
     val dataStatus: String = "",
+    /** Score long/short, trend H1/M15, tryb US Open, SL/TP z historią przesunięć, powód ostatniego wejścia i wyjścia. */
+    val signal: String = "",
     /** Plan bota: LONG/SHORT/czekam, na co czeka, kiedy zamknie. */
     val plan: String = "",
     /** Predykcja następnej świecy + status uczenia modelu (sekcja w HUD). */
