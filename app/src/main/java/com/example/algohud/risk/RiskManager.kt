@@ -33,7 +33,7 @@ class RiskManager(
     private val journal: TradeJournal? = null
 ) {
     data class Config(
-        val maxDailyLossPct: Double = Double.POSITIVE_INFINITY,          // twardy limit dziennej straty: 5% kapitału z początku dnia
+        val maxDailyLossPct: Double = 0.15,          // dzienny kill-switch: strata 15% kapitału z początku dnia
         val riskPerTradePct: Double = 0.02,          // 2% kapitału ryzyka na transakcję (do stop-lossa)
         val maxNotionalToEquity: Double = 5.0,       // wartość kontraktu maks. 5× kapitał (dźwignia CFD) – poziom umiarkowany
         /** Ryzyko na transakcję wg poziomu agresji: zredukowany / umiarkowany / agresywny. */
