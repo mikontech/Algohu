@@ -187,7 +187,6 @@ class SmcEngine(
         val ctx = context(m1Closed, m5, atr, spread, bias)
         newsBlackout(now)?.let { return Result(session, bias, lv, null, it, scen, ctx) }
         if (!allSessions && !session.tradable) return Result(session, bias, lv, null, "${session.label} – poza killzone nie handluję, czekam na Londyn 09:00 / NY 14:30", scen, ctx)
-        if (spread > 0.25 * atr) return Result(session, bias, lv, null, "spread %.2f > 25%% ATR – rynek za drogi".format(spread), scen, ctx)
 
         val tol = 0.05 * atr
         val buf = max(0.2 * atr, 1.5 * spread)
@@ -236,6 +235,8 @@ class SmcEngine(
                 val stop = extreme - dir * buf
                 val risk = abs(price - stop)
                 if (risk <= 0 || (price - stop) * dir <= 0) continue
+                // Koszt liczony względem ryzyka transakcji (SL), nie świecy 1m – na złocie spread to zwykle 50–70% ATR(1m).
+                if (spread > 0.2 * risk) { why = "spread %.2f to > 20%% odległości SL %.2f – za drogo".format(spread, risk); continue }
                 // Za późno = cena uciekła od poziomu CHoCH o > 35% ryzyka – takie wejście ma gorszy R:R i zwykle łapie szczyt.
                 if ((sw.second - price) * dir < 0 && abs(price - sw.second) > 0.35 * risk) {
                     why = "CHoCH ✓, ale cena uciekła %.2f od poziomu – nie gonię".format(abs(price - sw.second)); continue

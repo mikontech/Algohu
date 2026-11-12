@@ -804,6 +804,8 @@ class BotOrchestrator(
 
     /** Przerwa w danych > 30 s → po powrocie najpierw uzgodnienie pozycji z XTB, dopiero potem nowe wejścia. */
     private suspend fun watchDataOutage(inst: String, now: Long) {
+        // Pilnujemy tylko instrumentu, którym bot handluje (z biletu XTB) – inne feedy w tle (np. BITCOIN) nie mają biletu.
+        if (inst != hudLearningInstrument && risk.position(inst) == null) { needsReconcile.remove(inst); outageSince.remove(inst); return }
         val g = gateInput(inst)
         val feedStale = g.feedAt == null || now - g.feedAt > DataQuality.FEED_MAX_AGE_MS
         val screenStale = g.realTrading && (g.screenQuoteAt == null || now - g.screenQuoteAt > 30_000 || g.screenInstrument != inst)
@@ -1396,8 +1398,9 @@ class BotOrchestrator(
         if (!TRADE_ALL_SESSIONS) smc.session(now).let { if (!it.tradable) return "${it.label} – handluję tylko w killzone (Londyn 09–12, NY 14:30–17)" }
         val atr1 = Indicators.atr(m1.takeLast(60)) ?: return null // za mało danych – nie blokujemy
         val spread = spreadOf(symbol)
-        if (spread > 0 && spread > 0.25 * atr1) return "spread %.2f to > 25%% ruchu świecy – za drogo".format(spread)
-        if (spread > 0 && atr1 < 3 * spread) return "rynek martwy (ATR %.2f < 3× spread)".format(atr1)
+        // Koszt względem ryzyka transakcji (SL 15–20 zł ≈ 6–8 USD), a nie względem świecy 1m.
+        if (spread > 0 && spread > 0.2 * abs(price - stop)) return "spread %.2f to > 20%% odległości SL – za drogo".format(spread)
+        if (spread > 0 && atr1 < spread) return "rynek martwy (świeca 1m %.2f < spread)".format(atr1)
         if (m5.size >= 60) {
             val c5 = m5.map { it.close }
             val e20 = Indicators.ema(c5, 20); val e50 = Indicators.ema(c5, 50); val atr5 = Indicators.atr(m5.takeLast(60))
