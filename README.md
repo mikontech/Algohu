@@ -23,7 +23,7 @@ ceny (Pyth / Binance / ekran XTB) → świece 1m i 5m → strategie → bramka j
    odpowiada lub ma za krótką historię – z Binance (PAXGUSDT, historia przesuwana do poziomu
    ceny spot). Kwotowania Buy/Sell, instrument, dostępne środki i wartość kontraktu bot czyta
    z ekranu XTB.
-2. **Strategie.** Wszystkie cztery działają jednocześnie; pierwsza z sygnałem otwiera pozycję,
+2. **Strategie.** Wszystkie strategie działają jednocześnie; pierwsza z sygnałem otwiera pozycję,
    a jednocześnie może być otwarta tylko jedna.
 3. **Bramka jakości danych.** Przed każdym nowym wejściem bot sprawdza, czy dane są świeże
    i spójne (szczegóły niżej).
@@ -45,9 +45,14 @@ Wybrany tryb jest zapamiętywany i przywracany po restarcie usługi.
 | Strategia | Opis | Plik |
 |---|---|---|
 | SMC XAU | Sweep płynności (Asia High/Low, PDH/PDL, swingi z 60 min) → CHoCH na M1, SL za ekstremum sweepu, TP na przeciwnej płynności, kontekst H1. Tylko dla GOLD/XAU. Maks. 2 wejścia na sesję. | `bot/SmcEngine.kt` |
-| RT / ORB | Impuls świecy 1m w czasie rzeczywistym i wybicie z zakresu otwarcia (pierwsze 5 min, aktywne 15 min). | `bot/BotOrchestrator.kt` |
+| RT / ORB | Impuls świecy 1m w czasie rzeczywistym i wybicie z zakresu otwarcia Londynu 09:00 (pierwsze 5 min, aktywne 15 min). | `bot/BotOrchestrator.kt` |
+| US OPEN | Otwarcie sesji w USA (9:30 czasu Nowego Jorku – zwykle 15:30 PL, w tygodniach przesunięcia czasu 14:30). Zakres z pierwszych 15 min, bez wejść 5 min przed i 2 min po otwarciu, wejście po zamknięciu świecy 1m poza zakresem zgodnie z kompasem, SL w środku zakresu (setup pomijany, gdy to > 20 PLN). Jedno wejście na otwarcie, święta NYSE w kodzie. | `bot/UsOpenOrb.kt`, `bot/UsSession.kt` |
 | Zakres | Kupno po odbiciu od dolnych 20% zakresu z 30 świec 1m, sprzedaż przy górze; wyłączona w silnym trendzie. | `bot/BotOrchestrator.kt` |
 | Turniej | Warianty strategii (5m i 1m) handlują „na sucho”; handluje tylko zwycięzca z dodatnim, statystycznie istotnym wynikiem. | `bot/Learning.kt` |
+
+**🧭 Kompas kierunku** (`bot/TrendScore.kt`) – wspólna ocena −100…+100 z trendu 5m (EMA20/50), nachylenia
+EMA20 1m, MACD, RSI i struktury (BOS) 1m. Blokuje wejścia pod prąd silnego wyniku (wszystkie strategie poza SMC,
+które z założenia gra odwrócenia po sweepie), jest warunkiem wyjścia przy odwróceniu i linią w HUD.
 
 Model predykcji następnej świecy (`bot/NextCandlePredictor.kt`, regresja logistyczna ucząca się
 online) jest obecnie **tylko informacją w HUD** – nie otwiera pozycji.
@@ -59,10 +64,15 @@ Wartości są stałymi w `BotOrchestrator.kt` (blok `companion object`):
 - **Wolumen:** stały `0.006` lota na każdą transakcję, z wstępnym sprawdzeniem depozytu.
 - **Stop loss:** liczony w złotówkach – 15–20 PLN straty, a dla SMC 8–20 PLN (SL strukturalny).
 - **Take profit:** 2,5 × odległość SL (minimalne R:R 1:2,5).
-- **Zamykanie:** pozycję zamyka wyłącznie XTB – przez TP albo SL. Bot nie zamyka pozycji na
-  minusie z własnej inicjatywy.
+- **Zamykanie:** TP albo SL w XTB, a do tego bot sam zamyka pozycję przy **potwierdzonym odwróceniu
+  trendu** (`bot/ReversalGuard.kt`): ≥ 2 z 3 sygnałów (struktura przeciw, momentum przeciw, kompas przeciw)
+  na 2 kolejnych zamkniętych świecach 1m, min. 2 świece od wejścia i cofnięcie ≥ 0,5×ATR od najlepszej ceny.
+  Pojedyncza świeca przeciw nie zamyka pozycji. Wyłącznik: `TREND_EXIT` w `BotOrchestrator`.
 - **Prowadzenie SL:** po +1R (min. 8 PLN zysku) SL trafia na cenę wejścia, od +1,5R idzie 1R za
   najlepszą ceną. Zmiana jest wpisywana do otwartej pozycji w XTB (krok ≥ 2 PLN, najwyżej co 20 s).
+- **Duży ruch:** silny impuls w stronę pozycji przy zysku ≥ 1R → TP odsuwany na najlepszą cenę
+  + max(1,5×ATR, 1R) (maks. raz na świecę), SL 0,6×ATR za najlepszą ceną. Nowy TP trafia do otwartej
+  pozycji w XTB od razu, SL – w rytmie co 20 s.
 - **Sesje:** handel przez całą dobę (Azja, Londyn, Nowy Jork), bez nowych wejść 30 min przed
   zamknięciem sesji instrumentu.
 - **Spread:** filtr względem odległości SL oraz względem typowego spreadu instrumentu (`bot/SpreadGuard.kt`).
@@ -71,7 +81,8 @@ Wartości są stałymi w `BotOrchestrator.kt` (blok `companion object`):
 
 Aplikacja nie ma podłączonego kalendarza makro. Zamiast niego działają:
 
-- stałe okna danych z USA (czas polski): 14:25–14:40, 15:55–16:10, 19:55–20:35 – w `SmcEngine.kt`,
+- stałe okna danych z USA liczone w czasie Nowego Jorku: 8:25–8:40, 9:55–10:10, 13:55–14:35 ET
+  (zwykle 14:25, 15:55, 19:55 PL) – w `bot/UsSession.kt`,
 - **ręczna** lista publikacji w `bot/MacroWindows.kt` – trzeba ją samodzielnie uzupełniać.
 
 ## Bramka jakości danych
@@ -152,6 +163,8 @@ app/src/main/java/com/example/algohud/
 │   ├── DataQuality.kt                 – raport pochodzenia danych i bramka wejść
 │   ├── Bars.kt, CandleEvaluator.kt    – agregacja świec, wskaźniki, ocena impulsu
 │   ├── SpreadGuard.kt, MarketHours.kt, MacroWindows.kt – filtry spreadu, sesji i publikacji
+│   ├── TrendScore.kt, ReversalGuard.kt – kompas kierunku i wyjście przy odwróceniu trendu
+│   ├── UsSession.kt, UsOpenOrb.kt     – zegar sesji USA (czas NY, święta) i wybicie otwarcia USA
 │   └── CandleRecorder.kt, BarStore.kt – zapis świec do CSV w pamięci aplikacji
 ├── risk/
 │   ├── RiskManager.kt                 – kontrola każdego zlecenia, kill-switch
@@ -164,7 +177,8 @@ app/src/main/java/com/example/algohud/
 └── overlay/OverlayService.kt          – usługa pierwszoplanowa i pływający HUD
 ```
 
-Testy jednostkowe (`app/src/test/`) obejmują silnik SMC, predyktor świec, bramkę jakości danych,
+Testy jednostkowe (`app/src/test/`) obejmują kompas kierunku, wyjście przy odwróceniu (także przypadki,
+w których bot NIE może zamknąć), zegar sesji USA (tygodnie przesunięcia czasu, święta), wybicie otwarcia USA, silnik SMC, predyktor świec, bramkę jakości danych,
 formularz SL/TP i parser wierszy pozycji. `BotOrchestrator` i obsługa ekranu XTB nie mają testów.
 
 ## Znane ograniczenia
@@ -176,6 +190,9 @@ formularz SL/TP i parser wierszy pozycji. `BotOrchestrator` i obsługa ekranu XT
 - **Automatyzacja zależy od wyglądu XTB.** Identyfikatory widoków pochodzą ze zrzutów ekranu;
   aktualizacja aplikacji brokera może zepsuć odczyt lub klikanie.
 - **Godziny sesji** w `bot/MarketHours.kt` są wpisane ręcznie i wymagają weryfikacji w XTB.
+- **Święta NYSE** w `bot/UsSession.kt` są wpisane na 2026–2027 – uzupełniaj co rok.
+- **Przesunięcie SL/TP w XTB** nie jest weryfikowane odczytem pozycji po zapisie – bot zakłada sukces,
+  gdy dotknął „Modyfikuj pozycję”.
 - **Kalendarz makro** nie jest podłączony (`EconomicCalendarSource.None`).
 - **Kanały RSS** w `MarketNewsEngine` są przykładowe – sprawdź regulaminy źródeł.
 - **Identyfikator aplikacji** to nadal `com.example.algohud`, a build nie jest podpisany kluczem wydania.
