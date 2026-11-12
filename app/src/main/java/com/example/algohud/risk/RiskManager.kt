@@ -189,6 +189,7 @@ class RiskManager(
         val existing = positions[order.symbol]
         val reducing = existing != null && existing.side != order.side &&
             order.quantity <= existing.quantity + 1e-12
+        if (order.reduceOnly && !reducing) return@withLock reject("Brak zgodnej pozycji do zamknięcia")
         if (reducing) return@withLock Decision.Approved(order)
 
         if (_killSwitch.value) return@withLock reject("KILL-SWITCH aktywny: $killReason")

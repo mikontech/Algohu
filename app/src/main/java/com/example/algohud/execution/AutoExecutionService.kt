@@ -151,6 +151,11 @@ class ExecutionEngine(
     }
 
     private suspend fun execute(order: OrderRequest): ExecutionResult {
+        // Recheck after acquiring execMutex: a preceding exit may have closed this position.
+        if (order.reduceOnly) {
+            val decision = risk.evaluate(order)
+            if (decision is RiskManager.Decision.Rejected) return ExecutionResult.Rejected(decision.reason)
+        }
         if (_mode.value == ExecutionMode.DRY_RUN) {
             risk.onFill(order, order.referencePrice, order.quantity, paper = true)
             log("🧪 PAPER ${order.side} ${formatQty(order.quantity)} ${order.symbol} @ %.2f".format(order.referencePrice))

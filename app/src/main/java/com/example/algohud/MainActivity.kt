@@ -76,7 +76,7 @@ class MainActivity : ComponentActivity() {
         button("🧪 DRY_RUN – tylko symulacja") { OverlayService.command(this, OverlayService.ACTION_MODE, "DRY_RUN") }
 
         TextView(this).apply {
-            text = "\nStrategia: wszystkie 4 działają razem automatycznie\n🕯️ Świece + AI • ⚡ RT/ORB • 📈 Zakres • 🧠 Turniej\nPierwsza z sygnałem otwiera pozycję (stały lot 0.006); plan widać w HUD."
+            text = "\nProfil AGRESYWNY+: wcześniejsze wejścia, ochrona zysku przy odwróceniu\n🕯️ Świece + AI • ⚡ RT/ORB • 📈 Zakres • 🧠 Turniej\nLot 0.006; BUY: ochrona zysku przy spadku, SELL: przy wzroście. Szacowany zysk po spreadzie, bez gwarancji ceny wykonania. Plan w HUD."
             textSize = 15f
         }.also { layout.addView(it) }
 
