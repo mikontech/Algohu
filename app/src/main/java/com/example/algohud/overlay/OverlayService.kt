@@ -181,9 +181,9 @@ class OverlayService : LifecycleService() {
             ACTION_MODE -> if (::engine.isInitialized) {
                 val m = runCatching { ExecutionMode.valueOf(intent.getStringExtra(EXTRA_VALUE)!!) }.getOrNull()
                 if (m != null) {
-                    uiPrefs().edit().putString("mode", m.name).apply()
                     botScope.launch {
                         val blocked = engine.setMode(m, overrideGate = true)
+                        if (blocked == null) uiPrefs().edit().putString("mode", m.name).apply()
                         toast(if (blocked != null) "🔒 $m zablokowany: $blocked" else "Tryb: $m")
                     }
                 }
@@ -205,6 +205,8 @@ class OverlayService : LifecycleService() {
 
     override fun onDestroy() {
         botScope.cancel()
+        AutoExecutionService.selfHealEnabled = false
+        if (::engine.isInitialized) engine.rejectPending()
         setShield(false)
         rootView?.let { runCatching { wm.removeView(it) } }
         rootView = null
