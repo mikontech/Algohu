@@ -58,6 +58,24 @@ class SmcEngineTest {
         assertEquals("swing H 1h", s.swept.name)
     }
 
+    /** Szybka reakcja: CHoCH na trwającej świecy (cena na żywo) – bez czekania na jej zamknięcie. */
+    @Test fun intrabarChochEntersWithoutWaitingForClose() {
+        val now = at(10, 50)
+        val all = sweepShort(now - 109 * 60_000L)
+        val forming = all.last().copy(close = 2000.6)
+        val r = engine.evaluate(all.dropLast(1), emptyList(), 2000.6, 0.1, now, current = forming)
+        assertNotNull(r.note, r.setup)
+        assertTrue(r.setup!!.reason.contains("na żywo"))
+    }
+
+    /** Za późno: cena daleko za poziomem CHoCH – nie gonimy. */
+    @Test fun lateEntryIsRejected() {
+        val now = at(10, 50)
+        val m1 = sweepShort(now - 109 * 60_000L)
+        val r = engine.evaluate(m1, emptyList(), 1997.0, 0.1, now)
+        assertNull(r.setup)
+    }
+
     @Test fun noTradeOutsideKillzone() {
         val now = at(13, 0)
         val m1 = sweepShort(now - 109 * 60_000L)

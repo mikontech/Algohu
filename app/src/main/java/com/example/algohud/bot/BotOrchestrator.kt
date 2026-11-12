@@ -1333,7 +1333,7 @@ class BotOrchestrator(
         val m5 = aggregators["$inst@${Learner.M5}"]?.closed().orEmpty()
         val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
         val sh = q?.let { basis(inst, it) } ?: 0.0
-        val res = smc.evaluate(m1, m5, px, spreadOf(inst), now, sh)
+        val res = smc.evaluate(m1, m5, px, spreadOf(inst), now, sh, aggregators["$inst@${Learner.M1}"]?.current())
         smcResult[inst] = res
         val s = res.setup ?: return
         if (s.key in smcTaken) return

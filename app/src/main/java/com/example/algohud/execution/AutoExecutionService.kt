@@ -1023,7 +1023,7 @@ class AutoExecutionService : AccessibilityService() {
             scroller.performAction(
                 if (step > 0) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
             )
-            delay(450)
+            delay(300)
         }
         return null
     }
@@ -1064,7 +1064,7 @@ class AutoExecutionService : AccessibilityService() {
             val x = sc.exactCenterX() // środek: krawędź ekranu = systemowy gest „Wstecz”
             val y0 = if (delta > 0) sc.bottom - h * 0.12f else sc.top + h * 0.35f
             if (!drag(x, y0, y0 - delta)) return node
-            delay(450)
+            delay(250)
         }
         return appRoot()?.let { ScreenScanner.findById(it, id).firstOrNull() }
     }
@@ -1077,7 +1077,7 @@ class AutoExecutionService : AccessibilityService() {
             return suspendCancellableCoroutine { cont ->
                 val path = Path().apply { moveTo(x, fromY); lineTo(x, toY) }
                 val gesture = GestureDescription.Builder()
-                    .addStroke(GestureDescription.StrokeDescription(path, 0, 700))
+                    .addStroke(GestureDescription.StrokeDescription(path, 0, 350))
                     .build()
                 val accepted = dispatchGesture(gesture, object : GestureResultCallback() {
                     override fun onCompleted(gestureDescription: GestureDescription?) { if (cont.isActive) cont.resume(true) }
@@ -1231,6 +1231,8 @@ class AutoExecutionService : AccessibilityService() {
      * Bez poprawnie ustawionego SL zlecenie NIE jest wysyłane.
      */
     private var entryBaseline: TicketSlTpState? = null
+    /** Ostatnio znany stan suwaków SL/TP w bilecie (czas uptime → stan) – żeby nie przewijać biletu przy każdym wejściu. */
+    @Volatile private var cachedForm: Pair<Long, TicketSlTpState>? = null
 
     /** Wejście + sprzątanie: gdy zlecenie NIE poszło, suwaki SL/TP wracają od razu do stanu sprzed wejścia. */
     private suspend fun performXtbEntry(order: OrderRequest): ExecutionResult {
@@ -1243,6 +1245,7 @@ class AutoExecutionService : AccessibilityService() {
                 val err = applyFormToggle("StopLossContainer", "StopLossToggle", base.slEnabled, base.slValue)?.let { "SL: $it" }
                     ?: applyFormToggle("TakeProfitContainer", "TakeProfitToggle", base.tpEnabled, base.tpValue)?.let { "TP: $it" }
                 restoreTicketTop()
+                cachedForm = if (err == null) SystemClock.uptimeMillis() to base else null
                 _uiEvents.tryEmit(if (err == null) "↩️ ${order.symbol}: wejście nieudane – suwaki SL/TP przywrócone" else "⚠️ ${order.symbol}: wejście nieudane, suwaki nie wróciły ($err)")
             }
         }
@@ -1258,26 +1261,17 @@ class AutoExecutionService : AccessibilityService() {
         val sl = order.stopPrice + shift
         val tp = order.takeProfit?.plus(shift)
 
-        // Stan suwaków SL/TP i lista pozycji PRZED wejściem – do weryfikacji i późniejszego przywrócenia formularza.
-        val formBefore = runCatching { readTicketSlTp() }.getOrNull()
+        val t0 = SystemClock.uptimeMillis()
+        // Stan suwaków SL/TP PRZED wejściem: zapamiętany (z ostatniego przywrócenia/odczytu, < 10 min) – bez przewijania biletu.
+        val cached = cachedForm?.takeIf { SystemClock.uptimeMillis() - it.first < 10 * 60_000 }?.second
+        val formBefore = cached ?: runCatching { readTicketSlTp() }.getOrNull()
+        formBefore?.let { cachedForm = SystemClock.uptimeMillis() to it }
         entryBaseline = formBefore
         val rowsBefore = appRoot()?.let { runCatching { readPositionRows(it) }.getOrNull() }.orEmpty()
         val formOp = formBefore?.let { formCoordinator.beginEntry(order.clientOrderId, order.symbol, it) }
         if (formBefore == null) _uiEvents.tryEmit("⚠️ ${order.symbol}: nie odczytano suwaków SL/TP – po wejściu nie zostaną przywrócone")
 
-        restoreTicketTop() // readTicketSlTp() przewinął bilet w dół do SL/TP
-        revealById("MarketSizeInput") ?: return ExecutionResult.Rejected("nie znaleziono sekcji wolumenu")
-        val vol = revealField("MarketSizeInput") ?: return ExecutionResult.Rejected("sekcja wolumenu jest, ale pole niewidoczne")
-        val args = Bundle().apply {
-            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, formatQty(order.quantity))
-        }
-        if (!vol.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return ExecutionResult.Rejected("nie udało się wpisać wolumenu")
-        delay(300)
-        val typed = revealField("MarketSizeInput")?.text?.toString()?.let { ScreenScanner.parseNumber(it) }
-        if (typed == null || abs(typed - order.quantity) > 1e-9 + order.quantity * 1e-6) {
-            return ExecutionResult.Rejected("XTB nie przyjęło wolumenu (jest $typed, miało być ${formatQty(order.quantity)})")
-        }
-
+        // Kolejność dla szybkości: SL/TP (dół biletu) → góra biletu → wolumen → przycisk (jedno przewinięcie mniej).
         revealById("StopLossContainer") ?: return ExecutionResult.Rejected("nie znaleziono Stop Loss w bilecie")
         setPriceIn("StopLossContainer", "StopLossToggle", sl)?.let { return ExecutionResult.Rejected("SL: $it – nie otwieram bez stopu") }
         if (tp != null) {
@@ -1299,9 +1293,38 @@ class AutoExecutionService : AccessibilityService() {
             }
         }
 
+        restoreTicketTop()
+        revealById("MarketSizeInput") ?: return ExecutionResult.Rejected("nie znaleziono sekcji wolumenu")
+        val vol = revealField("MarketSizeInput") ?: return ExecutionResult.Rejected("sekcja wolumenu jest, ale pole niewidoczne")
+        val curVol = vol.text?.toString()?.let { ScreenScanner.parseNumber(it) }
+        if (curVol == null || abs(curVol - order.quantity) > 1e-9 + order.quantity * 1e-6) {
+            val args = Bundle().apply {
+                putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, formatQty(order.quantity))
+            }
+            if (!vol.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return ExecutionResult.Rejected("nie udało się wpisać wolumenu")
+            delay(250)
+        }
+        val typed = revealField("MarketSizeInput")?.text?.toString()?.let { ScreenScanner.parseNumber(it) }
+        if (typed == null || abs(typed - order.quantity) > 1e-9 + order.quantity * 1e-6) {
+            return ExecutionResult.Rejected("XTB nie przyjęło wolumenu (jest $typed, miało być ${formatQty(order.quantity)})")
+        }
+
+        // Poślizg: jeśli w trakcie ustawiania biletu cena uciekła o > 30% ryzyka w stronę SL/za wejściem – nie wchodzimy późno.
+        val pxNow = screenQuote.value?.let { if (order.side == Side.BUY) it.ask else it.bid }
+        val riskDist = abs(sidePx - sl)
+        if (pxNow != null && riskDist > 0) {
+            val dir = if (order.side == Side.BUY) 1 else -1
+            if ((pxNow - sidePx) * dir > 0.3 * riskDist) {
+                return ExecutionResult.Rejected("cena uciekła o %.2f w trakcie przygotowania biletu – za późno, nie wchodzę".format(abs(pxNow - sidePx)))
+            }
+            if ((sidePx - pxNow) * dir > 0.5 * riskDist) {
+                return ExecutionResult.Rejected("cena ruszyła o %.2f w stronę SL – setup nieaktualny".format(abs(pxNow - sidePx)))
+            }
+        }
         val btn = revealById(if (order.side == Side.BUY) "TradingBuyButton" else "TradingSellButton")
             ?: return ExecutionResult.Rejected("nie znaleziono przycisku ${order.side}")
         if (!click(btn)) return ExecutionResult.Rejected("kliknięcie ${order.side} nie powiodło się")
+        _uiEvents.tryEmit("⏱ ${order.symbol}: od decyzji do kliknięcia %.1f s".format((SystemClock.uptimeMillis() - t0) / 1000.0))
 
         // XTB może pokazać ekran "Nowe zlecenie Market" z przyciskiem "Potwierdź zlecenie Market" (np. przy SL/TP).
         val confirm = withTimeoutOrNull(3_000) {
@@ -1495,6 +1518,7 @@ class AutoExecutionService : AccessibilityService() {
             val err = applyFormToggle("StopLossContainer", "StopLossToggle", b.slEnabled, b.slValue)?.let { "SL: $it" }
                 ?: applyFormToggle("TakeProfitContainer", "TakeProfitToggle", b.tpEnabled, b.tpValue)?.let { "TP: $it" }
             runCatching { restoreTicketTop() }
+            cachedForm = if (err == null) SystemClock.uptimeMillis() to b else null
             return if (err == null) SlTpFormCoordinator.RestoreOutcome.Done else SlTpFormCoordinator.RestoreOutcome.Failed(err)
         } finally {
             _actionActive.value = false

@@ -174,15 +174,17 @@ class SmcEngine(
      * Setup krótki (lustrzanie długi): poziom nad ceną (PDH/Asia High/swing) wybity knotem w ostatnich 30 min,
      * świeca 1m zamknięta z powrotem pod poziomem, potem zamknięcie 1m pod ostatnim swing low sprzed ekstremum (CHoCH).
      */
-    fun evaluate(m1: List<Bar>, m5: List<Bar>, price: Double, spread: Double, now: Long, shift: Double = 0.0): Result {
+    fun evaluate(m1Closed: List<Bar>, m5: List<Bar>, price: Double, spread: Double, now: Long, shift: Double = 0.0, current: Bar? = null): Result {
+        // Szybka reakcja: trwająca świeca 1m też się liczy (sweep, powrót i CHoCH po cenie na żywo, bez czekania na zamknięcie).
+        val m1 = if (current != null && (m1Closed.isEmpty() || current.start > m1Closed.last().start)) m1Closed + current.copy(close = price) else m1Closed
         // [shift] – tylko do opisów: ceny w tekstach w skali XTB (feed w tle może się różnić o kilka USD).
         val session = session(now)
         val bias = biasH1(m5)
         if (m1.size < 60) return Result(session, bias, null, null, "zbieram świece 1m (${m1.size}/60)", emptyList())
-        val atr = Indicators.atr(m1.takeLast(60)) ?: return Result(session, bias, null, null, "brak ATR", emptyList())
-        val lv = levels(m5, m1, now)
+        val atr = Indicators.atr(m1Closed.takeLast(60)) ?: return Result(session, bias, null, null, "brak ATR", emptyList())
+        val lv = levels(m5, m1Closed, now)
         val scen = scenarios(lv, price, bias, shift)
-        val ctx = context(m1, m5, atr, spread, bias)
+        val ctx = context(m1Closed, m5, atr, spread, bias)
         newsBlackout(now)?.let { return Result(session, bias, lv, null, it, scen, ctx) }
         if (!allSessions && !session.tradable) return Result(session, bias, lv, null, "${session.label} – poza killzone nie handluję, czekam na Londyn 09:00 / NY 14:30", scen, ctx)
         if (spread > 0.25 * atr) return Result(session, bias, lv, null, "spread %.2f > 25%% ATR – rynek za drogi".format(spread), scen, ctx)
@@ -224,7 +226,7 @@ class SmcEngine(
                     why = "sweep ${level.name} %.2f ✓ – czekam na CHoCH: zamknięcie M1 %s %.2f".format(level.price + shift, if (dir < 0) "pod" else "nad", sw.second + shift)
                     continue
                 }
-                if (m1.size - 1 - choch > 5) { why = "CHoCH po sweepie ${level.name} był > 5 min temu – nie gonię"; continue }
+                if (m1.size - 1 - choch > 1) { why = "CHoCH po sweepie ${level.name} był > 1 min temu – za późno, nie gonię"; continue }
                 // 4) bias H1: przeciw trendowi tylko po sweepie PDH/PDL
                 if (bias != 0 && bias != dir && level.name != (if (dir < 0) "PDH" else "PDL")) {
                     why = "sweep ${level.name} przeciw strukturze H1 (${if (bias > 0) "↑" else "↓"}) – pod prąd tylko po PDH/PDL"
@@ -234,6 +236,10 @@ class SmcEngine(
                 val stop = extreme - dir * buf
                 val risk = abs(price - stop)
                 if (risk <= 0 || (price - stop) * dir <= 0) continue
+                // Za późno = cena uciekła od poziomu CHoCH o > 35% ryzyka – takie wejście ma gorszy R:R i zwykle łapie szczyt.
+                if ((sw.second - price) * dir < 0 && abs(price - sw.second) > 0.35 * risk) {
+                    why = "CHoCH ✓, ale cena uciekła %.2f od poziomu – nie gonię".format(abs(price - sw.second)); continue
+                }
                 // 5) cel: najbliższa przeciwna płynność z R:R ≥ MIN_RR (TP tuż przed poziomem)
                 val targets = if (dir < 0) lv.below(price) else lv.above(price)
                 // R:R PO KOSZTACH: zysk pomniejszony o spread, ryzyko powiększone o spread (wejście/wyjście po gorszej stronie).
@@ -248,7 +254,7 @@ class SmcEngine(
                 val s = Setup(
                     side, stop, tgt.second, rr, level, extreme, sw.second,
                     key = "${level.name}:${m1[ext].start}",
-                    reason = "SMC ${if (dir < 0) "SHORT" else "LONG"}: sweep ${level.name} %.2f → CHoCH %.2f (potwierdzone zamknięciem M1), cel ${tgt.first.name} %.2f, R:R po kosztach 1:%.1f".format(
+                    reason = "SMC ${if (dir < 0) "SHORT" else "LONG"}: sweep ${level.name} %.2f → CHoCH %.2f (${if (choch == m1.size - 1 && current != null) "na żywo, świeca w trakcie" else "potwierdzone zamknięciem M1"}), cel ${tgt.first.name} %.2f, R:R po kosztach 1:%.1f".format(
                         level.price + shift, sw.second + shift, tgt.first.price + shift, rr)
                 )
                 if (best == null || s.rr > best.rr) best = s
