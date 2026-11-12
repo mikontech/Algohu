@@ -21,7 +21,7 @@ object DataQuality {
     ) {
         fun status(now: Long): Status = when {
             value == null || readAt == null -> Status.MISSING
-            now - readAt > maxAgeMs -> Status.STALE
+            readAt <= 0 || readAt > now + FUTURE_TOLERANCE_MS || now - readAt > maxAgeMs -> Status.STALE
             else -> Status.OK
         }
         fun line(now: Long): String {
@@ -54,6 +54,7 @@ object DataQuality {
     /** Ostatni pełny raport pól (kopiowany z aplikacji). */
     @Volatile var lastReport: String? = null
 
+    const val FUTURE_TOLERANCE_MS = 5_000L
     const val SCREEN_MAX_AGE_MS = 8_000L
     const val FEED_MAX_AGE_MS = 20_000L
 
@@ -61,17 +62,22 @@ object DataQuality {
     fun entryBlock(g: GateInput): String? {
         val feedAge = g.feedAt?.let { g.now - it }
         if (g.feedPrice == null || feedAge == null) return "brak ceny z feedu – nie widzę rynku"
+        if (!g.feedPrice.isFinite() || g.feedPrice <= 0) return "błędna cena z feedu"
+        if ((g.feedAt ?: 0) <= 0 || feedAge < -FUTURE_TOLERANCE_MS) return "błędny czas ceny z feedu"
         if (feedAge > FEED_MAX_AGE_MS) return "cena z feedu nieaktualna (${feedAge / 1000} s)"
         if (!g.pointValueKnown) return "nieznana wartość kontraktu – otwórz bilet ${g.expectedInstrument} w XTB"
         if (g.needsReconcile) return "po przerwie w danych uzgadniam pozycje z XTB – wejścia wstrzymane"
         if (!g.realTrading) return null // papier: wystarczy feed
         val screenAge = g.screenQuoteAt?.let { g.now - it }
-        if (screenAge == null || screenAge > SCREEN_MAX_AGE_MS) return "bilet XTB nieodczytany lub nieaktualny (${screenAge?.div(1000) ?: "?"} s)"
+        if (screenAge == null || g.screenQuoteAt!! <= 0 || screenAge < -FUTURE_TOLERANCE_MS || screenAge > SCREEN_MAX_AGE_MS) return "bilet XTB nieodczytany lub nieaktualny (${screenAge?.div(1000) ?: "?"} s)"
         if (g.screenInstrument != g.expectedInstrument) return "w XTB widać ${g.screenInstrument ?: "?"}, a analiza dotyczy ${g.expectedInstrument} – nie handluję"
         val bid = g.screenBid ?: return "brak ceny Sell w XTB"
         val ask = g.screenAsk ?: return "brak ceny Buy w XTB"
+        if (!bid.isFinite() || !ask.isFinite() || bid <= 0 || ask <= 0) return "XTB: błędna cena Buy/Sell"
         if (ask < bid) return "XTB: Buy < Sell – błędny odczyt"
         val atr = g.atr1
+        if (atr != null && (!atr.isFinite() || atr < 0)) return "błędna zmienność ATR"
+        if (g.typicalBasis != null && !g.typicalBasis.isFinite()) return "błędna różnica XTB–feed"
         if (atr != null && atr > 0 && g.typicalBasis != null) {
             val basis = (bid + ask) / 2 - g.feedPrice
             val jump = abs(basis - g.typicalBasis)

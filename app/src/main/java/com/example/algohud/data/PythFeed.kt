@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -95,9 +96,11 @@ class PythFeed(
                         val price = p.getJSONObject("price")
                         val publishMs = price.getLong("publish_time") * 1000
                         // Rynek zamknięty / brak nowych cen – nie produkujemy sztucznych, płaskich świec.
-                        if (now - publishMs > 120_000 || lastPublish[item.instrument] == publishMs) continue
-                        lastPublish[item.instrument] = publishMs
+                        if (publishMs <= 0 || publishMs > now + 5_000 || now - publishMs > 120_000 ||
+                            publishMs <= (lastPublish[item.instrument] ?: Long.MIN_VALUE)) continue
                         val value = price.getString("price").toDouble() * 10.0.pow(price.getInt("expo"))
+                        if (!value.isFinite() || value <= 0) continue
+                        lastPublish[item.instrument] = publishMs
                         _ticks.emit(Tick(item.instrument, value, publishMs))
                     }
                 } catch (ce: CancellationException) {
@@ -167,7 +170,7 @@ class PythFeed(
     }
 
     private fun setStatus(instrument: String, s: String) {
-        _status.value = _status.value + (instrument to s)
+        _status.update { it + (instrument to s) }
     }
 
     private companion object {

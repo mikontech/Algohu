@@ -32,4 +32,22 @@ class DataQualityTest {
         assertTrue(f.line(now).contains("brak"))
     }
     @Test fun medianIsRobust() = assertEquals(2.0, DataQuality.median(listOf(1.0, 2.0, 100.0))!!, 1e-9)
+    @Test fun invalidPricesBlock() {
+        for (price in listOf(Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY, 0.0, -1.0)) {
+            assertNotNull(DataQuality.entryBlock(ok().copy(feedPrice = price)))
+            assertNotNull(DataQuality.entryBlock(ok().copy(screenBid = price)))
+            assertNotNull(DataQuality.entryBlock(ok().copy(screenAsk = price)))
+        }
+    }
+    @Test fun futureTimestampsBlock() {
+        assertNotNull(DataQuality.entryBlock(ok().copy(feedAt = now + 60_000)))
+        assertNotNull(DataQuality.entryBlock(ok().copy(screenQuoteAt = now + 60_000)))
+        assertEquals(DataQuality.Status.STALE,
+            DataQuality.Field("Cena", "1", "test", now + 60_000, "USD", 8_000).status(now))
+    }
+    @Test fun smallClockSkewPasses() = assertNull(DataQuality.entryBlock(ok().copy(feedAt = now + 1_000)))
+    @Test fun invalidDerivedDataBlocks() {
+        assertNotNull(DataQuality.entryBlock(ok().copy(atr1 = Double.NaN)))
+        assertNotNull(DataQuality.entryBlock(ok().copy(typicalBasis = Double.POSITIVE_INFINITY)))
+    }
 }

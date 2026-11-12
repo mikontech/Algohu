@@ -9,11 +9,19 @@ import kotlin.math.min
 class BarAggregator(private val periodMs: Long = 5 * 60_000L, private val maxBars: Int = 300) {
     private val bars = ArrayDeque<Bar>()
     private var current: Bar? = null
+    private var lastTickAt = Long.MIN_VALUE
+
+    init {
+        require(periodMs > 0) { "periodMs must be positive" }
+        require(maxBars > 0) { "maxBars must be positive" }
+    }
 
     /** Zwraca świecę, która właśnie się zamknęła (gdy tick otworzył nową), w przeciwnym razie null. */
     @Synchronized
     fun onTick(price: Double, ts: Long): Bar? {
+        if (!price.isFinite() || price <= 0 || ts < 0 || ts < lastTickAt) return null
         val start = ts - ts % periodMs
+        lastTickAt = ts
         val c = current
         if (c == null) {
             if (bars.isNotEmpty() && start <= bars.last().start) return null // spóźniony tick po domknięciu przez zegar
@@ -25,8 +33,7 @@ class BarAggregator(private val periodMs: Long = 5 * 60_000L, private val maxBar
             return null
         }
         if (start < c.start) {
-            // Spóźniony tick – pomijamy. Ale świeca „z przyszłości” (zły znacznik czasu) blokowałaby agregator na zawsze.
-            if (c.start - start > 2 * periodMs) current = Bar(start, price, price, price, price)
+            // Nigdy nie cofamy czasu bieżącej świecy.
             return null
         }
         bars.addLast(c)
@@ -38,9 +45,13 @@ class BarAggregator(private val periodMs: Long = 5 * 60_000L, private val maxBar
     /** Historia z REST (bez trwającej świecy) – strategia nie musi czekać godzinami na rozgrzewkę. */
     @Synchronized
     fun seed(history: List<Bar>) {
-        val live = bars.filter { b -> history.none { it.start == b.start } }
+        val merged = (history + bars).filter { b ->
+            b.start >= 0 && (current == null || b.start < current!!.start) &&
+                listOf(b.open, b.high, b.low, b.close).all { it.isFinite() && it > 0 } &&
+                b.low <= minOf(b.open, b.close) && b.high >= maxOf(b.open, b.close)
+        }.associateBy { it.start }.values.sortedBy { it.start }.takeLast(maxBars)
         bars.clear()
-        (history + live).sortedBy { it.start }.takeLast(maxBars).forEach { bars.addLast(it) }
+        merged.forEach { bars.addLast(it) }
     }
 
     @Synchronized
