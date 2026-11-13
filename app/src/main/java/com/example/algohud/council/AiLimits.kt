@@ -9,6 +9,9 @@ class AiLimits(private val prefs: SharedPreferences, private val clock: () -> Lo
     fun reserveDebate(): String? = synchronized(LOCK) {
         reserve("debates", 12, 10 * 60_000L)
     }
+    fun reserveObservation(): String? = synchronized(LOCK) {
+        reserve("observations", 24, 10 * 60_000L)
+    }
     fun reserveRequest(provider: AiProvider): String? = synchronized(LOCK) {
         val now = clock()
         val until = prefs.getLong("ai_backoff_${provider.name}", 0)

@@ -472,6 +472,12 @@ class BotOrchestrator(
             ).joinToString("\n")
         }
         if (_plan[inst] != text) { _plan[inst] = text; _hud.update { it.copy(plan = text) } }
+        val observationPrice = lastPx[inst]
+        if (council != null && observationPrice != null && !risk.killSwitch.value && !council.busy) {
+            val m1 = aggregators["$inst@${Learner.M1}"]?.closed().orEmpty()
+            val m5 = aggregators["$inst@${Learner.M5}"]?.closed().orEmpty()
+            scope.launch { council.observeCandles(inst, m1, m5, observationPrice.first, observationPrice.second, now) }
+        }
         val compact = compactView(inst, now, sh)
         _hud.update { if (it.compact == compact) it else it.copy(compact = compact) }
         statusReport(inst, now, compact)
@@ -1732,6 +1738,7 @@ class BotOrchestrator(
                 ?: if (Ntfy.lastOkAt > 0) " • ostatnio wysłano ${hhmm(Ntfy.lastOkAt)} ✓" else " • jeszcze nic nie wysłano"
             lines += "🔔 ntfy: $t$st"
         }
+        council?.let { lines += it.observationLine(inst, now) }
         return lines.joinToString("\n")
     }
 

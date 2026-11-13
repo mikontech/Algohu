@@ -57,6 +57,69 @@ class AgentCouncil(
     /** true = trwa debata (orkiestrator nie startuje drugiej dla tego samego instrumentu). */
     val busy: Boolean get() = running?.isActive == true
 
+    private data class Observation(val at: Long, val text: String)
+    private val observations = java.util.concurrent.ConcurrentHashMap<String, Observation>()
+    private val observationNotes = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private var observationAttempt = 0L
+
+    fun observationLine(instrument: String, now: Long): String {
+        if (mode == CouncilMode.OFF) return "🧠 Analiza niezależna: rada OFF"
+        val item = observations[instrument]
+        val note = observationNotes[instrument]
+        return if (item == null) "🧠 Analiza niezależna: ${note ?: "czekam na świece M1/M5"}"
+        else "🧠 Scenariusz AI ${hhmmAt(item.at)} (ceny feedu, bez zlecenia" +
+            (if (now - item.at > 120_000) ", nieaktualizowany od ${(now - item.at) / 60_000} min" else "") +
+            "): ${item.text}" + (note?.let { "\n   $it" } ?: "")
+    }
+    private fun hhmmAt(at: Long) = java.text.SimpleDateFormat("HH:mm", Locale.getDefault()).format(java.util.Date(at))
+
+    /** Jeden odczyt analityczny niezależny od sygnału strategii; nigdy nie tworzy zlecenia. */
+    suspend fun observeCandles(instrument: String, m1: List<Bar>, m5: List<Bar>, price: Double, priceAt: Long, now: Long) {
+        if (mode == CouncilMode.OFF || isKilled() || !reviewMutex.tryLock()) return
+        try {
+            if (now - observationAttempt < 10 * 60_000L) return
+            if (now - priceAt !in 0..20_000 || !price.isFinite() || price <= 0 || m1.size < 30 || m5.size < 12 ||
+                !CandleAdvice.validBars(m1.takeLast(30), 60_000, now) || !CandleAdvice.validBars(m5.takeLast(12), 300_000, now)) {
+                observationNotes[instrument] = "czekam na świeże, ciągłe świece: 30 M1 i 12 M5"
+                return
+            }
+            val model = AiSettings.plan(prefs).deep
+            if (AiSettings.key(prefs, AiSettings.provider(model)).isNullOrBlank()) {
+                observationNotes[instrument] = "brak klucza ${AiSettings.provider(model)}"; return
+            }
+            observationAttempt = now
+            limits.reserveObservation()?.let { observationNotes[instrument] = it; return }
+            observationNotes[instrument] = "analizuję świece ($model)…"
+            fun candles(bars: List<Bar>) = bars.joinToString("\n") { "${it.start},${it.open},${it.high},${it.low},${it.close}" }
+            try {
+                val answer = coroutineScope {
+                    val task = async { withTimeout(TOTAL_TIMEOUT_MS) {
+                        client.askJson(model,
+                            "Jesteś analitykiem świec M1/M5. Tworzysz wyłącznie hipotetyczny scenariusz, bez zlecenia. " +
+                            "Nie wymagasz sygnału strategii bota ani wybicia 10 świec. Nie wymuszaj transakcji. " +
+                            "Wszystkie poziomy w skali dostarczonego feedu, nie XTB. LONG/SHORT to faktyczny kierunek opinii, " +
+                            "nie podlega odwracaniu wejść bota. Oceniaj tylko podane zamknięte świece, nie dopisuj danych. " +
+                            "Zwróć JSON: side LONG/SHORT/WAIT, entry liczba lub null, invalidation liczba lub null, " +
+                            "condition konkretny warunek wejścia po polsku (np. zamknięcie M1 ponad poziomem i retest), " +
+                            "reason krótkie uzasadnienie po polsku. WAIT też musi mieć warunek ponownej oceny.",
+                            "Instrument: $instrument; czas ms: $now; cena feedu: $price. Kolumny: czas,open,high,low,close. " +
+                                "M1:\n${candles(m1.takeLast(30))}\nM5:\n${candles(m5.takeLast(12))}", maxTokens = 500)
+                    } }
+                    running = task
+                    task.await()
+                }
+                if (mode != CouncilMode.OFF && !isKilled()) {
+                    observations[instrument] = Observation(now, CandleAdvice.parse(answer).display())
+                    observationNotes.remove(instrument)
+                }
+            } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+                observationNotes[instrument] = "analiza przekroczyła 40 s; brak nowej opinii"
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { observationNotes[instrument] = "brak nowej opinii: ${e.message?.take(140)}" }
+            finally { running = null }
+        } finally { reviewMutex.unlock() }
+    }
+
     /** Wywoływane z kill-switcha HUD: natychmiast przerywa trwającą debatę. */
     fun cancelAll() { running?.cancel(CancellationException("KILL-SWITCH")) }
 

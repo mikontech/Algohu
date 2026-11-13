@@ -105,7 +105,7 @@ class MainActivity : ComponentActivity() {
         TextView(this).apply {
             text = "Tryb oszczędny: do 4 zapytań/debatę, nie częściej niż co 10 min, maks. 12 debat/dobę UTC. " +
                 "Maks. 60 zapytań/dostawcę/dobę łącznie z nawigatorem. Po HTTP 429 przerwa min. 15 min. " +
-                "Analiza świec nadal działa lokalnie co sekundę. Limity konta mogą być niższe. " +
+                "Analiza świec lokalnie co sekundę. Niezależny scenariusz AI: 1 zapytanie co 10 min, maks. 24/dobę, w ramach wspólnego limitu 60 zapytań/dostawcę. Nie otwiera zleceń. Limity konta mogą być niższe. " +
                 "Darmowość zależy od planu u dostawcy; aplikacja nie zmienia rozliczeń konta."
         }.also { layout.addView(it) }
         fun selectAi(route: AiRoute) {
