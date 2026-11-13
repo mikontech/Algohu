@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
 import android.graphics.Rect
+import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
@@ -418,6 +419,28 @@ class AutoExecutionService : AccessibilityService() {
         @Volatile var wantedInstrument: String? = null
         @Volatile var wantedUrgent: Boolean = false
 
+        /**
+         * Autonomia nawigacji we WSZYSTKICH trybach (także DRY_RUN): XTB wraca na wierzch, bot wraca na bilet GOLD,
+         * zamyka wiszące okna i ekran błędu. Zlecenia dalej tylko w AUTO. Ustawia nakładka z prefs „nav_autonomy”.
+         */
+        @Volatile var navAutonomy: Boolean = true
+        /** Pauza autonomii (np. „chcę chwilę użyć telefonu”) – do tej chwili (System.currentTimeMillis). */
+        @Volatile var navPausedUntil: Long = 0L
+        /** Zapasowy nawigator wizyjny (AI) – wołany, gdy zwykłe szukanie biletu zawiedzie. Ustawia nakładka. */
+        @Volatile var aiNavigator: (suspend (target: String) -> Boolean)? = null
+        /** Kill-switch: przerywa trwającą nawigację AI (sprawdzane przed każdym krokiem). */
+        @Volatile var navAbort: () -> Boolean = { false }
+        /** Jedna linia: co robi samonaprawa widoku (do HUD i świadomości agentów). */
+        @Volatile var navStatus: String = "—"
+        /** Pakiet aplikacji, która jest teraz na wierzchu (gdy nie XTB) – do świadomości agentów. */
+        @Volatile var foregroundPackage: String? = null
+        /** Aplikacje, z których bot NIE wyciąga użytkownika na siłę (ustawienia, instalator, Algo HUD, okna systemowe). */
+        private val NO_YANK_PREFIXES = listOf(
+            "com.example.algohud", "com.android.settings", "com.android.packageinstaller", "com.google.android.packageinstaller",
+            "com.android.systemui", "android", "com.google.android.permissioncontroller", "com.android.permissioncontroller"
+        )
+        private const val AI_NAV_MAX_PER_HOUR = 6
+
         private val _gestureActive = MutableStateFlow(false)
         /** HUD obserwuje to i chowa się na czas gestu, żeby nie przechwycić dotyku. */
         val gestureActive: StateFlow<Boolean> = _gestureActive.asStateFlow()
@@ -688,12 +711,14 @@ class AutoExecutionService : AccessibilityService() {
         val pkg = root?.packageName?.toString()
         val label = pkg?.let { targetLabel(it) }
         if (root == null || pkg == null || label == null) {
+            foregroundPackage = pkg
             if (notVisibleSince == 0L) notVisibleSince = now
             diag = "nie widzę okna XTB" + (if (root != null) " (na wierzchu: $pkg)" else "") +
                 (if (lastTargetEventAt > 0) ", ostatni sygnał z XTB ${(now - lastTargetEventAt) / 1000} s temu" else ", brak sygnałów z XTB")
             return false
         }
         notVisibleSince = 0L
+        foregroundPackage = null
         val profile = activeProfile?.takeIf { it.packageName == pkg }
         val profilePrice = profile?.priceLabel?.let { sel -> find(root, sel)?.text?.toString()?.let(::parsePrice) }
         val ts = System.currentTimeMillis()
@@ -1123,6 +1148,11 @@ class AutoExecutionService : AccessibilityService() {
     private var staleSince = 0L
     private var notVisibleSince = 0L
     private var lastFrontAttempt = 0L
+    private var frontAttempts = 0
+
+    /** Samonaprawa widoku: AUTO albo włączona autonomia nawigacji, i nie w pauzie użytkownika. */
+    private fun autonomyOn(): Boolean =
+        (selfHealEnabled || navAutonomy) && System.currentTimeMillis() > navPausedUntil
 
     /** Przewija bilet z powrotem na górę (tytuł instrumentu + przyciski Sell/Buy widoczne) – inaczej bot „ślepnie”. */
     private suspend fun restoreTicketTop() {
@@ -1180,7 +1210,7 @@ class AutoExecutionService : AccessibilityService() {
 
     /** W trybie AUTO: zamyka okna, na których bot utknął, i przywraca bilet na górę. Nie działa w trakcie akcji bota. */
     private suspend fun selfHeal() {
-        if (!selfHealEnabled || _actionActive.value) { staleSince = 0L; return }
+        if (!autonomyOn() || _actionActive.value) { staleSince = 0L; return }
         if (!uiMutex.tryLock()) return
         try {
             val root = appRoot() ?: return
@@ -1227,7 +1257,7 @@ class AutoExecutionService : AccessibilityService() {
         when (xtbError.onScan(error, SystemClock.uptimeMillis())) {
             XtbErrorRecovery.Action.NONE -> Unit
             XtbErrorRecovery.Action.TAP_REFRESH -> {
-                if (!selfHealEnabled) { remoteNote("⚠️ XTB: ekran błędu – naciśnij „Odśwież” (samonaprawa działa tylko w AUTO)"); return }
+                if (!autonomyOn()) { remoteNote("⚠️ XTB: ekran błędu – naciśnij „Odśwież” (samonaprawa wyłączona albo w pauzie)"); return }
                 val btn = nodes.firstOrNull { (_, t) -> XtbErrorRecovery.REFRESH_TEXTS.any { t.equals(it, ignoreCase = true) } }?.first
                 if (btn == null) { remoteNote("⚠️ XTB: ekran błędu bez przycisku „Odśwież” – spróbuję restartu XTB"); return }
                 if (!uiMutex.tryLock()) return
@@ -1235,7 +1265,7 @@ class AutoExecutionService : AccessibilityService() {
                 remoteNote(if (ok) "🔄 XTB: ekran błędu – naciskam „Odśwież”" else "⚠️ XTB: nie udało się nacisnąć „Odśwież”", force = true)
             }
             XtbErrorRecovery.Action.RESTART_APP -> {
-                if (!selfHealEnabled) { alert("XTB pokazuje błąd – uruchom XTB ponownie"); return }
+                if (!autonomyOn()) { alert("XTB pokazuje błąd – uruchom XTB ponownie"); return }
                 restartXtb()
                 alert("XTB się zawiesiło („Coś poszło nie tak”) – otwieram XTB od nowa (${xtbError.restartCount}×). Sprawdź otwarte pozycje!")
             }
@@ -1267,7 +1297,7 @@ class AutoExecutionService : AccessibilityService() {
      */
     private suspend fun findWantedInstrument() {
         val target = wantedInstrument ?: return
-        if (!selfHealEnabled || _actionActive.value || xtbErrorVisible) { offTargetSince = 0L; return }
+        if (!autonomyOn() || _actionActive.value || xtbErrorVisible) { offTargetSince = 0L; return }
         val root = appRoot() ?: return
         if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) { offTargetSince = 0L; return }
         val now = SystemClock.uptimeMillis()
@@ -1290,10 +1320,23 @@ class AutoExecutionService : AccessibilityService() {
         if (now - offTargetSince < wait || now - lastNavAttempt < navRetryMs(navFails)) return
         lastNavAttempt = now
         if (!uiMutex.tryLock()) return
-        val ok = try { navigateTo(target) } finally { uiMutex.unlock() }
+        navStatus = "szukam biletu $target (próba ${navFails + 1})"
+        var viaAi = false
+        val ok = try {
+            navigateTo(target) || run {
+                // Zwykłe szukanie zawiodło – nawigator wizyjny (zrzut ekranu + AI), z limitem na godzinę.
+                val ai = aiNavigator
+                if (ai != null && aiNavAllowed()) {
+                    aiNavTimes.addLast(System.currentTimeMillis())
+                    viaAi = runCatching { ai(target) }.getOrDefault(false)
+                    viaAi
+                } else false
+            }
+        } finally { uiMutex.unlock() }
+        navStatus = if (ok) "bilet $target otwarty${if (viaAi) " (nawigator AI)" else ""}" else "nie znalazłem $target (próba ${navFails + 1})"
         if (ok) {
             navFails = 0; offTargetSince = 0L
-            remoteNote("🧭 XTB: sam otworzyłem bilet $target", force = true)
+            remoteNote("🧭 XTB: sam otworzyłem bilet $target${if (viaAi) " – pomógł nawigator AI 👁️" else ""}", force = true)
             if (wantedUrgent) com.example.algohud.bot.Ntfy.send("🧭 XTB: wróciłem na bilet $target", "pozycja znów pod nadzorem bota",
                 com.example.algohud.bot.Ntfy.NORMAL, "compass")
         } else {
@@ -1566,19 +1609,104 @@ class AutoExecutionService : AccessibilityService() {
         }.onFailure { Log.w(TAG, "Alarm nieudany", it) }
     }
 
-    /** W trybie AUTO: jeśli XTB zniknęło z ekranu na ponad 20 s, przywraca je na pierwszy plan. */
+    /**
+     * XTB zniknęło z ekranu (pulpit, inna aplikacja) na ponad 20 s → przywraca je na pierwszy plan.
+     * Działa we wszystkich trybach przy włączonej autonomii. Nie wyciąga z ustawień, instalatora, Algo HUD
+     * i okien systemowych (np. zgoda AnyDesk). Ekran wygaszony = nic nie robi.
+     */
     private fun keepXtbFront() {
-        if (!selfHealEnabled || !getSharedPreferences("ui", MODE_PRIVATE).getBoolean("keep_xtb_front", true)) return
+        if (!autonomyOn() || !getSharedPreferences("ui", MODE_PRIVATE).getBoolean("keep_xtb_front", true)) return
         val since = notVisibleSince
         val now = SystemClock.uptimeMillis()
-        if (since == 0L || now - since < 20_000 || now - lastFrontAttempt < 30_000) return
+        if (since == 0L) { frontAttempts = 0; return }
+        val fg = foregroundPackage
+        if (fg != null && NO_YANK_PREFIXES.any { fg == it || fg.startsWith("$it.") }) {
+            navStatus = "XTB w tle – czekam, bo na wierzchu: $fg"
+            return
+        }
+        if (fg != null && fg.startsWith("com.anydesk") && now - since < 120_000) return // okno AnyDesk – daj 2 min
+        if (now - since < 20_000 || now - lastFrontAttempt < 30_000) return
         if (getSystemService(android.os.PowerManager::class.java)?.isInteractive != true) return
         lastFrontAttempt = now
-        val intent = packageManager.getLaunchIntentForPackage(ScreenScanner.XTB_PACKAGE) ?: return
-        intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-        runCatching { startActivity(intent) }
-        Log.i(TAG, "XTB niewidoczne od ${(now - since) / 1000} s – przywracam na pierwszy plan")
+        frontAttempts++
+        val intent = packageManager.getLaunchIntentForPackage(ScreenScanner.XTB_PACKAGE) ?: run { navStatus = "XTB nie jest zainstalowane?"; return }
+        intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+        runCatching { startActivity(intent) }.onFailure { Log.w(TAG, "Przywracanie XTB nieudane", it) }
+        navStatus = "przywracam XTB na wierzch (${frontAttempts}×, na wierzchu było: ${fg ?: "?"})"
+        Log.i(TAG, "XTB niewidoczne od ${(now - since) / 1000} s – przywracam na pierwszy plan ($frontAttempts×)")
+        // Android może zablokować start z tła – po 3 nieudanych próbach jeden alarm (powtórka co 10 min w alert()).
+        if (frontAttempts == 3 || frontAttempts % 20 == 0) alert("Nie mogę przywrócić XTB na ekran (${fg ?: "?"} na wierzchu) – otwórz XTB ręcznie")
     }
+
+    // ───────────── Prymitywy nawigacji dla nawigatora AI (wołane TYLKO pod uiMutex z findWantedInstrument) ─────────────
+
+    private val aiNavTimes = ArrayDeque<Long>()
+    private fun aiNavAllowed(): Boolean {
+        val now = System.currentTimeMillis()
+        while (aiNavTimes.isNotEmpty() && now - aiNavTimes.first() > 3_600_000L) aiNavTimes.removeFirst()
+        return aiNavTimes.size < AI_NAV_MAX_PER_HOUR
+    }
+
+    /** Słowa przycisków, w które nawigator AI NIGDY nie może trafić (zlecenia, zamknięcia, modyfikacje). */
+    private val navForbidden = listOf("Sell", "Buy", "Sprzedaj", "Kup", "Potwierdź", "Zamknij", "Close", "Modyfikuj", "Modify",
+        "Usuń", "Delete", "Wyloguj", "Log out", "Wpłać", "Wypłać", "Deposit", "Withdraw")
+
+    /** Wymiary ekranu jak na zrzucie (cały wyświetlacz, z paskami). */
+    private fun realScreen(): Pair<Float, Float> =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            getSystemService(android.view.WindowManager::class.java).currentWindowMetrics.bounds.let { it.width().toFloat() to it.height().toFloat() }
+        } else screenW() to screenH()
+
+    /**
+     * Dotknięcie w punkcie (0..1, 0..1 względem całego ekranu). Zwraca null = dotknięto, inaczej powód odmowy.
+     * Odmawia poza XTB i gdy w punkcie jest przycisk z [navForbidden].
+     */
+    suspend fun navTapNormalized(nx: Float, ny: Float): String? {
+        if (navAbort()) return "kill-switch"
+        if (nx !in 0.02f..0.98f || ny !in 0.03f..0.97f) return "punkt poza bezpiecznym obszarem"
+        val root = appRoot() ?: return "brak okna"
+        if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) return "XTB nie jest na wierzchu"
+        if (findOrderConfirm(root) != null) return "otwarte potwierdzenie zlecenia – nie dotykam"
+        val (w, h) = realScreen()
+        val x = nx * w; val y = ny * h
+        val hit = textNodes(root, 400).firstOrNull { (n, t) ->
+            val r = Rect().also(n::getBoundsInScreen)
+            r.contains(x.toInt(), y.toInt()) && navForbidden.any { f -> t.trim().startsWith(f, ignoreCase = true) }
+        }
+        if (hit != null) return "w tym miejscu jest „${hit.second.take(20)}” – zakazane dla nawigatora"
+        return if (tap(x, y)) null else "gest odrzucony"
+    }
+
+    /**
+     * Chowa HUD i tarczę na czas [block] (zrzut ekranu dla AI – żeby HUD nie zasłaniał XTB).
+     * Gdy trwa jakakolwiek akcja w XTB (zlecenie, nawigacja), NIE rusza HUD-a – zrzut idzie z HUD-em,
+     * bo przełączanie widoczności w trakcie gestu mogłoby przechwycić dotyk. [lockHeld] = wołający już trzyma uiMutex.
+     */
+    suspend fun <T> withHudHidden(lockHeld: Boolean = false, block: suspend () -> T): T {
+        val owned = !lockHeld && uiMutex.tryLock()
+        val canHide = (owned || lockHeld) && !_actionActive.value && !_gestureActive.value
+        try {
+            if (!canHide) return block()
+            _gestureActive.value = true
+            try { delay(150); return block() } finally { _gestureActive.value = false }
+        } finally { if (owned) uiMutex.unlock() }
+    }
+
+    suspend fun navBack() { if (!navAbort()) backStayInXtb() }
+
+    suspend fun navScroll(down: Boolean) {
+        if (navAbort()) return
+        val r = appRoot() ?: return
+        val sc = findScrollable(r)
+        val ok = sc?.performAction(if (down) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) == true
+        if (!ok) { if (down) drag(screenW() / 2, screenH() * 0.72f, screenH() * 0.38f) else drag(screenW() / 2, screenH() * 0.38f, screenH() * 0.72f) }
+        delay(600)
+    }
+
+    suspend fun navIsOnTarget(target: String): Boolean = onTarget(target)
+
+    /** Krótki opis tekstów widocznych w XTB (dla nawigatora, gdy zrzut ekranu jest zablokowany). */
+    fun navScreenText(): String = screenDump()
 
     private suspend fun awaitById(id: String, timeoutMs: Long): AccessibilityNodeInfo? = withTimeoutOrNull(timeoutMs) {
         var found: AccessibilityNodeInfo? = null

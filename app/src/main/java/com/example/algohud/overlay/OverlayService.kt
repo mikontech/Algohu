@@ -113,6 +113,11 @@ class OverlayService : LifecycleService() {
     private lateinit var risk: RiskManager
     private lateinit var engine: ExecutionEngine
     private lateinit var bot: BotOrchestrator
+    private var council: com.example.algohud.council.AgentCouncil? = null
+    private var aiNav: com.example.algohud.council.AiNavigator? = null
+    private lateinit var tvCouncil: TextView
+    private lateinit var tvDebate: TextView
+    private var showDebate = false
 
     private var expanded = false
 
@@ -182,7 +187,7 @@ class OverlayService : LifecycleService() {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
             ACTION_STOP -> { uiPrefs().edit().putBoolean("autostart", false).apply(); stopSelf() }
-            ACTION_KILL -> if (::engine.isInitialized) botScope.launch { engine.flattenAll("KILL z powiadomienia") }
+            ACTION_KILL -> if (::engine.isInitialized) { stopAi(); botScope.launch { engine.flattenAll("KILL z powiadomienia") } }
             ACTION_MODE -> if (::engine.isInitialized) {
                 val m = runCatching { ExecutionMode.valueOf(intent.getStringExtra(EXTRA_VALUE)!!) }.getOrNull()
                 if (m != null) {
@@ -209,6 +214,8 @@ class OverlayService : LifecycleService() {
     }
 
     override fun onDestroy() {
+        stopAi()
+        AutoExecutionService.aiNavigator = null
         botScope.cancel()
         setShield(false)
         rootView?.let { runCatching { wm.removeView(it) } }
@@ -247,6 +254,28 @@ class OverlayService : LifecycleService() {
             autoGate = { null }
         )
 
+        // ── Rada AI (4 agenty) + nawigator wizyjny. Klucz API i tryb: aplikacja Algo HUD → „Rada AI”. ──
+        val councilPrefs = getSharedPreferences("council", MODE_PRIVATE)
+        val claude = com.example.algohud.council.ClaudeClient({ councilPrefs.getString(com.example.algohud.council.AgentCouncil.PREF_KEY, null) })
+        val c = com.example.algohud.council.AgentCouncil(
+            prefs = councilPrefs, client = claude,
+            log = { line -> if (::bot.isInitialized) bot.councilLog(line) },
+            isKilled = { risk.killSwitch.value },
+            priceNow = { inst -> if (::bot.isInitialized) bot.lastPrice(inst) else null }
+        )
+        council = c
+        val nav = com.example.algohud.council.AiNavigator(
+            client = claude,
+            model = { councilPrefs.getString(com.example.algohud.council.AgentCouncil.PREF_FAST_MODEL, null)
+                ?: com.example.algohud.council.AgentCouncil.DEFAULT_FAST_MODEL },
+            hasKey = { c.hasKey() },
+            log = { line -> if (::bot.isInitialized) bot.councilLog(line) }
+        )
+        aiNav = nav
+        AutoExecutionService.aiNavigator = { target -> if (councilPrefs.getBoolean("ai_nav", true)) nav.open(target) else false }
+        AutoExecutionService.navAbort = { risk.killSwitch.value }
+        AutoExecutionService.navAutonomy = uiPrefs().getBoolean("nav_autonomy", true)
+
         bot = BotOrchestrator(
             scope = botScope,
             news = news,
@@ -263,12 +292,18 @@ class OverlayService : LifecycleService() {
                     engine.mode.value == ExecutionMode.DRY_RUN -> 10_000.0 to "PAPER" // bez XTB: konto papierowe
                     else -> null
                 }
-            }
+            },
+            council = c
         )
         bot.start()
     }
 
     private fun uiPrefs() = getSharedPreferences("ui", MODE_PRIVATE)
+
+    private fun stopAi() {
+        council?.cancelAll()
+        aiNav?.cancel()
+    }
 
     /** Po starcie wraca tryb wybrany w aplikacji (np. AUTO) – ponawia, dopóki ułatwienia dostępu nie będą gotowe. */
     private fun restoreMode() {
@@ -305,6 +340,8 @@ class OverlayService : LifecycleService() {
         tvPlan = TextView(this).apply { setTextColor(0xFFFFE082.toInt()); textSize = 11.5f; visibility = View.GONE }
         tvPredict = TextView(this).apply { setTextColor(0xFFBDBDBD.toInt()); textSize = 11.5f; visibility = View.GONE }
         tvScreen = TextView(this).apply { setTextColor(0xFFFFE082.toInt()); textSize = 11f; maxWidth = dp(280); maxLines = 3 }
+        tvCouncil = TextView(this).apply { setTextColor(0xFFCE93D8.toInt()); textSize = 11.5f; maxLines = 3 }
+        tvDebate = TextView(this).apply { setTextColor(0xFFE1BEE7.toInt()); textSize = 11f; maxLines = 16; visibility = View.GONE }
         btnConfirm = actionButton("✔ Potwierdź", 0xFF1565C0.toInt()) {
             botScope.launch { engine.confirmPending() }
         }.apply { visibility = View.GONE }
@@ -312,7 +349,17 @@ class OverlayService : LifecycleService() {
         val killRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(actionButton("⛔ KILL", 0xFF7F0000.toInt(), longPress = true) {
+                stopAi() // najpierw przerwij debatę i nawigację AI – zwalnia blokadę UI dla zamykania pozycji
                 botScope.launch { engine.flattenAll("KILL ręczny z HUD") }
+            })
+            addView(actionButton("🧠", 0xFF4A148C.toInt()) {
+                showDebate = !showDebate
+                tvDebate.visibility = if (showDebate) View.VISIBLE else View.GONE
+            })
+            addView(actionButton("⏸", 0xFF37474F.toInt()) {
+                val paused = AutoExecutionService.navPausedUntil > System.currentTimeMillis()
+                AutoExecutionService.navPausedUntil = if (paused) 0L else System.currentTimeMillis() + 10 * 60_000L
+                toast(if (paused) "▶ Samonaprawa widoku wznowiona" else "⏸ Samonaprawa widoku wstrzymana na 10 min – możesz używać telefonu")
             })
             btnDetails = actionButton(if (showDetails) "▴ Zwiń" else "ℹ️ Szczegóły", 0xFF37474F.toInt()) {
                 showDetails = !showDetails
@@ -338,6 +385,8 @@ class OverlayService : LifecycleService() {
             addView(tvPredict, full().apply { topMargin = dp(4) })
             addView(tvStats, full().apply { topMargin = dp(4) })
             addView(tvMessage, full().apply { topMargin = dp(4) })
+            addView(tvCouncil, full().apply { topMargin = dp(4) })
+            addView(tvDebate, full().apply { topMargin = dp(2) })
             addView(killRow, wrap().apply { topMargin = dp(6) })
         }
         val root = LinearLayout(this).apply {
@@ -455,6 +504,18 @@ class OverlayService : LifecycleService() {
             }
         }
         lifecycleScope.launch { AutoExecutionService.gestureActive.collect { setPassThrough(it) } }
+        // Kill-switch ma pierwszeństwo: przerywa debatę rady i nawigację AI.
+        lifecycleScope.launch { risk.killSwitch.collect { if (it) stopAi() } }
+        council?.let { c ->
+            lifecycleScope.launch {
+                kotlinx.coroutines.flow.combine(c.status, kotlinx.coroutines.flow.flow { while (true) { emit(Unit); kotlinx.coroutines.delay(2_000) } }) { st, _ -> st }
+                    .collect { st ->
+                        val paused = AutoExecutionService.navPausedUntil > System.currentTimeMillis()
+                        tvCouncil.text = "$st\n🧭 ${if (paused) "⏸ samonaprawa w pauzie • " else ""}${AutoExecutionService.navStatus}"
+                    }
+            }
+            lifecycleScope.launch { c.transcript.collect { tvDebate.text = it.takeLast(14).joinToString("\n").ifBlank { "Brak debaty – rada rusza przy kandydacie na wejście" } } }
+        }
         lifecycleScope.launch { engine.mode.collect { AutoExecutionService.selfHealEnabled = it == ExecutionMode.AUTO } }
         lifecycleScope.launch {
             kotlinx.coroutines.flow.combine(AutoExecutionService.peek, AutoExecutionService.actionActive) { a, b -> a || b }

@@ -84,6 +84,48 @@ class MainActivity : ComponentActivity() {
             Toast.makeText(this, "Wyłączone", Toast.LENGTH_SHORT).show()
         }
 
+        // ───────────── Rada AI (4 agenty) i samonaprawa widoku ─────────────
+        TextView(this).apply { text = "\n🧠 Rada AI (4 agenty)"; textSize = 18f }.also { layout.addView(it) }
+        fun council() = getSharedPreferences("council", MODE_PRIVATE)
+        TextView(this).apply {
+            text = "Obserwator → Strateg ⇄ Sceptyk (weto) → Dowódca → RiskGate. Rada ocenia tylko NOWE wejścia; " +
+                "wyjścia, SL i kill-switch działają bez AI. Klucz API Anthropic zostaje tylko w tym telefonie."
+        }.also { layout.addView(it) }
+        val keyEdit = android.widget.EditText(this).apply {
+            hint = if (council().getString(com.example.algohud.council.AgentCouncil.PREF_KEY, null).isNullOrBlank()) "Klucz API Anthropic (sk-ant-…)" else "Klucz zapisany ✓ (wpisz nowy, by zmienić)"
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }.also { layout.addView(it) }
+        button("Zapisz klucz API") {
+            val k = keyEdit.text.toString().trim()
+            if (!k.startsWith("sk-ant-")) Toast.makeText(this, "To nie wygląda na klucz Anthropic (sk-ant-…)", Toast.LENGTH_LONG).show()
+            else {
+                council().edit().putString(com.example.algohud.council.AgentCouncil.PREF_KEY, k).apply()
+                keyEdit.setText(""); keyEdit.hint = "Klucz zapisany ✓ (wpisz nowy, by zmienić)"
+                Toast.makeText(this, "Zapisano", Toast.LENGTH_SHORT).show()
+            }
+        }
+        fun councilMode(m: com.example.algohud.council.CouncilMode, note: String) {
+            council().edit().putString(com.example.algohud.council.AgentCouncil.PREF_MODE, m.name).apply()
+            Toast.makeText(this, "Rada AI: ${m.name} – $note", Toast.LENGTH_LONG).show(); refresh()
+        }
+        button("Rada: ADVISORY – tylko komentuje (domyślnie)") { councilMode(com.example.algohud.council.CouncilMode.ADVISORY, "bot wchodzi jak dotąd") }
+        button("Rada: GATE – może zawetować wejście") { councilMode(com.example.algohud.council.CouncilMode.GATE, "weto blokuje wejście, błąd API = brak wejścia") }
+        button("Rada: OFF") { councilMode(com.example.algohud.council.CouncilMode.OFF, "wyłączona") }
+        button("Nawigator AI (zapas, gdy bot nie znajdzie GOLD): WŁĄCZ") { council().edit().putBoolean("ai_nav", true).apply(); refresh() }
+        button("Nawigator AI: wyłącz") { council().edit().putBoolean("ai_nav", false).apply(); refresh() }
+        button("Samonaprawa widoku we WSZYSTKICH trybach (też DRY_RUN): WŁĄCZ") {
+            getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("nav_autonomy", true).apply()
+            AutoExecutionService.navAutonomy = true; refresh()
+        }
+        button("Samonaprawa widoku: tylko w AUTO") {
+            getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("nav_autonomy", false).apply()
+            AutoExecutionService.navAutonomy = false; refresh()
+        }
+        button("⏸ Wstrzymaj samonaprawę na 30 min (używam telefonu)") {
+            AutoExecutionService.navPausedUntil = System.currentTimeMillis() + 30 * 60_000L; refresh()
+        }
+        button("▶ Wznów samonaprawę") { AutoExecutionService.navPausedUntil = 0L; refresh() }
+
         TextView(this).apply { text = "\nZdalny dostęp (AnyDesk)"; textSize = 18f }.also { layout.addView(it) }
         fun ui() = getSharedPreferences("ui", MODE_PRIVATE)
         button("AnyDesk: auto-akceptuj „Rozpocząć nagrywanie?” – WŁĄCZ") {
@@ -162,7 +204,14 @@ class MainActivity : ComponentActivity() {
         status.text = buildString {
             appendLine("Nakładka: " + if (Settings.canDrawOverlays(this@MainActivity)) "✅" else "❌")
             appendLine("Ułatwienia dostępu: " + if (AutoExecutionService.instance != null) "✅" else "❌ (potrzebne tylko w Wariancie B)")
-            append("Domyślny tryb: DRY_RUN (paper trading)")
+            appendLine("Domyślny tryb: DRY_RUN (paper trading)")
+            val cp = getSharedPreferences("council", MODE_PRIVATE)
+            appendLine("Rada AI: " + (cp.getString(com.example.algohud.council.AgentCouncil.PREF_MODE, null) ?: "ADVISORY") +
+                " • klucz API: " + (if (cp.getString(com.example.algohud.council.AgentCouncil.PREF_KEY, null).isNullOrBlank()) "❌ brak" else "✅") +
+                " • nawigator AI: " + (if (cp.getBoolean("ai_nav", true)) "✅" else "wył."))
+            val paused = AutoExecutionService.navPausedUntil > System.currentTimeMillis()
+            append("Samonaprawa widoku: " + (if (getSharedPreferences("ui", MODE_PRIVATE).getBoolean("nav_autonomy", true)) "wszystkie tryby" else "tylko AUTO") +
+                (if (paused) " (⏸ pauza)" else "") + " • zrzuty ekranu: " + (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) "✅ Android 11+" else "❌ za stary Android"))
         }
     }
 }

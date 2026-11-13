@@ -15,6 +15,10 @@ import com.example.algohud.execution.AutoExecutionService
 import com.example.algohud.execution.ExecutionEngine
 import com.example.algohud.risk.RiskManager
 import com.example.algohud.risk.TradeJournal
+import com.example.algohud.council.AgentCouncil
+import com.example.algohud.council.CouncilContext
+import com.example.algohud.council.CouncilDecision
+import com.example.algohud.council.CouncilMode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
@@ -140,7 +144,9 @@ class BotOrchestrator(
     /** (kapitał, źródło) – np. (631.27, "XTB:PLN"); null = brak danych. */
     private val equityProvider: suspend () -> Pair<Double, String>?,
     private val manualStopPct: Double = 0.005,
-    private val barMs: Long = 5 * 60_000L
+    private val barMs: Long = 5 * 60_000L,
+    /** Rada 4 agentów AI – bramka przed NOWYM wejściem (null = wyłączona). */
+    private val council: AgentCouncil? = null
 ) {
     private val _hud = MutableStateFlow(HudState())
     val hud: StateFlow<HudState> = _hud.asStateFlow()
@@ -335,7 +341,9 @@ class BotOrchestrator(
 
     private suspend fun enterAggressive(
         inst: String, dir: Int, px: Double, rawStop: Double, why: String, ts: Long,
-        tp: Double? = null, tier: Int = Tier.AGGRESSIVE, tpR: Double = 2.0
+        tp: Double? = null, tier: Int = Tier.AGGRESSIVE, tpR: Double = 2.0,
+        /** Po FAKTYCZNYM wysłaniu zlecenia (przy radzie w trybie GATE – dopiero po werdykcie, w tle). */
+        after: ((ExecutionResult) -> Unit)? = null
     ): ExecutionResult? {
         // Bot może złożyć zlecenie tylko na instrumencie otwartym w XTB – pozostałe liczy w tle bez prób wejścia.
         val onScreen = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() }?.instrument
@@ -362,7 +370,7 @@ class BotOrchestrator(
         }
         val order = buildOrder(inst, side, entry, stop, takeProfit, why, pointValue(inst), tier) ?: return null
         decisionCard(inst, order, Signal(side, stop, takeProfit, why, tier), ev = Double.NaN)
-        return engine.submit(order)
+        return submitEntry(inst, order, after)
     }
 
     // ───────────── ŚWIECE + PREDYKCJA AI: model online, wejście przed zamknięciem świecy, trailing za impulsem ─────────────
@@ -581,8 +589,9 @@ class BotOrchestrator(
         val stop = px - dir * AI_STOP_ATR * p.atr
         val reason = "$AI_TAG ${if (p.early) "wcześnie " else ""}${if (dir > 0) "wzrostowa" else "spadkowa"} %.0f%%, korpus ~%.2f".format(p.prob * 100, p.expBody)
         aiEnteredBar[inst] = curBar
-        val r = enterAggressive(inst, dir, px, stop, reason, ts, tpR = AI_SAFETY_TP_R)
-        if (r is ExecutionResult.Filled || r is ExecutionResult.Submitted) aiTrades[inst] = AiTrade(expBody = p.expBody)
+        enterAggressive(inst, dir, px, stop, reason, ts, tpR = AI_SAFETY_TP_R) { r ->
+            if (r is ExecutionResult.Filled || r is ExecutionResult.Submitted) aiTrades[inst] = AiTrade(expBody = p.expBody)
+        }
     }
 
     // ── zarządzanie pozycją AI: TP wirtualny, przesuwanie TP za impulsem, ciasny trailing, wyjście przy wyhamowaniu ──
@@ -1331,7 +1340,7 @@ class BotOrchestrator(
         val order = buildOrder(inst, sig.side, entry, sig.stopPrice, sig.takeProfit, "STRAT ${sig.reason}", pointValue(inst), tier)
             ?: return
         decisionCard(inst, order, sig.copy(tier = tier), ev)
-        engine.submit(order)
+        submitEntry(inst, order)
     }
 
     /** Decyzja w formacie: kondycja • kierunek • poziom agresji i wielkość • wejście/SL/TP (w cenach XTB). */
@@ -1479,8 +1488,9 @@ class BotOrchestrator(
         if (risk.cooldownLeftMs() > 0) { usOpenInfo[inst] = "przerwa po stracie ${risk.cooldownLeftMs() / 1000} s$rangeText"; return }
         msg("🇺🇸 $inst: ${s.reason}")
         val dir = s.side.sign
-        val r = enterAggressive(inst, dir, px, s.stop, s.reason, now, tier = Tier.MODERATE)
-        if (r is ExecutionResult.Filled || r is ExecutionResult.Submitted) res.status.openMs?.let { orb.markTaken(it) }
+        enterAggressive(inst, dir, px, s.stop, s.reason, now, tier = Tier.MODERATE) { r ->
+            if (r is ExecutionResult.Filled || r is ExecutionResult.Submitted) res.status.openMs?.let { orb.markTaken(it) }
+        }
     }
 
     private val blindSince = HashMap<String, Long>()
@@ -1735,10 +1745,10 @@ class BotOrchestrator(
         val order = buildOrder(inst, s.side, px, s.stop, s.target, s.reason, pointValue(inst), Tier.AGGRESSIVE, structural = true) ?: run {
             msg("🏦 $inst: ${s.reason} – ${smcNote[inst] ?: "odrzucone"}"); countBlock("🏦 ${smcNote[inst] ?: "odrzucone"}"); return
         }
-        smcSessionCount[sessKey] = n + 1
         msg("🏦 $inst: ${s.reason} – WCHODZĘ")
         decisionCard(inst, order, Signal(s.side, order.stopPrice, order.takeProfit ?: s.target, s.reason, Tier.AGGRESSIVE), ev = Double.NaN)
-        engine.submit(order)
+        // Limit wejść na sesję liczony dopiero po faktycznym wysłaniu (weto rady nie zużywa limitu).
+        submitEntry(inst, order) { smcSessionCount[sessKey] = (smcSessionCount[sessKey] ?: 0) + 1 }
     }
 
     private fun smcPlan(inst: String, sh: Double): String {
@@ -1890,8 +1900,129 @@ class BotOrchestrator(
     }
 
     private val clockFmt = java.time.format.DateTimeFormatter.ofPattern("HH:mm")
-    private fun msg(text: String) = _hud.update {
-        it.copy(lastMessage = java.time.LocalTime.now(MarketHours.ZONE).format(clockFmt) + " " + text)
+    private fun msg(text: String) {
+        val line = java.time.LocalTime.now(MarketHours.ZONE).format(clockFmt) + " " + text
+        synchronized(recentMsgs) { recentMsgs.addLast(line); while (recentMsgs.size > 12) recentMsgs.removeFirst() }
+        _hud.update { it.copy(lastMessage = line) }
+    }
+
+    /** Ostatnie komunikaty bota – część „świadomości” rady AI. */
+    private val recentMsgs = ArrayDeque<String>()
+
+    /** Ostatnia cena bota dla instrumentu (feed/XTB) – do kontroli poślizgu po debacie rady. */
+    fun lastPrice(inst: String): Double? = lastPx[inst]?.first
+
+    /** Komunikat rady AI (z wątku debaty) – do HUD. */
+    fun councilLog(text: String) = msg(text)
+
+    // ───────────── Rada AI: bramka przed NOWYM wejściem ─────────────
+
+    private val councilPending = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val councilVetoUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * Jedyna droga NOWEGO wejścia. Zamknięcia, odwrócenia i reduceOnly idą od razu do silnika (bez AI).
+     *  • GATE – debata w tle: pętla cen, wyjścia, schodki SL i kill-switch działają dalej; po werdykcie ponowna
+     *    kontrola (pozycja? kill-switch?) i dopiero wtedy engine.submit. Weto = przerwa [COUNCIL_VETO_PAUSE_MS] dla tego kierunku.
+     *  • ADVISORY – wejście od razu jak dotąd, debata równolegle tylko do logu i ntfy.
+     * @return wynik, gdy zlecenie poszło od razu; null, gdy czeka na radę albo pominięte. [after] – po faktycznym submit.
+     */
+    private suspend fun submitEntry(inst: String, order: OrderRequest, after: ((ExecutionResult) -> Unit)? = null): ExecutionResult? {
+        val c = council
+        val isEntry = !order.reduceOnly && risk.position(inst) == null
+        val mode = c?.mode ?: CouncilMode.OFF
+        if (c == null || !isEntry || mode == CouncilMode.OFF || (mode == CouncilMode.ADVISORY && !c.hasKey())) return engine.submit(order).also { after?.invoke(it) }
+        val now = System.currentTimeMillis()
+        val vkey = "$inst:${order.side}"
+        if (mode == CouncilMode.ADVISORY) {
+            val ctx = councilContext(inst, order)
+            if (!c.busy) scope.launch { runCatching { c.review(ctx) } }
+            return engine.submit(order).also { after?.invoke(it) }
+        }
+        councilVetoUntil[vkey]?.let { until ->
+            if (now < until) { skip(inst, "rada AI zawetowała ${sideName(order.side)} – przerwa do ${hhmm(until)}"); return null }
+        }
+        if (councilPending.putIfAbsent(inst, now) != null) { skip(inst, "rada AI już debatuje nad wejściem"); return null }
+        val ctx = councilContext(inst, order)
+        msg("🧠 $inst: ${sideName(order.side)} – czekam na werdykt rady AI (do ${AgentCouncil.TOTAL_TIMEOUT_MS / 1000} s)")
+        scope.launch {
+            try {
+                val d = c.review(ctx)
+                lock.withLock {
+                    when (d) {
+                        is CouncilDecision.Approve -> when {
+                            risk.killSwitch.value -> msg("🧠 $inst: rada ZA, ale kill-switch aktywny – nie wchodzę")
+                            risk.position(inst) != null -> msg("🧠 $inst: rada ZA, ale w międzyczasie otwarto pozycję – pomijam")
+                            else -> engine.submit(d.order).also { after?.invoke(it) }
+                        }
+                        is CouncilDecision.Veto -> {
+                            councilVetoUntil[vkey] = System.currentTimeMillis() + COUNCIL_VETO_PAUSE_MS
+                            skip(inst, "rada AI: ${d.reason}")
+                            countBlock("🧠 " + d.reason.replace(Regex("[0-9]+([.,][0-9]+)?"), "#").take(60))
+                        }
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                msg("🧠 $inst: błąd rady AI – ${e.message?.take(60)} – nie wchodzę")
+            } finally {
+                councilPending.remove(inst)
+            }
+        }
+        return null
+    }
+
+    private fun us(v: Double?) = v?.let { String.format(java.util.Locale.US, "%.2f", it) } ?: "—"
+
+    private suspend fun councilContext(inst: String, order: OrderRequest): CouncilContext {
+        val now = System.currentTimeMillis()
+        val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
+        val rows = if (q != null) runCatching { AutoExecutionService.instance?.visiblePositionRows()?.size }.getOrNull() ?: 0 else 0
+        return CouncilContext(
+            instrument = inst, order = order, strategy = stratName(order.reason),
+            priceNow = lastPx[inst]?.first ?: order.referencePrice, spread = spreadOf(inst),
+            m1 = aggregators["$inst@${Learner.M1}"]?.closed().orEmpty(),
+            m5 = aggregators["$inst@${Learner.M5}"]?.closed().orEmpty(),
+            newsSentiment = news.sentimentFor(aliasesFor(inst)).first,
+            freeFunds = q?.availableFunds ?: AutoExecutionService.lastAccountFunds,
+            dailyPnl = _hud.value.dailyPnl,
+            botNotes = listOfNotNull(compassLine(inst), usOpenLine(inst, now), traderNote[inst], smcNote[inst]),
+            xtbShift = q?.let { basis(inst, it) } ?: 0.0,
+            awareness = awareness(inst),
+            untrackedXtbRows = rows
+        )
+    }
+
+    /**
+     * „Omni-awareness”: wszystko, co bot wie o sobie, XTB i telefonie – w kilku linijkach dla agentów AI.
+     * Tylko odczyt (bez kliknięć), więc bezpieczne do wołania z pętli cen.
+     */
+    suspend fun awareness(inst: String): String = buildString {
+        val now = System.currentTimeMillis()
+        val svc = AutoExecutionService.instance
+        val q = AutoExecutionService.screenQuote.value
+        val h = _hud.value
+        appendLine("Tryb wykonania: ${engine.mode.value} • kill-switch: ${if (risk.killSwitch.value) "AKTYWNY (${risk.killReason})" else "nie"} • " +
+            "wynik dnia ${us(h.dailyPnl)} zł • feed cen: ${if (h.feedConnected) "online" else "OFFLINE"}")
+        appendLine("Usługa ułatwień dostępu: ${if (svc != null) "aktywna" else "WYŁĄCZONA"} • odczyt XTB: ${AutoExecutionService.diag}")
+        appendLine("Na wierzchu: ${AutoExecutionService.foregroundPackage ?: "XTB"} • ekran błędu XTB: ${if (svc?.xtbErrorVisible == true) "TAK" else "nie"} • " +
+            "samonaprawa widoku: ${AutoExecutionService.navStatus}")
+        q?.let {
+            appendLine("Ostatni odczyt XTB: ${it.instrument ?: "(nie bilet)"} Sell ${us(it.bid)} Buy ${us(it.ask)} • ${(now - it.timestamp) / 1000} s temu • " +
+                "wolne środki ${us(it.availableFunds ?: AutoExecutionService.lastAccountFunds)} ${it.accountCurrency ?: AutoExecutionService.lastAccountCurrency ?: ""}")
+        }
+        val pos = risk.openSymbols().mapNotNull { risk.position(it) }
+        appendLine("Pozycje w księdze bota: " + if (pos.isEmpty()) "brak" else pos.joinToString("; ") { p ->
+            "${p.symbol} ${sideName(p.side)} ${p.quantity} @ ${us(p.entryPrice)} SL ${us(p.stopPrice)} TP ${us(p.takeProfit)}" +
+                (if (p.paper) " (papier)" else "") + " [${stratName(p.entryReason)}]"
+        })
+        runCatching { svc?.visiblePositionRows() }.getOrNull()?.takeIf { it.isNotEmpty() }?.let { rows ->
+            appendLine("Wiersze pozycji widoczne teraz w XTB: " + rows.joinToString("; ") { r -> "${r.side ?: "?"} ${r.volume ?: "?"} ${r.entryText ?: ""} SL ${us(r.sl)} TP ${us(r.tp)}" })
+        }
+        appendLine("Bramka danych: ${dataBlock(inst) ?: "OK"} • przerwa po stracie: ${risk.cooldownLeftMs() / 1000} s • ntfy: ${Ntfy.lastError ?: "OK"}")
+        AutoExecutionService.lastAlert?.takeIf { now - it.first < 30 * 60_000L }?.let { appendLine("Ostatni alarm (${(now - it.first) / 60_000} min temu): ${it.second}") }
+        append("Ostatnie zdarzenia bota: " + synchronized(recentMsgs) { recentMsgs.toList() }.takeLast(6).joinToString(" | "))
     }
 
     private fun f2(v: Double?) = v?.let { "%.2f".format(it) } ?: "—"
@@ -2045,6 +2176,7 @@ class BotOrchestrator(
         const val EARLY_LOSS_EXITS = false
         /** Pozycję zamyka WYŁĄCZNIE Stop Loss (przesuwany za zyskiem); bez TP, bez wyjść bota, bez zamykania na koniec sesji. */
         const val BROKER_EXITS_ONLY = true       // wyjścia: TP/SL w XTB (+ odwrócenie trendu, gdy TREND_EXIT)
+        const val COUNCIL_VETO_PAUSE_MS = 3 * 60_000L // po wecie rady: 3 min bez ponownej debaty w tym kierunku
         const val STATUS_EVERY_MS = 1_800_000L    // cichy raport stanu (ntfy) co 30 min – w limicie ntfy.sh
         const val ARM_NOTIFY_GAP_MS = 900_000L    // „za chwilę mogę wejść” / „odpuściłem silny ruch” – maks. raz na 15 min
         const val MISSED_MOVE_ATR = 1.5           // „silny ruch” = świeca 1m ≥ 1,5×ATR
