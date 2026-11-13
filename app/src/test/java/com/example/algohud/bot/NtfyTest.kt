@@ -14,6 +14,12 @@ class NtfyTest {
         assertTrue(a.all { it.isLetterOrDigit() || it == '-' })
     }
 
+    @Test fun deviceTopicIsStable() {
+        assertEquals(Ntfy.topicFor("abc123"), Ntfy.topicFor("abc123"))
+        assertTrue(Ntfy.topicFor("abc123") != Ntfy.topicFor("abc124"))
+        assertEquals(18, Ntfy.topicFor("abc123").length)
+    }
+
     @Test fun polishTitleIsEncodedInUrl() {
         val u = Ntfy.url("algohud-test", "🚨 Pozycja bez nadzoru – sprawdź", 5, "rotating_light")
         assertTrue(u, u.startsWith("https://ntfy.sh/algohud-test?title="))
