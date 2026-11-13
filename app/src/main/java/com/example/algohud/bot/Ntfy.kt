@@ -82,14 +82,31 @@ object Ntfy {
      * Wysyła powiadomienie w tle. [key] + [minGapMs] – nie częściej niż raz na [minGapMs] dla tego samego klucza.
      * Błędy sieci są tylko logowane (bot działa dalej).
      */
+    /**
+     * Darmowy ntfy.sh przyjmuje ok. 250 wiadomości na dobę z jednego adresu IP (potem HTTP 429).
+     * Budżet: ciche wiadomości (raporty, zapowiedzi, diagnoza) najwyżej [LOW_DAILY_BUDGET] na dobę,
+     * reszta zostaje dla wejść, wyjść i alarmów. Po HTTP 429 ciche wiadomości pauzują na [BACKOFF_MS].
+     */
+    const val LOW_DAILY_BUDGET = 120
+    const val BACKOFF_MS = 30 * 60_000L
+    @Volatile private var day = 0L
+    @Volatile private var lowSentToday = 0
+    @Volatile private var backoffUntil = 0L
+
     fun send(title: String, text: String, priority: Int = NORMAL, tags: String = "", key: String? = null, minGapMs: Long = 0L) {
         val t = topic ?: return
-        if (key != null) {
-            val now = System.currentTimeMillis()
-            val prev = lastSent[key]
-            if (prev != null && now - prev < minGapMs) return
-            lastSent[key] = now
+        val nowMs = System.currentTimeMillis()
+        if (priority <= QUIET) {
+            val d = nowMs / 86_400_000L
+            if (d != day) { day = d; lowSentToday = 0 }
+            if (nowMs < backoffUntil || lowSentToday >= LOW_DAILY_BUDGET) return
         }
+        if (key != null) {
+            val prev = lastSent[key]
+            if (prev != null && nowMs - prev < minGapMs) return
+            lastSent[key] = nowMs
+        }
+        if (priority <= QUIET) lowSentToday++
         scope.launch {
             runCatching {
                 val c = URL(url(t, title, priority, tags)).openConnection() as HttpURLConnection
@@ -102,7 +119,11 @@ object Ntfy {
                     c.outputStream.use { it.write(text.toByteArray(Charsets.UTF_8)) }
                     val code = c.responseCode
                     if (code in 200..299) { lastOkAt = System.currentTimeMillis(); lastError = null }
-                    else { lastError = "HTTP $code"; Log.w(TAG, "ntfy HTTP $code") }
+                    else {
+                        lastError = if (code == 429) "HTTP 429 – dzienny limit ntfy.sh, ciche raporty wstrzymane na 30 min" else "HTTP $code"
+                        if (code == 429) backoffUntil = System.currentTimeMillis() + BACKOFF_MS
+                        Log.w(TAG, "ntfy HTTP $code")
+                    }
                 } finally { c.disconnect() }
             }.onFailure { lastError = it.javaClass.simpleName + ": " + (it.message ?: ""); Log.w(TAG, "ntfy: wysyłka nieudana", it) }
         }
