@@ -3,6 +3,9 @@ package com.example.algohud
 import com.example.algohud.council.AiSettings
 import com.example.algohud.council.AiProvider
 import com.example.algohud.council.AiRoute
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
+import androidx.core.widget.doAfterTextChanged
 import android.Manifest
 import android.content.Intent
 import android.net.Uri
@@ -87,6 +90,15 @@ class MainActivity : ComponentActivity() {
             Toast.makeText(this, "Wyłączone", Toast.LENGTH_SHORT).show()
         }
 
+        val reverseSwitch = android.widget.Switch(this).apply {
+            text = "Odwracaj nowe wejścia: LONG ↔ SHORT"
+            isChecked = getSharedPreferences("ui", MODE_PRIVATE).getBoolean("reverse_entries", true)
+            setOnCheckedChangeListener { _, enabled ->
+                getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("reverse_entries", enabled).apply()
+                Toast.makeText(this@MainActivity, "Nowe wejścia: " + if (enabled) "odwrócone" else "normalne", Toast.LENGTH_LONG).show()
+            }
+        }
+        layout.addView(reverseSwitch)
         // ───────────── Rada AI (4 agenty) i samonaprawa widoku ─────────────
         TextView(this).apply { text = "\n🧠 Rada AI (4 agenty)"; textSize = 18f }.also { layout.addView(it) }
         fun council() = getSharedPreferences("council", MODE_PRIVATE)
@@ -108,20 +120,56 @@ class MainActivity : ComponentActivity() {
         TextView(this).apply {
             text = "Gemini + Groq: Gemini = Obserwator/Dowódca/nawigator; Groq = Strateg/Sceptyk. " +
                 "Wybrany dostawca otrzymuje dane analizy, a przy ocenie ekranu także zrzut XTB. " +
-                "Nie ma automatycznego przełączania na innego dostawcę. Klucze zapisujesz tylko na telefonie."
+                "Po 502/503/504 jedna ponowna próba u tego samego dostawcy. Klucze zostają po restarcie i aktualizacji APK; odinstalowanie usuwa dane."
         }.also { layout.addView(it) }
         for (provider in listOf(AiProvider.GEMINI, AiProvider.GROQ, AiProvider.CLAUDE)) {
             val keyEdit = android.widget.EditText(this).apply {
                 hint = "${provider.name}: " + if (AiSettings.key(council(), provider).isNullOrBlank()) "wklej klucz API" else "klucz zapisany ✓"
                 inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+                isSaveEnabled = false
             }.also { layout.addView(it) }
+            val keyStatus = TextView(this).also { layout.addView(it) }
+            fun keyStatusRefresh() { keyStatus.text = "${provider.name}: " + if (AiSettings.key(council(), provider).isNullOrBlank()) "brak klucza" else "klucz zapisany na telefonie ✓" }
+            keyStatusRefresh()
+            keyEdit.doAfterTextChanged { value ->
+                val key = value.toString().trim()
+                if (key.isNotBlank() && key.none { it.isWhitespace() }) {
+                    council().edit().putString(AiSettings.keyPref(provider), key).apply()
+                    keyStatusRefresh()
+                }
+            }
             button("Zapisz klucz ${provider.name}") {
                 val key = keyEdit.text.toString().trim()
                 if (key.isBlank() || key.any { it.isWhitespace() }) Toast.makeText(this, "Wklej poprawny klucz bez spacji", Toast.LENGTH_LONG).show()
                 else {
-                    council().edit().putString(AiSettings.keyPref(provider), key).apply()
+                    if (!council().edit().putString(AiSettings.keyPref(provider), key).commit()) {
+                        keyStatus.text = "Błąd zapisu klucza"; return@button
+                    }
+                    keyStatusRefresh()
                     keyEdit.setText(""); keyEdit.hint = "${provider.name}: klucz zapisany ✓"; refresh()
                 }
+            }
+        }
+        val apiStatus = TextView(this).also { layout.addView(it) }
+        var testingApi = false
+        button("Testuj zapisane klucze i modele API") {
+            if (!testingApi) lifecycleScope.launch {
+                testingApi = true
+                apiStatus.text = "Test API trwa…"
+                try {
+                    val plan = AiSettings.plan(council())
+                    val client = com.example.algohud.council.ClaudeClient.configured(council())
+                    val results = mutableListOf<String>()
+                    for (model in listOf(plan.fast, plan.deep).distinct()) {
+                        val result = try {
+                            client.askJson(model, "Return only a JSON object.", "Return {\"ok\":true}", maxTokens = 100)
+                            "$model: połączenie działa ✓"
+                        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                        catch (e: Exception) { "$model: ${e.message}" }
+                        results += result
+                        apiStatus.text = results.joinToString("\n")
+                    }
+                } finally { testingApi = false }
             }
         }
         for ((pref, defaultModel) in listOf("gemini_model" to AiSettings.GEMINI_MODEL, "groq_model" to AiSettings.GROQ_MODEL)) {

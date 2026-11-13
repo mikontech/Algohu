@@ -26,7 +26,7 @@ class ClaudeClient(
     private val providerKey: (AiProvider) -> String? = { apiKey() },
     private val limits: AiLimits? = null
 ) {
-    class ApiException(message: String) : IOException(message)
+    class ApiException(message: String, val status: Int? = null) : IOException(message)
 
     suspend fun askJson(model: String, system: String, userText: String,
                         imageJpegBase64: String? = null, maxTokens: Int = 700): JSONObject {
@@ -34,8 +34,16 @@ class ClaudeClient(
         val key = providerKey(provider)?.takeIf { it.isNotBlank() }
             ?: throw ApiException("brak klucza API ${provider.name}")
         val req = request(model, key, system, userText, imageJpegBase64, maxTokens)
-        limits?.reserveRequest(provider)?.let { throw ApiException(it) }
-        return withContext(Dispatchers.IO) { http.newCall(req).await(provider) }
+        for (attempt in 0..1) {
+            limits?.reserveRequest(provider)?.let { throw ApiException(it) }
+            try {
+                return withContext(Dispatchers.IO) { http.newCall(req).await(provider) }
+            } catch (e: ApiException) {
+                if (attempt == 1 || e.status !in listOf(502, 503, 504)) throw e
+                kotlinx.coroutines.delay(1500)
+            }
+        }
+        throw ApiException("brak odpowiedzi API")
     }
 
     private suspend fun Call.await(provider: AiProvider): JSONObject = suspendCancellableCoroutine { cont ->
@@ -51,7 +59,14 @@ class ClaudeClient(
                         if (!r.isSuccessful) {
                             if (r.code == 429) limits?.backoff(provider, r.header("Retry-After")?.toLongOrNull())
                             // Treść błędu dostawcy może zawierać fragmenty danych lub klucz. Nie logujemy jej.
-                            throw ApiException("${provider.name}: HTTP ${r.code}" + if (r.code == 429) " – przerwa minimum 15 min" else "")
+                            val hint = when (r.code) {
+                                401, 403 -> " – sprawdź klucz i uprawnienia konta"
+                                404 -> " – model niedostępny: sprawdź nazwę modelu"
+                                429 -> " – limit dostawcy; przerwa minimum 15 min"
+                                502, 503, 504 -> " – usługa chwilowo niedostępna"
+                                else -> " – sprawdź konfigurację modelu"
+                            }
+                            throw ApiException("${provider.name}: HTTP ${r.code}$hint", r.code)
                         }
                         parse(provider, r.body?.string().orEmpty())
                     }

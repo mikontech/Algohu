@@ -30,7 +30,8 @@ data class PositionRowInfo(
     /** Tekst ceny otwarcia, np. "@ 4 106.51" – część sygnatury wiersza. */
     val entryText: String?,
     val sl: Double?,
-    val tp: Double?
+    val tp: Double?,
+    val netPnl: Double? = null
 ) {
     /** XTB nie pokazuje w aplikacji numeru pozycji – wiersz rozpoznajemy po stronie, wolumenie i cenie otwarcia. */
     val signature: String get() = "$side|$volume|$entryText"
@@ -70,7 +71,8 @@ object PositionRowParser {
             volume = valueUnder(items, "Wolumen", "ValueTextText")?.let(::number),
             entryText = valueUnder(items, "Wolumen", "ValueTextSubtitle")?.trim(),
             sl = valueUnder(items, "Stop Loss", "ValueTextText")?.let(::number),
-            tp = valueUnder(items, "Take Profit", "ValueTextText")?.let(::number)
+            tp = valueUnder(items, "Take Profit", "ValueTextText")?.let(::number),
+            netPnl = valueUnder(items, "Zysk netto", "ValueTextText")?.let(::number)
         )
     }
 }

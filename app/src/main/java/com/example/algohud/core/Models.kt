@@ -49,6 +49,7 @@ data class OrderRequest(
     val tier: Int = 1,
     /** Stały wolumen (np. 0.006) – bez skalowania wg % ryzyka i limitu dźwigni poziomu agresji. */
     val fixedSize: Boolean = false,
+    val directionPrepared: Boolean = false,
     val clientOrderId: String = "hud" + UUID.randomUUID().toString().replace("-", "").take(16)
 )
 

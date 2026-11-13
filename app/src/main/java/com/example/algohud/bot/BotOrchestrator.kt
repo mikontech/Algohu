@@ -609,6 +609,7 @@ class BotOrchestrator(
         var lockStep: Int = 0,
         /** Najlepszy zysk netto w zł liczony jak „Zysk netto” w XTB (po cenie zamknięcia z ekranu). */
         var bestNetPln: Double = 0.0,
+        var profitStopXtb: Double? = null,
         /** TP, który według bota jest teraz ustawiony w XTB (NaN = nieznany). */
         var brokerTp: Double = Double.NaN,
         /** Świeca 1m, w której ostatnio odsunięto TP (maks. raz na świecę). */
@@ -645,7 +646,7 @@ class BotOrchestrator(
                 } else (px - pos.entryPrice) * dir * perPrice - spreadOf(inst) * perPrice
                 t.bestNetPln = maxOf(t.bestNetPln, netPln)
                 // Schodki: co SL_STEP_PLN zysku netto SL wyżej (+8 zł → wejście + spread, +16 → +8 zł, +24 → +16…).
-                Sizing.lockStop(pos.entryPrice, dir, t.bestNetPln, perPrice, maxOf(spreadOf(inst), 0.05), SL_STEP_PLN)?.let { lock ->
+                if (pos.paper) Sizing.lockStop(pos.entryPrice, dir, t.bestNetPln, perPrice, maxOf(spreadOf(inst), 0.05), SL_STEP_PLN)?.let { lock ->
                     val steps = kotlin.math.floor(t.bestNetPln / SL_STEP_PLN + 1e-9).toInt()
                     if (risk.tightenStop(inst, lock) && steps > t.lockStep) {
                         t.lockStep = steps
@@ -655,7 +656,7 @@ class BotOrchestrator(
                     }
                 }
                 val rPln = r * perPrice
-                if (bestPln >= maxOf(BE_AT_PLN, rPln)) {
+                if (pos.paper && bestPln >= maxOf(BE_AT_PLN, rPln)) {
                     // BE dopiero po +1R (wcześniej to tylko oddawanie pozycji szumowi), od +1,5R SL 1R za najlepszą ceną.
                     val be = pos.entryPrice + dir * maxOf(spreadOf(inst), 0.05)
                     val trail = best - dir * r
@@ -700,6 +701,21 @@ class BotOrchestrator(
                 }
             }
             if (t.trailing) risk.tightenStop(inst, best - dir * maxOf(BIG_MOVE_TRAIL_ATR * atr, 2 * spreadOf(inst)))
+            if (!pos.paper) {
+                AutoExecutionService.instance?.profitSnapshot(inst, pos.side, pos.quantity)?.let { (quote, row) ->
+                    val entry = row.entryText?.let { com.example.algohud.execution.PositionRowParser.number(it) }
+                    val net = row.netPnl
+                    val bid = quote.bid; val ask = quote.ask
+                    if (entry != null && net != null && bid != null && ask != null) {
+                        val target = ProfitTrail.target(entry, dir, net, perPrice, ask - bid,
+                            if (dir > 0) bid else ask, row.sl)
+                        if (target != null && (t.profitStopXtb == null || (target - t.profitStopXtb!!) * dir > 0)) {
+                            t.profitStopXtb = target
+                            msg("🔒 $inst: XTB netto %+.2f zł – zlecam SL %.2f (spread + zysk)".format(net, target))
+                        }
+                    }
+                }
+            }
             brokerSync(inst, pos, t, ts, perPrice)
             return
         }
@@ -784,7 +800,8 @@ class BotOrchestrator(
             val be = p.entryPrice + dir * maxOf(spreadOf(inst), 0.05)
             val step = maxOf(2 * spreadOf(inst), if (perPrice > 0) BROKER_STEP_PLN / perPrice else 0.3)
             // SL: tylko po stronie zysku (startowy SL 15–20 zł zostaje w XTB), maks. co BROKER_SYNC_EVERY_MS.
-            val slDue = (stopNow - be) * dir >= 0 && ts - t.brokerAt >= BROKER_SYNC_EVERY_MS &&
+            val profitDue = t.profitStopXtb != null && ts - t.brokerAt >= BROKER_SYNC_EVERY_MS
+            val slDue = profitDue || (stopNow - be) * dir >= 0 && ts - t.brokerAt >= BROKER_SYNC_EVERY_MS &&
                 (t.brokerSl.isNaN() || abs(stopNow - t.brokerSl) >= step)
             // TP: od razu po odsunięciu (bez czekania 20 s) – inaczej XTB zamknie na starym TP w środku wzrostu.
             val tpDue = tpNow != null && (t.brokerTp.isNaN() || abs(tpNow - t.brokerTp) >= step)
@@ -793,14 +810,20 @@ class BotOrchestrator(
             t.brokerBusy = true; t.brokerAt = ts
             try {
                 val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
-                val sh = q?.let { basis(inst, it) } ?: 0.0
+                if (q == null) return@launch
+                val sh = basis(inst, q)
+                val requestedSl = if (profitDue) t.profitStopXtb else if (slDue) stopNow + sh else null
                 val res = AutoExecutionService.instance?.setProtection(
-                    inst, if (slDue) stopNow + sh else null, if (tpDue) tpNow!! + sh else null
+                    inst, requestedSl, if (tpDue) tpNow!! + sh else null
                 )
                 if (res is ExecutionResult.Submitted || res is ExecutionResult.Filled) {
-                    if (slDue) t.brokerSl = stopNow
+                    if (slDue) {
+                        t.brokerSl = requestedSl!! - sh
+                        risk.tightenStop(inst, t.brokerSl)
+                        if (profitDue) t.profitStopXtb = null
+                    }
                     if (tpDue) t.brokerTp = tpNow!!
-                    msg("🛡 $inst: w otwartej pozycji XTB" + (if (slDue) " SL → %.2f".format(stopNow + sh) else "") +
+                    msg("🛡 $inst: w otwartej pozycji XTB" + (if (slDue) " SL → %.2f".format(requestedSl) else "") +
                         (if (tpDue) " TP → %.2f".format(tpNow!! + sh) else ""))
                 } else if (res != null) {
                     msg("⚠️ $inst: nie zmieniłem SL/TP w pozycji XTB (${(res as? ExecutionResult.Rejected)?.reason ?: res}) – ponowię")
@@ -1941,7 +1964,8 @@ class BotOrchestrator(
      *  • ADVISORY – wejście od razu jak dotąd, debata równolegle tylko do logu i ntfy.
      * @return wynik, gdy zlecenie poszło od razu; null, gdy czeka na radę albo pominięte. [after] – po faktycznym submit.
      */
-    private suspend fun submitEntry(inst: String, order: OrderRequest, after: ((ExecutionResult) -> Unit)? = null): ExecutionResult? {
+    private suspend fun submitEntry(inst: String, request: OrderRequest, after: ((ExecutionResult) -> Unit)? = null): ExecutionResult? {
+        val order = engine.prepareEntry(request)
         val c = council
         val isEntry = !order.reduceOnly && risk.position(inst) == null
         val mode = c?.mode ?: CouncilMode.OFF

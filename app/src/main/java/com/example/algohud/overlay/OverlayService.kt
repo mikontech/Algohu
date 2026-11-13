@@ -249,6 +249,7 @@ class OverlayService : LifecycleService() {
 
         engine = ExecutionEngine(
             risk, executor, initialMode = ExecutionMode.DRY_RUN,
+            reverseEntries = { getSharedPreferences("ui", MODE_PRIVATE).getBoolean("reverse_entries", true) },
             // AUTO dopiero po udokumentowanym dodatnim wyniku na papierze.
             positionProbe = { sym -> AutoExecutionService.instance?.xtbPositionExists(sym) },
             autoGate = { null }

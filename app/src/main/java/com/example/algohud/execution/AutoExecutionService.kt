@@ -68,6 +68,7 @@ class ExecutionEngine(
     /** Dodatkowa bramka AUTO (np. wyniki papierowe); null = OK. */
     private val autoGate: () -> String? = { null },
     /** Czy pozycja instrumentu istnieje w aplikacji brokera: true / false / null = nie da się ustalić. */
+    private val reverseEntries: () -> Boolean = { false },
     private val positionProbe: suspend (String) -> Boolean? = { null }
 ) {
     private var pendingAt = 0L
@@ -113,7 +114,11 @@ class ExecutionEngine(
     }
 
     /** @param bypassConfirmation true dla akcji człowieka i stopów ochronnych. */
-    suspend fun submit(order: OrderRequest, bypassConfirmation: Boolean = false): ExecutionResult {
+    fun prepareEntry(order: OrderRequest): OrderRequest =
+        com.example.algohud.core.EntryDirection.prepare(order, reverseEntries())
+
+    suspend fun submit(request: OrderRequest, bypassConfirmation: Boolean = false): ExecutionResult {
+        val order = prepareEntry(request)
         when (val d = risk.evaluate(order)) {
             is RiskManager.Decision.Rejected -> {
                 log("✋ ${d.reason}")
@@ -951,6 +956,11 @@ class AutoExecutionService : AccessibilityService() {
     }
 
     private suspend fun doSetProtection(instrument: String, sl: Double?, tp: Double?): ExecutionResult {
+        val before = appRoot()?.let { readPositionRows(it) }?.singleOrNull()
+            ?: return ExecutionResult.Rejected("brak jednoznacznego odczytu pozycji przed zmianą SL/TP")
+        if (before.signature != profitAnchors[instrument]) return ExecutionResult.Rejected("pozycja niepotwierdzona przez bota")
+        if (sl != null && before.sl != null && before.side != null && (sl - before.sl) * before.side.sign < -0.005)
+            return ExecutionResult.Rejected("nie cofam SL względem poziomu w XTB")
         openPositionScreen(instrument)?.let { return ExecutionResult.Rejected(it) }
         tp?.let { price -> setPriceIn("TakeProfitInput", "TakeProfitToggle", price)?.let { return ExecutionResult.Rejected("TP: $it") } }
         sl?.let { price -> setPriceIn("StopLossInput", "StopLossToggle", price)?.let { return ExecutionResult.Rejected("SL: $it") } }
@@ -958,10 +968,17 @@ class AutoExecutionService : AccessibilityService() {
             ?: return ExecutionResult.Rejected("brak przycisku Modyfikuj pozycję")
         if (!click(modify)) return ExecutionResult.Rejected("nie udało się dotknąć Modyfikuj pozycję")
         delay(1_200)
-        return ExecutionResult.Submitted(
-            "Ustawiono w XTB" + (sl?.let { " SL %.2f".format(it) } ?: "") + (tp?.let { " TP %.2f".format(it) } ?: "") +
-                " – sprawdź na wykresie"
-        )
+        // Wpis w formularzu nie jest dowodem zapisu u brokera.
+        repeat(4) {
+            val row = appRoot()?.let { readPositionRows(it) }?.singleOrNull { it.signature == before.signature }
+            if (row != null && (sl == null || row.sl?.let { abs(it - sl) <= 0.011 } == true) &&
+                (tp == null || row.tp?.let { abs(it - tp) <= 0.011 } == true)) {
+                return ExecutionResult.Submitted("SL/TP potwierdzone przy pozycji XTB")
+            }
+            if (it == 0) backStayInXtb()
+            delay(500)
+        }
+        return ExecutionResult.Rejected("zmiana wysłana, ale brak potwierdzenia SL/TP przy pozycji XTB")
     }
 
     private suspend fun doClosePosition(instrument: String): ExecutionResult {
@@ -1564,6 +1581,19 @@ class AutoExecutionService : AccessibilityService() {
     }
 
     /** Wiersze otwartych pozycji widoczne w drzewie bieżącego ekranu XTB (bez klikania) – do wykrycia pozycji spoza księgi. */
+    private val profitAnchors = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** Wyłącznie świeży odczyt pozycji, której otwarcie potwierdził bot. */
+    fun profitSnapshot(instrument: String, side: Side, quantity: Double): Pair<ScreenQuote, PositionRowInfo>? {
+        val root = appRoot()?.takeIf { it.packageName?.toString() == ScreenScanner.XTB_PACKAGE } ?: return null
+        val q = ScreenScanner.scanXtb(root, ScreenScanner.XTB_PACKAGE, "XTB", System.currentTimeMillis()) ?: return null
+        if (q.instrument != instrument || q.accountCurrency != "PLN") return null
+        val row = readPositionRows(root).singleOrNull() ?: return null
+        if (row.signature != profitAnchors[instrument] || row.side != side ||
+            row.volume?.let { abs(abs(it) - quantity) > 1e-8 } != false) return null
+        return q to row
+    }
+
     fun visiblePositionRows(): List<PositionRowInfo> =
         appRoot()?.takeIf { it.packageName?.toString() == ScreenScanner.XTB_PACKAGE }?.let { runCatching { readPositionRows(it) }.getOrNull() }.orEmpty()
 
@@ -1882,6 +1912,7 @@ class AutoExecutionService : AccessibilityService() {
         val desc = "${order.side} ${formatQty(order.quantity)} ${order.symbol}, SL %.2f".format(sl) + (tp?.let { ", TP %.2f".format(it) } ?: "")
         return when (val check = awaitOpenedPosition(order, sl, tp, rowsBefore)) {
             is OpenCheck.Confirmed -> {
+                profitAnchors[order.symbol] = check.row.signature
                 if (formOp != null) {
                     formCoordinator.onConfirmed(
                         formOp,
