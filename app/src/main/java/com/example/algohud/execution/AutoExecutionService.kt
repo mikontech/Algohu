@@ -1298,9 +1298,14 @@ class AutoExecutionService : AccessibilityService() {
                 com.example.algohud.bot.Ntfy.NORMAL, "compass")
         } else {
             navFails++
-            remoteNote("🧭 XTB: nie znalazłem $target (próba $navFails, następna za ${navRetryMs(navFails) / 60_000L} min)", force = true)
-            if (navFails == 3 || navFails % 6 == 0) alert("Nie mogę sam otworzyć $target w XTB ($navFails prób). Otwórz bilet $target ręcznie" +
-                if (wantedUrgent) " – bot ma otwartą pozycję!" else ".")
+            remoteNote("🧭 XTB: nie znalazłem $target (próba $navFails, następna za ${navRetryMs(navFails) / 60_000L} min) • ekran: ${lastNavDump.take(400)}", force = true)
+            if (navFails == 3 || navFails % 6 == 0) {
+                alert("Nie mogę sam otworzyć $target w XTB ($navFails prób). Otwórz bilet $target ręcznie" +
+                    if (wantedUrgent) " – bot ma otwartą pozycję!" else ".")
+                // Do diagnozy: co bot widział na ekranie (cicho, raz na próbę z alarmem).
+                com.example.algohud.bot.Ntfy.send("🔍 Diagnoza szukania $target", lastNavDump.take(900),
+                    com.example.algohud.bot.Ntfy.MIN, "mag")
+            }
         }
     }
 
@@ -1371,33 +1376,15 @@ class AutoExecutionService : AccessibilityService() {
         }
     }
 
-    private suspend fun navigateTo(target: String): Boolean {
-        Log.i(TAG, "Szukam $target w XTB")
-        // 1) Wyszukiwarka: lupa w prawym górnym rogu → wpisz nazwę → wiersz wyniku (nie pole tekstowe!)
-        run {
-            appRoot()?.let { r -> nodeWithText(r, "Rynki", minY = 0.8f)?.let { click(it); delay(1_000) } }
-            val r0 = appRoot() ?: return false
-            val lupa = r0.findAccessibilityNodeInfosByText("Szukaj").firstOrNull { it.isVisibleToUser && !it.isEditable }
-            if (lupa != null) click(lupa) else tap(screenW() * 0.91f, screenH() * 0.085f)
-            delay(1_200)
-            val field = appRoot()?.let { findEditable(it) }
-            if (field != null) {
-                val args = android.os.Bundle().apply {
-                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, target)
-                }
-                field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
-                delay(1_500)
-                appRoot()?.let { r -> instrumentRow(r, target) }?.let { row ->
-                    click(row)
-                    if (onTarget(target)) return true
-                }
-                performGlobalAction(GLOBAL_ACTION_BACK); delay(600) // zamknij klawiaturę / wyszukiwarkę
-                performGlobalAction(GLOBAL_ACTION_BACK); delay(800)
-            }
-        }
-        // 2) Rynki → Surowce (albo CFD) → wiersz instrumentu (z przewijaniem)
-        appRoot()?.let { r -> nodeWithText(r, "Rynki", minY = 0.8f)?.let { click(it); delay(1_200) } }
-        appRoot()?.let { r -> (nodeWithText(r, "Surowce", maxY = 0.3f) ?: nodeWithText(r, "CFD", maxY = 0.3f))?.let { click(it); delay(900) } }
+    /** Teksty widoczne na ekranie przy ostatniej nieudanej próbie – do diagnozy (HUD „Szczegóły” i alarm). */
+    @Volatile private var lastNavDump: String = ""
+
+    private fun screenDump(): String = appRoot()?.let { r ->
+        textNodes(r, 300).map { it.second.replace('\n', ' ').take(30) }.distinct().take(30).joinToString(" | ")
+    } ?: "brak okna"
+
+    /** Na bieżącej liście: wiersz instrumentu → klik → bilet; inaczej przewijanie (maks. [NAV_SCROLLS] razy). */
+    private suspend fun clickRowWithScroll(target: String): Boolean {
         repeat(NAV_SCROLLS) {
             val r = appRoot() ?: return false
             val row = instrumentRow(r, target)
@@ -1413,6 +1400,53 @@ class AutoExecutionService : AccessibilityService() {
             }
             delay(600)
         }
+        return false
+    }
+
+    private suspend fun navigateTo(target: String): Boolean {
+        Log.i(TAG, "Szukam $target w XTB")
+        // 1) Wyszukiwarka: lupa → pole → wpisz nazwę → wiersz wyniku (nie pole tekstowe!)
+        run {
+            appRoot()?.let { r -> nodeWithText(r, "Rynki", minY = 0.8f)?.let { click(it); delay(1_000) } }
+            val r0 = appRoot() ?: return false
+            val lupa = r0.findAccessibilityNodeInfosByText("Szukaj").firstOrNull { it.isVisibleToUser && !it.isEditable }
+            if (lupa != null) click(lupa) else tap(screenW() * 0.91f, screenH() * 0.085f)
+            delay(1_200)
+            var field = appRoot()?.let { findEditable(it) }
+            if (field == null) { // ekran „Instrumenty” bez aktywnego pola – dotknij miejsca pola u góry
+                tap(screenW() / 2, screenH() * 0.19f); delay(900)
+                field = appRoot()?.let { findEditable(it) }
+            }
+            if (field != null) {
+                val args = android.os.Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, target)
+                }
+                field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                delay(1_500)
+                appRoot()?.let { r -> instrumentRow(r, target) }?.let { row ->
+                    click(row)
+                    if (onTarget(target)) return true
+                }
+            } else {
+                // „Ostatnio wyszukiwane” (kafelek GOLD) albo kategoria „Surowce” na ekranie Instrumenty
+                appRoot()?.let { r -> instrumentRow(r, target) }?.let { tile ->
+                    click(tile)
+                    if (onTarget(target)) return true
+                }
+                appRoot()?.let { r -> nodeWithText(r, "Surowce", minY = 0.15f) }?.let { cat ->
+                    click(cat); delay(1_500)
+                    if (clickRowWithScroll(target)) return true
+                }
+            }
+            lastNavDump = screenDump()
+            performGlobalAction(GLOBAL_ACTION_BACK); delay(600) // zamknij klawiaturę / wyszukiwarkę
+            performGlobalAction(GLOBAL_ACTION_BACK); delay(800)
+        }
+        // 2) Rynki → Surowce (albo CFD) → wiersz instrumentu (z przewijaniem)
+        appRoot()?.let { r -> nodeWithText(r, "Rynki", minY = 0.8f)?.let { click(it); delay(1_200) } }
+        appRoot()?.let { r -> (nodeWithText(r, "Surowce") ?: nodeWithText(r, "CFD", maxY = 0.3f))?.let { click(it); delay(1_200) } }
+        if (clickRowWithScroll(target)) return true
+        lastNavDump = lastNavDump + " || " + screenDump()
         return false
     }
 
