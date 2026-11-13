@@ -2013,7 +2013,7 @@ class BotOrchestrator(
         const val ARM_NOTIFY_GAP_MS = 300_000L    // „za chwilę mogę wejść” / „odpuściłem silny ruch” – maks. raz na 5 min
         const val MISSED_MOVE_ATR = 1.5           // „silny ruch” = świeca 1m ≥ 1,5×ATR
         const val BLIND_ALERT_MS = 45_000L        // alarm: pozycja otwarta, a bot nie widzi biletu w XTB od 45 s…
-        const val BLIND_ALERT_EVERY_MS = 120_000L //  …i potem co 2 min, dopóki trwa
+        const val BLIND_ALERT_EVERY_MS = 600_000L //  …i potem co 10 min, dopóki trwa
         const val TREND_EXIT = true              // bot sam zamyka przy POTWIERDZONEJ tendencji przeciwnej (ReversalGuard)
         const val BIG_MOVE_MIN_R = 1.0           // „duży wzrost”: silny impuls przy zysku ≥ 1R…
         const val TP_EXTEND_ATR = 1.5            // …TP odsuwany na najlepszą cenę + max(1,5×ATR, 1R)

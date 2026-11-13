@@ -46,11 +46,47 @@ object MarketHours {
         "ETHEREUM" to ALWAYS
     )
 
+    /**
+     * Instrumenty z sesją CME Globex (złoto, srebro, ropa, indeksy USA): przerwa dzienna 17:00–18:00 czasu
+     * Nowego Jorku i weekend od piątku 17:00 do niedzieli 18:00 ET. Liczone w czasie NY, więc przerwa sama
+     * przesuwa się w tygodniach, gdy USA i Europa zmieniają czas w różne dni (wtedy 22:00–23:00 PL zamiast 23:00–00:00).
+     */
+    val GLOBEX = setOf("GOLD", "SILVER", "OIL", "OIL.WTI", "US100", "US500", "US30")
+    /** Zapas po otwarciu sesji (szeroki spread, słaba płynność). */
+    const val GLOBEX_OPEN_BUFFER_MIN = 5
+
+    fun globexStatus(nowMs: Long): Status {
+        val ny = Instant.ofEpochMilli(nowMs).atZone(UsSession.NY)
+        val m = ny.hour * 60 + ny.minute
+        val close = 17 * 60
+        val reopen = 18 * 60 + GLOBEX_OPEN_BUFFER_MIN
+        val open = when (ny.dayOfWeek) {
+            DayOfWeek.SATURDAY -> false
+            DayOfWeek.SUNDAY -> m >= reopen
+            DayOfWeek.FRIDAY -> m < close
+            else -> m < close || m >= reopen
+        }
+        if (!open) return Status(false, null, null)
+        // Najbliższe 17:00 ET (dziś albo jutro)
+        val closeAt = (if (m < close) ny.toLocalDate() else ny.toLocalDate().plusDays(1)).atTime(17, 0).atZone(UsSession.NY)
+        val toClose = Duration.between(ny, closeAt).toMinutes()
+        return Status(true, toClose, null)
+    }
+
     /** Instrumenty, na których bot gra otwarcie sesji w USA (UsOpenOrb). */
     val US_OPEN_TRADED = setOf("GOLD", "SILVER", "OIL", "OIL.WTI", "DE40", "US100", "US500", "US30")
 
     fun status(inst: String, nowMs: Long): Status {
         val h = TABLE[inst] ?: COMMODITY
+        if (inst in GLOBEX) {
+            val g = globexStatus(nowMs)
+            val now = Instant.ofEpochMilli(nowMs).atZone(ZONE)
+            val lastEvent = if (!g.open || now.dayOfWeek !in WEEKDAYS) null else h.openEvents
+                .map { now.toLocalDate().atTime(it).atZone(ZONE) }
+                .filter { !it.isAfter(now) }
+                .maxOrNull()?.toInstant()?.toEpochMilli()
+            return g.copy(lastOpenEventMs = lastEvent)
+        }
         val now = Instant.ofEpochMilli(nowMs).atZone(ZONE)
         val time = now.toLocalTime()
         val lastEvent = if (now.dayOfWeek !in WEEKDAYS) null else h.openEvents
