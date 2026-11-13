@@ -1276,8 +1276,11 @@ class BotOrchestrator(
     // ───────────── Rdzeń: wyjścia, świece, sygnały ─────────────
 
     private suspend fun processPrice(inst: String, px: Double, tsRaw: Long) {
-        // Znacznik z przyszłości (zły zegar źródła) zablokowałby świece – przycinamy do teraz.
-        val ts = minOf(tsRaw, System.currentTimeMillis() + 2_000)
+        // Nie odmładzaj nieaktualnych notowań; odrzuć błędny czas/cenę i cofające się ticki.
+        val now = System.currentTimeMillis()
+        if (!px.isFinite() || px <= 0 || tsRaw <= 0 || tsRaw > now + 2_000 || now - tsRaw > 20_000) return
+        val ts = tsRaw
+        if (lastPx[inst]?.second?.let { ts < it } == true) return
         lastPx[inst] = px to ts
         risk.onMark(inst, px)?.let { exit ->
             val real = engine.mode.value != ExecutionMode.DRY_RUN && risk.position(inst)?.paper == false
@@ -2066,7 +2069,10 @@ class BotOrchestrator(
             )
         } ?: "brak"
         val pnl = "Wynik dnia – XTB: %+.2f • papier: %+.2f".format(risk.dailyPnl.value, risk.dailyPnlPaper.value)
-        return listOf(line1, readinessLine(inst, q), line2, "Środki: $funds • wartość lota: $pv", "Pozycja bota: $pos", pnl,
+        val sourceDiag = if (inst in binanceFallback) "📡 Binance ${FEEDS[inst]}: ${news.liveDiagnostic(FEEDS[inst].orEmpty())}"
+            else if (inst in PYTH_FEEDS) "📡 Pyth: ${pyth.liveDiagnostic(inst)}"
+            else "📡 ${FEEDS[inst]?.let { news.liveDiagnostic(it) } ?: "XTB ekran"}"
+        return listOf(line1, readinessLine(inst, q), sourceDiag, line2, "Środki: $funds • wartość lota: $pv", "Pozycja bota: $pos", pnl,
             "(pozycje otwarte ręcznie w XTB nie są w księdze bota) • wersja ${com.example.algohud.BuildConfig.GIT_SHA}").joinToString("\n")
     }
 

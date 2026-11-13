@@ -112,3 +112,17 @@ Dokumentacja sprawdzona 13.11.2026:
 Testy bez kluczy sprawdzają żądania, odpowiedzi, odrzucanie uciętych odpowiedzi,
 429 bez wycieku treści błędu, budżety po restarcie i blokadę GATE. Połączenie z
 prawdziwym kontem wymaga sprawdzenia na telefonie po wpisaniu własnych kluczy.
+
+## Diagnostyka braku bieżących cen
+
+Binance: połączenia WebSocket rotują między publicznym hostem danych na 443,
+standardowym hostem na 443 oraz 9443. Jeśli dla symbolu od 10 s nie ma nowej
+transakcji, co 5 s działa zapas HTTPS `/api/v3/trades?limit=100` na
+`data-api.binance.vision`. REST zachowuje czas i ID transakcji giełdy; powtórne
+odczyty nie odmładzają ceny. Stare (>20 s), przyszłe (>2 s), błędne i powtórzone
+transakcje są odrzucane. 429/418 włącza przerwę co najmniej 60 s z Retry-After.
+Nie podmieniamy feedu kursem z ekranu XTB. Przy braku danych wejścia nadal blokowane.
+
+HUD pokazuje diagnostykę wybranego źródła (Pyth albo Binance). Usługa dostępności
+ustawia flagi odczytu interaktywnych okien przy połączeniu i reaguje na WINDOWS_CHANGED;
+XTB rozpoznawane także po jednoznacznym pakiecie. Weryfikacja na telefonie nadal wymagana.

@@ -483,6 +483,12 @@ class AutoExecutionService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        // Ponownie ustaw flagi również po aktualizacji APK z działającą usługą.
+        serviceInfo = serviceInfo.apply {
+            flags = flags or android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
+                android.accessibilityservice.AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
+            eventTypes = eventTypes or AccessibilityEvent.TYPE_WINDOWS_CHANGED
+        }
         instance = this
         com.example.algohud.bot.Ntfy.init(this)
         startPolling()
@@ -691,6 +697,7 @@ class AutoExecutionService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event?.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) { scanNow(); return }
         val pkg = event?.packageName?.toString() ?: return
         if (pkg.startsWith("com.anydesk")) {
             if (event.eventType == AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) handleAnydeskNotification(event)
@@ -808,6 +815,7 @@ class AutoExecutionService : AccessibilityService() {
     /** Etykieta aplikacji, jeśli to aplikacja docelowa (np. "XTB"); dla pozostałych null. */
     private fun targetLabel(pkg: String): String? {
         if (pkg == packageName) return null
+        if (pkg == ScreenScanner.XTB_PACKAGE) return "XTB"
         return labelCache.getOrPut(pkg) {
             val label = runCatching {
                 packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
