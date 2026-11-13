@@ -74,6 +74,29 @@ object Indicators {
         return e
     }
 
+    /** Cała seria EMA (wartość dla każdej świecy od [period]-tej); pusta, gdy za mało danych. */
+    fun emaSeries(values: List<Double>, period: Int): List<Double> {
+        if (values.size < period) return emptyList()
+        val k = 2.0 / (period + 1)
+        var e = values.take(period).average()
+        val out = ArrayList<Double>(values.size - period + 1)
+        out += e
+        for (v in values.drop(period)) { e = v * k + e * (1 - k); out += e }
+        return out
+    }
+
+    /** Histogram MACD (12, 26, 9) – ostatnie [last] wartości (najnowsza na końcu); pusta lista = za mało danych. */
+    fun macdHistogram(closes: List<Double>, fast: Int = 12, slow: Int = 26, signal: Int = 9, last: Int = 3): List<Double> {
+        val f = emaSeries(closes, fast)
+        val s = emaSeries(closes, slow)
+        if (s.isEmpty()) return emptyList()
+        val macd = s.indices.map { i -> f[i + (slow - fast)] - s[i] }
+        val sig = emaSeries(macd, signal)
+        if (sig.isEmpty()) return emptyList()
+        val off = macd.size - sig.size
+        return sig.indices.map { i -> macd[i + off] - sig[i] }.takeLast(last)
+    }
+
     /** Average True Range (Wilder). */
     fun atr(bars: List<Bar>, period: Int = 14): Double? {
         if (bars.size < period + 1) return null

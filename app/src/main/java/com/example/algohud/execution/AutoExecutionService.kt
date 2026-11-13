@@ -412,12 +412,26 @@ class AutoExecutionService : AccessibilityService() {
         @Volatile private var lastTargetEventAt = 0L
         /** Samonaprawa ekranu i przywracanie XTB na wierzch – tylko w trybie AUTO (ustawia nakładka). */
         @Volatile var selfHealEnabled: Boolean = false
+        /** Ostatni alarm (czas, treść) – do uproszczonego HUD. */
+        @Volatile var lastAlert: Pair<Long, String>? = null
+        /** Instrument, którego bilet bot ma mieć otwarty w XTB (ustawia orkiestrator), i czy jest otwarta pozycja. */
+        @Volatile var wantedInstrument: String? = null
+        @Volatile var wantedUrgent: Boolean = false
 
         private val _gestureActive = MutableStateFlow(false)
         /** HUD obserwuje to i chowa się na czas gestu, żeby nie przechwycić dotyku. */
         val gestureActive: StateFlow<Boolean> = _gestureActive.asStateFlow()
 
         private const val TAG = "AutoExecutionService"
+        private const val ALERT_CHANNEL = "algo_hud_alert"
+        private const val ALERT_NOTIF_ID = 4242
+        private const val NAV_WAIT_URGENT_MS = 5_000L
+        private const val NAV_WAIT_MS = 20_000L
+        private const val NAV_RETRY_MS = 20_000L
+        private const val NAV_SCROLLS = 10
+        /** Podpis instrumentu w XTB (wiersz listy/wyniku i nagłówek biletu). */
+        private val SUBTITLES = mapOf("GOLD" to "Troy Ounce of Gold")
+        private val TICKET_MARKERS = listOf("Otwarte pozycje", "Stop Loss", "Take Profit", "Opis instrumentu")
 
         /** Diagnostyka: ostatnio widziane okno nagrywania (do skopiowania z aplikacji, gdy auto-akceptacja nie trafi). */
         @Volatile var lastCaptureDump: String? = null
@@ -447,6 +461,7 @@ class AutoExecutionService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        com.example.algohud.bot.Ntfy.init(this)
         startPolling()
         Log.i(TAG, "Połączono")
     }
@@ -690,6 +705,16 @@ class AutoExecutionService : AccessibilityService() {
                 ScreenScanner.scan(root, pkg, label, ts)
             }
         }.getOrNull()
+        // XTB odświeża Sell i Buy osobno: w szybkim ruchu przez ułamek sekundy widać nową cenę Sell i starą Buy
+        // (Buy < Sell). Taki odczyt pomijamy – zostaje poprzedni, a bramka danych nie blokuje wejść przez chwilowy artefakt.
+        val qb = quote?.bid
+        val qa = quote?.ask
+        val torn = qb != null && qa != null && qa < qb
+        if (torn) {
+            tornReads++
+            if (tornReads % 20 == 1L) Log.i(TAG, "Pominięty rozjechany odczyt Sell/Buy ($qb / $qa), łącznie $tornReads")
+            return true
+        }
         if (quote != null) {
             _screenQuote.value = quote
             quote.availableFunds?.let { lastAccountFunds = it; lastAccountCurrency = quote.accountCurrency }
@@ -712,6 +737,8 @@ class AutoExecutionService : AccessibilityService() {
             while (isActive) {
                 val ok = runCatching { scanNow() }.getOrDefault(false)
                 if (ok) { misses = 0; _peek.value = false } else if (++misses >= 3) { _peek.value = true; misses = 0 }
+                runCatching { recoverFromXtbError() }
+                runCatching { findWantedInstrument() }
                 runCatching { selfHeal() }
                 runCatching { maybeAcceptRemoteRequest() }
                 runCatching { keepXtbFront() }
@@ -1092,6 +1119,7 @@ class AutoExecutionService : AccessibilityService() {
 
     // ───────────── Samonaprawa i weryfikacja stanu w XTB ─────────────
 
+    private var tornReads = 0L
     private var staleSince = 0L
     private var notVisibleSince = 0L
     private var lastFrontAttempt = 0L
@@ -1175,6 +1203,367 @@ class AutoExecutionService : AccessibilityService() {
         } finally {
             uiMutex.unlock()
         }
+    }
+
+    // ───────────── Ekran błędu XTB („Coś poszło nie tak … Odśwież”) ─────────────
+
+    private val xtbError = XtbErrorRecovery()
+
+    /** true = XTB pokazuje teraz ekran błędu (bot nie może handlować ani zamykać pozycji). */
+    @Volatile var xtbErrorVisible: Boolean = false
+        private set
+
+    /**
+     * Co sekundę: gdy XTB pokazuje ekran błędu, bot sam naciska „Odśwież”, a gdy to nie pomaga –
+     * otwiera XTB od nowa (jak ręczne wyłącz/włącz). Przy restarcie i dalej co minutę – alarm z dźwiękiem.
+     */
+    private suspend fun recoverFromXtbError() {
+        val root = appRoot() ?: return
+        if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) return // nie widać XTB – nie oceniamy
+        val nodes = textNodes(root, 250)
+        val error = XtbErrorRecovery.isErrorText(nodes.map { it.second })
+        xtbErrorVisible = error
+        if (error) diag = "XTB pokazuje ekran błędu „Coś poszło nie tak” – naprawiam"
+        when (xtbError.onScan(error, SystemClock.uptimeMillis())) {
+            XtbErrorRecovery.Action.NONE -> Unit
+            XtbErrorRecovery.Action.TAP_REFRESH -> {
+                if (!selfHealEnabled) { remoteNote("⚠️ XTB: ekran błędu – naciśnij „Odśwież” (samonaprawa działa tylko w AUTO)"); return }
+                val btn = nodes.firstOrNull { (_, t) -> XtbErrorRecovery.REFRESH_TEXTS.any { t.equals(it, ignoreCase = true) } }?.first
+                if (btn == null) { remoteNote("⚠️ XTB: ekran błędu bez przycisku „Odśwież” – spróbuję restartu XTB"); return }
+                if (!uiMutex.tryLock()) return
+                val ok = try { click(btn) } finally { uiMutex.unlock() }
+                remoteNote(if (ok) "🔄 XTB: ekran błędu – naciskam „Odśwież”" else "⚠️ XTB: nie udało się nacisnąć „Odśwież”", force = true)
+            }
+            XtbErrorRecovery.Action.RESTART_APP -> {
+                if (!selfHealEnabled) { alert("XTB pokazuje błąd – uruchom XTB ponownie"); return }
+                restartXtb()
+                alert("XTB się zawiesiło („Coś poszło nie tak”) – otwieram XTB od nowa (${xtbError.restartCount}×). Sprawdź otwarte pozycje!")
+            }
+            XtbErrorRecovery.Action.ALERT -> alert("XTB nadal pokazuje błąd – sprawdź telefon i otwarte pozycje!")
+            XtbErrorRecovery.Action.RECOVERED -> remoteNote("✅ XTB wróciło po błędzie – bot znów widzi aplikację", force = true)
+        }
+    }
+
+    // ───────────── Szukanie instrumentu w XTB (bot sam wraca na bilet GOLD) ─────────────
+
+    private var offTargetSince = 0L
+    private var lastNavAttempt = 0L
+    private var navFails = 0
+    private var lastScrollUp = 0L
+
+    /** Przerwa przed kolejną próbą: 20 s przez pierwsze 3 próby, potem 2, 5 i 10 min (nie błądzimy po XTB godzinami). */
+    private fun navRetryMs(fails: Int): Long = when {
+        fails < 3 -> NAV_RETRY_MS
+        fails < 5 -> 2 * 60_000L
+        fails < 8 -> 5 * 60_000L
+        else -> 10 * 60_000L
+    }
+
+    /**
+     * Co sekundę: XTB jest na wierzchu, ale nie pokazuje biletu [wantedInstrument] (ekran główny po restarcie,
+     * Portfolio, Wiadomości…) → bot sam go otwiera: wyszukiwarka → wynik (dla GOLD po podpisie „Troy Ounce of Gold”),
+     * zapasowo Rynki → Surowce. Przy otwartej pozycji po 5 s, bez pozycji po 20 s.
+     * Gdy bilet właściwego instrumentu jest otwarty, ale przewinięty (nie widać cen) – tylko przewija go do góry.
+     */
+    private suspend fun findWantedInstrument() {
+        val target = wantedInstrument ?: return
+        if (!selfHealEnabled || _actionActive.value || xtbErrorVisible) { offTargetSince = 0L; return }
+        val root = appRoot() ?: return
+        if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) { offTargetSince = 0L; return }
+        val now = SystemClock.uptimeMillis()
+        val q = _screenQuote.value
+        val onTicket = q != null && q.isFresh() && q.instrument != null && q.bid != null && q.ask != null
+        if (onTicket && (!wantedUrgent || q?.instrument.equals(target, ignoreCase = true))) { offTargetSince = 0L; navFails = 0; return }
+        // Bilet tego instrumentu jest otwarty, tylko przewinięty w dół (np. do listy pozycji) – nie wychodzimy z niego.
+        if (xtbTitle(root).equals(target, ignoreCase = true) && hasTicketHeader(root, target)) {
+            offTargetSince = 0L
+            if (now - lastScrollUp > 10_000L && uiMutex.tryLock()) {
+                lastScrollUp = now
+                try { scrollTicketUp(root) } finally { uiMutex.unlock() }
+                remoteNote("🧭 XTB: bilet $target przewinięty – przewijam do góry, żeby widzieć ceny")
+            }
+            return
+        }
+        if (findOrderConfirm(root) != null) return // trwa składanie zlecenia
+        if (offTargetSince == 0L) { offTargetSince = now; return }
+        val wait = if (wantedUrgent) NAV_WAIT_URGENT_MS else NAV_WAIT_MS
+        if (now - offTargetSince < wait || now - lastNavAttempt < navRetryMs(navFails)) return
+        lastNavAttempt = now
+        if (!uiMutex.tryLock()) return
+        val ok = try { navigateTo(target) } finally { uiMutex.unlock() }
+        if (ok) {
+            navFails = 0; offTargetSince = 0L
+            remoteNote("🧭 XTB: sam otworzyłem bilet $target", force = true)
+            if (wantedUrgent) com.example.algohud.bot.Ntfy.send("🧭 XTB: wróciłem na bilet $target", "pozycja znów pod nadzorem bota",
+                com.example.algohud.bot.Ntfy.NORMAL, "compass")
+        } else {
+            navFails++
+            remoteNote("🧭 XTB: nie znalazłem $target (próba $navFails, następna za ${navRetryMs(navFails) / 60_000L} min) • ekran: ${lastNavDump.take(400)}", force = true)
+            if (navFails == 3 || navFails % 6 == 0) {
+                alert("Nie mogę sam otworzyć $target w XTB ($navFails prób). Otwórz bilet $target ręcznie" +
+                    if (wantedUrgent) " – bot ma otwartą pozycję!" else ".")
+                // Do diagnozy: co bot widział na ekranie (cicho, raz na próbę z alarmem).
+                com.example.algohud.bot.Ntfy.send("🔍 Diagnoza szukania $target", lastNavDump.take(900),
+                    com.example.algohud.bot.Ntfy.MIN, "mag")
+            }
+        }
+    }
+
+    /**
+     * Ekran biletu (także przewiniętego w dół): przyciski Sell/Buy albo elementy dolnej części biletu
+     * („Otwarte pozycje”, „Stop Loss”, „Opis instrumentu”). Lista wyników i lista Rynki ich nie mają.
+     */
+    private fun hasTicketHeader(root: AccessibilityNodeInfo, target: String): Boolean =
+        hasTradeButtons(root) || TICKET_MARKERS.any { m ->
+            root.findAccessibilityNodeInfosByText(m).any { it.isVisibleToUser && !it.isEditable }
+        }
+
+    private suspend fun scrollTicketUp(root: AccessibilityNodeInfo) {
+        val sc = findScrollable(root)
+        repeat(4) {
+            if (sc == null || !sc.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)) {
+                drag(screenW() / 2, screenH() * 0.35f, screenH() * 0.8f)
+            }
+            delay(350)
+        }
+    }
+
+    private fun screenH() = resources.displayMetrics.heightPixels.toFloat()
+    private fun screenW() = resources.displayMetrics.widthPixels.toFloat()
+
+    /** Tekst węzła to nazwa instrumentu: „GOLD”, „GOLD CFD”, „GOLD\nCFD” – ale nie „GOLD 24/7”, „Gold.com”. */
+    private fun isInstrumentLabel(t: String, target: String): Boolean {
+        val n = t.replace('\n', ' ').replace(Regex("\\s+"), " ").trim()
+        if (n.equals(target, ignoreCase = true)) return true
+        val first = n.substringBefore(' ')
+        return first.equals(target, ignoreCase = true) && !n.contains("24/7") &&
+            (n.length == first.length || n.substring(first.length).trim().startsWith("CFD", ignoreCase = true))
+    }
+
+    /** Pierwszy kafelek „Ostatnio wyszukiwane” z tym instrumentem (ekran po naciśnięciu lupy). */
+    private fun recentTile(root: AccessibilityNodeInfo, target: String): AccessibilityNodeInfo? {
+        val h = screenH()
+        val r = Rect()
+        return textNodes(root, 400).map { it.first to it.second }.firstOrNull { (n, t) ->
+            n.getBoundsInScreen(r)
+            !n.isEditable && r.centerY() > 0.1f * h && r.centerY() < 0.45f * h && isInstrumentLabel(t, target)
+        }?.first
+    }
+
+    /** Widoczny, NIEEDYTOWALNY węzeł z dokładnie tym tekstem, w pasie ekranu [minY]–[maxY] (ułamki wysokości). */
+    private fun nodeWithText(root: AccessibilityNodeInfo, text: String, minY: Float = 0f, maxY: Float = 1f): AccessibilityNodeInfo? {
+        val r = Rect()
+        val h = screenH()
+        return root.findAccessibilityNodeInfosByText(text).firstOrNull { n ->
+            val t = (n.text ?: n.contentDescription)?.toString()?.trim()
+            n.getBoundsInScreen(r)
+            n.isVisibleToUser && !n.isEditable && !n.isFocused && t.equals(text, ignoreCase = true) && !r.isEmpty &&
+                r.centerY() >= minY * h && r.centerY() <= maxY * h
+        }
+    }
+
+    /**
+     * Wiersz wyniku/listy z instrumentem: dla znanych instrumentów po podpisie (GOLD → „Troy Ounce of Gold”,
+     * żeby nie trafić w „GOLD 24/7” ani „Gold.com”), inaczej po tytule – nigdy pole wyszukiwania.
+     */
+    private fun instrumentRow(root: AccessibilityNodeInfo, target: String): AccessibilityNodeInfo? {
+        val h = screenH()
+        val r = Rect()
+        SUBTITLES[target.uppercase()]?.let { sub ->
+            root.findAccessibilityNodeInfosByText(sub).firstOrNull { n ->
+                n.getBoundsInScreen(r)
+                n.isVisibleToUser && !n.isEditable && r.centerY() > 0.15f * h && r.centerY() < 0.92f * h
+            }?.let { return it }
+        }
+        nodeWithText(root, target, minY = 0.15f, maxY = 0.92f)?.let { return it }
+        return textNodes(root, 400).firstOrNull { (n, t) ->
+            n.getBoundsInScreen(r)
+            n.isVisibleToUser && !n.isEditable && r.centerY() > 0.15f * h && r.centerY() < 0.92f * h && isInstrumentLabel(t, target)
+        }?.first
+    }
+
+    private suspend fun onTarget(target: String): Boolean {
+        repeat(6) {
+            delay(400)
+            val r = appRoot()
+            if (r != null && xtbTitle(r).equals(target, ignoreCase = true) && hasTradeButtons(r)) return true
+        }
+        return false
+    }
+
+    /** Przyciski „Sell …” / „Buy …” biletu (nie „Sellas Life Sciences” z listy – po słowie musi być koniec albo odstęp). */
+    private fun hasTradeButtons(root: AccessibilityNodeInfo): Boolean = listOf("Sell", "Buy").any { word ->
+        root.findAccessibilityNodeInfosByText(word).any { n ->
+            val t = (n.text ?: n.contentDescription)?.toString()?.trim().orEmpty()
+            n.isVisibleToUser && t.startsWith(word) && (t.length == word.length || t[word.length].isWhitespace())
+        }
+    }
+
+    /** Teksty widoczne na ekranie przy ostatniej nieudanej próbie – do diagnozy (HUD „Szczegóły” i alarm). */
+    @Volatile private var lastNavDump: String = ""
+
+    private fun screenDump(): String = appRoot()?.let { r ->
+        textNodes(r, 300).map { it.second.replace('\n', ' ').take(30) }.distinct().take(30).joinToString(" | ")
+    } ?: "brak okna"
+
+    private fun inXtb(): Boolean = appRoot()?.packageName?.toString() == ScreenScanner.XTB_PACKAGE
+
+    /** „Wstecz” tylko w obrębie XTB: jeśli po nim XTB zniknęło (pulpit), od razu otwieramy XTB z powrotem. */
+    private suspend fun backStayInXtb() {
+        performGlobalAction(GLOBAL_ACTION_BACK); delay(700)
+        if (!inXtb()) {
+            packageManager.getLaunchIntentForPackage(ScreenScanner.XTB_PACKAGE)?.let { i ->
+                i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                runCatching { startActivity(i) }
+            }
+            delay(2_000)
+        }
+    }
+
+    /** Dotknięcie środka węzła palcem (gest) – pewniejsze niż ACTION_CLICK dla ikon w nagłówku XTB. */
+    private suspend fun tapNode(n: AccessibilityNodeInfo): Boolean {
+        val r = Rect().also(n::getBoundsInScreen)
+        if (r.isEmpty) return false
+        return tap(r.exactCenterX(), r.exactCenterY())
+    }
+
+    /** Na bieżącej liście: wiersz instrumentu → klik → bilet; inaczej przewijanie (maks. [NAV_SCROLLS] razy). */
+    private suspend fun clickRowWithScroll(target: String): Boolean {
+        repeat(NAV_SCROLLS) {
+            if (!inXtb()) return false
+            val r = appRoot() ?: return false
+            val row = instrumentRow(r, target)
+            if (row != null) {
+                click(row)
+                if (onTarget(target)) return true
+                backStayInXtb()
+                return false
+            }
+            val scroller = findScrollable(r)
+            if (scroller == null || !scroller.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)) {
+                drag(screenW() / 2, screenH() * 0.72f, screenH() * 0.38f)
+            }
+            delay(600)
+        }
+        return false
+    }
+
+    private suspend fun navigateTo(target: String): Boolean {
+        Log.i(TAG, "Szukam $target w XTB")
+        if (!inXtb()) return false // nigdy nie klikamy po pulpicie ani innych aplikacjach
+        // 1) Rynki → CFD (lista obserwowanych) → przewijanie do wiersza instrumentu
+        appRoot()?.let { r -> nodeWithText(r, "Rynki", minY = 0.8f)?.let { click(it); delay(1_200) } }
+        appRoot()?.let { r -> nodeWithText(r, "CFD", maxY = 0.35f)?.let { click(it); delay(1_000) } }
+        // na początek listy, potem w dół
+        appRoot()?.let { r -> findScrollable(r)?.let { sc -> repeat(3) { sc.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) } } }
+        delay(500)
+        if (clickRowWithScroll(target)) return true
+        lastNavDump = screenDump()
+        if (!inXtb()) return false
+        // 2) Wyszukiwarka: lupa („Wyszukaj”) dotknięta palcem → pole → nazwa → wiersz wyniku (nie pole tekstowe!)
+        run {
+            val r0 = appRoot() ?: return false
+            val lupa = r0.findAccessibilityNodeInfosByText("Wyszukaj").firstOrNull { it.isVisibleToUser && !it.isEditable }
+                ?: r0.findAccessibilityNodeInfosByText("Szukaj").firstOrNull { it.isVisibleToUser && !it.isEditable }
+            if (lupa != null) tapNode(lupa) else tap(screenW() * 0.91f, screenH() * 0.085f)
+            delay(1_500)
+            // Ekran „Instrumenty”: w „Ostatnio wyszukiwane” instrument jest pierwszym kafelkiem u góry – wchodzimy w niego.
+            appRoot()?.let { r ->
+                recentTile(r, target)?.let { tile ->
+                    click(tile)
+                    if (onTarget(target)) return true
+                    tapNode(tile) // gdy ACTION_CLICK nie zadziałał – dotknięcie palcem
+                    if (onTarget(target)) return true
+                }
+                // bez rozpoznanego tekstu: pierwszy kafelek pod nagłówkiem „Ostatnio wyszukiwane”
+                r.findAccessibilityNodeInfosByText("Ostatnio wyszukiwane").firstOrNull { it.isVisibleToUser }?.let { head ->
+                    val hb = Rect().also(head::getBoundsInScreen)
+                    tap(screenW() * 0.21f, hb.bottom + screenH() * 0.055f)
+                    if (onTarget(target)) return true
+                    backStayInXtb()
+                    if (lupa != null) appRoot()?.findAccessibilityNodeInfosByText("Wyszukaj")?.firstOrNull { it.isVisibleToUser }?.let { tapNode(it); delay(1_500) }
+                }
+            }
+            var field = appRoot()?.let { findEditable(it) }
+            if (field == null && inXtb() && appRoot()?.findAccessibilityNodeInfosByText("Ostatnio wyszukiwane").isNullOrEmpty()) {
+                tap(screenW() / 2, screenH() * 0.19f); delay(900); field = appRoot()?.let { findEditable(it) }
+            }
+            if (field != null) {
+                val args = android.os.Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, target)
+                }
+                field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+                delay(1_500)
+                appRoot()?.let { r -> instrumentRow(r, target) }?.let { row ->
+                    click(row)
+                    if (onTarget(target)) return true
+                }
+            } else if (inXtb()) {
+                // ekran „Instrumenty”: kafelek z „Ostatnio wyszukiwanych” albo kategoria „Surowce”
+                appRoot()?.let { r -> instrumentRow(r, target) }?.let { tile -> click(tile); if (onTarget(target)) return true }
+                appRoot()?.let { r -> nodeWithText(r, "Surowce", minY = 0.15f) }?.let { cat ->
+                    click(cat); delay(1_500)
+                    if (clickRowWithScroll(target)) return true
+                }
+            }
+            lastNavDump = lastNavDump + " || " + screenDump()
+            backStayInXtb()
+        }
+        return false
+    }
+
+    /** Wiersze otwartych pozycji widoczne w drzewie bieżącego ekranu XTB (bez klikania) – do wykrycia pozycji spoza księgi. */
+    fun visiblePositionRows(): List<PositionRowInfo> =
+        appRoot()?.takeIf { it.packageName?.toString() == ScreenScanner.XTB_PACKAGE }?.let { runCatching { readPositionRows(it) }.getOrNull() }.orEmpty()
+
+    private fun findEditable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+        var visited = 0
+        while (queue.isNotEmpty() && visited < 1500) {
+            val n = queue.removeFirst(); visited++
+            if (n.isEditable && n.isVisibleToUser) return n
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+        return null
+    }
+
+    /** Otwiera XTB od nowa: zamyka bieżące ekrany aplikacji i startuje ją od ekranu startowego. */
+    private fun restartXtb() {
+        val intent = packageManager.getLaunchIntentForPackage(ScreenScanner.XTB_PACKAGE) ?: return
+        intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        runCatching { startActivity(intent) }
+            .onFailure { Log.w(TAG, "Restart XTB nieudany", it) }
+        Log.i(TAG, "Ekran błędu XTB – restart aplikacji")
+    }
+
+    /**
+     * Alarm dla użytkownika: wiadomość w HUD + powiadomienie z dźwiękiem i wibracją (osobny kanał o wysokim priorytecie).
+     * Używane, gdy bot nie może sam dokończyć sprawy (zawieszone XTB, pozycja bez nadzoru).
+     */
+    fun alert(text: String) {
+        _uiEvents.tryEmit("🚨 $text")
+        lastAlert = System.currentTimeMillis() to text
+        // Na główny telefon (ntfy) – pilne, z dźwiękiem; ten sam alarm najwyżej raz na minutę.
+        // Ten sam rodzaj alarmu (treść bez liczb – „324 prób”, „6827 s”) najwyżej raz na 10 min.
+        com.example.algohud.bot.Ntfy.send("🚨 Algo HUD – awaria", text, com.example.algohud.bot.Ntfy.URGENT, "rotating_light",
+            key = "alert:" + text.filterNot { it.isDigit() }.take(50), minGapMs = 600_000L)
+        runCatching {
+            val nm = getSystemService(android.app.NotificationManager::class.java)
+            nm.createNotificationChannel(
+                android.app.NotificationChannel(ALERT_CHANNEL, "Algo HUD – alarmy", android.app.NotificationManager.IMPORTANCE_HIGH)
+                    .apply { enableVibration(true) }
+            )
+            val n = androidx.core.app.NotificationCompat.Builder(this, ALERT_CHANNEL)
+                .setSmallIcon(android.R.drawable.stat_sys_warning)
+                .setContentTitle("Algo HUD – wymaga uwagi")
+                .setContentText(text)
+                .setStyle(androidx.core.app.NotificationCompat.BigTextStyle().bigText(text))
+                .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+                .setCategory(androidx.core.app.NotificationCompat.CATEGORY_ALARM)
+                .setAutoCancel(true)
+                .build()
+            nm.notify(ALERT_NOTIF_ID, n)
+        }.onFailure { Log.w(TAG, "Alarm nieudany", it) }
     }
 
     /** W trybie AUTO: jeśli XTB zniknęło z ekranu na ponad 20 s, przywraca je na pierwszy plan. */

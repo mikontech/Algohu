@@ -98,6 +98,10 @@ class OverlayService : LifecycleService() {
     private lateinit var bubble: TextView
     private lateinit var panel: LinearLayout
     private lateinit var tvStatus: TextView
+    private lateinit var tvCompact: TextView
+    private lateinit var btnDetails: Button
+    /** false = uproszczony HUD (pozycja, co dalej, ostatnie transakcje); true = wszystkie szczegóły. */
+    private var showDetails = false
     private lateinit var tvMessage: TextView
     private lateinit var tvScreen: TextView
     private lateinit var tvStats: TextView
@@ -160,6 +164,7 @@ class OverlayService : LifecycleService() {
 
     override fun onCreate() {
         super.onCreate()
+        com.example.algohud.bot.Ntfy.init(this)
         startAsForeground("Uruchamianie…")
         if (!Settings.canDrawOverlays(this)) {
             toast("Brak uprawnienia do wyświetlania nad innymi aplikacjami")
@@ -290,6 +295,8 @@ class OverlayService : LifecycleService() {
             background = roundedBg(0xE0202020.toInt(), 18)
         }
         tvStatus = TextView(this).apply { setTextColor(0xFFDDDDDD.toInt()); textSize = 11f }
+        tvCompact = TextView(this).apply { setTextColor(0xFFEEEEEE.toInt()); textSize = 12.5f; setLineSpacing(0f, 1.1f) }
+        showDetails = getSharedPreferences("ui", MODE_PRIVATE).getBoolean("hud_details", false)
         tvMessage = TextView(this).apply {
             setTextColor(0xFFAAAAAA.toInt()); textSize = 11f
             maxLines = 4; maxWidth = dp(280); ellipsize = TextUtils.TruncateAt.END
@@ -307,16 +314,25 @@ class OverlayService : LifecycleService() {
             addView(actionButton("⛔ KILL", 0xFF7F0000.toInt(), longPress = true) {
                 botScope.launch { engine.flattenAll("KILL ręczny z HUD") }
             })
+            btnDetails = actionButton(if (showDetails) "▴ Zwiń" else "ℹ️ Szczegóły", 0xFF37474F.toInt()) {
+                showDetails = !showDetails
+                getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("hud_details", showDetails).apply()
+                btnDetails.text = if (showDetails) "▴ Zwiń" else "ℹ️ Szczegóły"
+                applyDetailsVisibility()
+            }
+            addView(btnDetails)
             addView(btnConfirm)
         }
         fun full() = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         listOf(tvStatus, tvPlan, tvPredict, tvStats, tvMessage).forEach { it.maxWidth = Int.MAX_VALUE; it.maxLines = 12 }
+        tvCompact.maxWidth = Int.MAX_VALUE; tvCompact.maxLines = 14
         tvStatus.setTextColor(0xFFEEEEEE.toInt())
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = roundedBg(0xE8121212.toInt(), 14)
             setPadding(dp(10), dp(8), dp(10), dp(8))
             visibility = View.GONE
+            addView(tvCompact, full())
             addView(tvStatus, full())
             addView(tvPlan, full().apply { topMargin = dp(4) })
             addView(tvPredict, full().apply { topMargin = dp(4) })
@@ -462,6 +478,15 @@ class OverlayService : LifecycleService() {
         }
     }
 
+    /** Uproszczony HUD: widać tylko [tvCompact] + przyciski; szczegóły po „ℹ️ Szczegóły”. */
+    private fun applyDetailsVisibility() {
+        val d = if (showDetails) View.VISIBLE else View.GONE
+        tvCompact.visibility = if (showDetails) View.GONE else View.VISIBLE
+        tvStatus.visibility = d; tvStats.visibility = d; tvMessage.visibility = d
+        tvPlan.visibility = if (showDetails && tvPlan.text.isNotBlank()) View.VISIBLE else View.GONE
+        tvPredict.visibility = if (showDetails && tvPredict.text.isNotBlank()) View.VISIBLE else View.GONE
+    }
+
     private fun render(s: HudState) {
         val arrow = when {
             s.sentiment > 0.15 -> "▲"
@@ -507,6 +532,8 @@ class OverlayService : LifecycleService() {
         tvStats.text = listOf(s.learning, s.paperStats).filter { it.isNotBlank() }.joinToString("\n")
         if (s.status.isNotEmpty()) tvStatus.text = s.status
         tvScreen.visibility = View.GONE
+        tvCompact.text = s.compact.ifBlank { s.lastMessage }
+        applyDetailsVisibility()
 
         val key = "${s.mode}|${s.killSwitch}|${s.feedConnected}"
         if (key != lastNotifKey) { // nie aktualizuj powiadomienia przy każdym ticku
