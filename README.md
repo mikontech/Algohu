@@ -109,9 +109,11 @@ przyciskiem „Skopiuj raport danych”.
 - **KILL:** przytrzymanie przycisku w HUD albo akcja w powiadomieniu blokuje nowe wejścia
   i próbuje zamknąć otwartą pozycję przez ekran pozycji w XTB. Kill-switch włącza się też sam,
   gdy po kliknięciu nie da się zweryfikować stanu zlecenia w XTB.
-- **Szukanie instrumentu:** gdy XTB jest na wierzchu, ale nie pokazuje żadnego biletu (np. Portfolio po restarcie),
-  bot sam otwiera ostatni instrument: Rynki → CFD → wiersz (z przewijaniem), potem Odkryj → Popularne, na końcu
-  wyszukiwarka. Przy otwartej pozycji po 5 s, bez pozycji po 20 s; po 3 nieudanych próbach – alarm.
+- **Szukanie instrumentu:** gdy XTB jest na wierzchu, ale nie pokazuje biletu, bot sam go otwiera: wyszukiwarka
+  → wiersz wyniku (dla GOLD po podpisie „Troy Ounce of Gold”, nigdy pole tekstowe), zapasowo Rynki → Surowce.
+  Bilet właściwego instrumentu przewinięty w dół (nie widać cen) bot tylko przewija do góry – nie wychodzi z niego.
+  Przy otwartej pozycji po 5 s, bez pozycji po 20 s; kolejne próby co 20 s, potem 2, 5 i 10 min; alarm po 3 próbach.
+- **Alarmy bez zalewu:** ten sam rodzaj alarmu (bez względu na liczby w treści) najwyżej raz na 10 min.
 - **Zawieszone XTB:** gdy XTB pokaże ekran „Coś poszło nie tak … Odśwież”, bot sam naciska „Odśwież”
   (2 próby), a gdy to nie pomaga – otwiera XTB od nowa (maks. raz na minutę) i wysyła alarm z dźwiękiem
   (`execution/XtbErrorRecovery.kt`). Działa w trybie AUTO.
@@ -230,7 +232,8 @@ formularz SL/TP i parser wierszy pozycji. `BotOrchestrator` i obsługa ekranu XT
   włączyć bez dodatniego wyniku na papierze.
 - **Automatyzacja zależy od wyglądu XTB.** Identyfikatory widoków pochodzą ze zrzutów ekranu;
   aktualizacja aplikacji brokera może zepsuć odczyt lub klikanie.
-- **Godziny sesji** w `bot/MarketHours.kt` są wpisane ręcznie i wymagają weryfikacji w XTB.
+- **Godziny sesji** w `bot/MarketHours.kt` są wpisane ręcznie i wymagają weryfikacji w XTB. Złoto, srebro, ropa
+  i indeksy USA liczą się według czasu Nowego Jorku (przerwa 17:00–18:05 ET, weekend od piątku 17:00 do niedzieli 18:05 ET).
 - **Święta NYSE** w `bot/UsSession.kt` są wpisane na 2026–2027 – uzupełniaj co rok.
 - **Przesunięcie SL/TP w XTB** nie jest weryfikowane odczytem pozycji po zapisie – bot zakłada sukces,
   gdy dotknął „Modyfikuj pozycję”.
