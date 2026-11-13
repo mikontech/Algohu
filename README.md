@@ -174,6 +174,13 @@ Wymagania: JDK 17, Android SDK 35.
   i buduje APK przy każdym pushu do `main`, w każdym pull requeście i ręcznie. Wyniki są
   w zakładce *Actions → ostatni build → Artifacts*: `algohud-debug-apk` oraz `unit-test-report`.
 
+## Aktualizacja aplikacji
+
+APK z GitHub Actions jest podpisany stałym kluczem (`app/debug.keystore`), a `versionCode` rośnie z każdym
+buildem – nowy APK instaluje się jako **aktualizacja** (bez odinstalowania), więc zostają dziennik transakcji,
+zgoda na ułatwienia dostępu i kanał ntfy. Kanał ntfy jest dodatkowo wyliczany z identyfikatora urządzenia,
+więc nie zmienia się nawet po ponownej instalacji.
+
 ## Pierwsze uruchomienie
 
 1. Zezwól na wyświetlanie nad innymi aplikacjami.

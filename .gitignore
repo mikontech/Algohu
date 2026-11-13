@@ -11,3 +11,6 @@
 *.keystore
 *.jks
 secrets.properties
+
+# Stały klucz podpisu wersji debug (aktualizacje bez odinstalowania) – celowo w repo
+!app/debug.keystore
