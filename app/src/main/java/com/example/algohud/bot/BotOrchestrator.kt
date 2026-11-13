@@ -437,7 +437,7 @@ class BotOrchestrator(
             val sl = "SL ${f(pos.stopPrice)}" + if (pos.stopPrice != pos.initialStop) " (przesunięty)" else ""
             val exit = if (BROKER_EXITS_ONLY) {
                 "Wyjście: TP ${pos.takeProfit?.let { f(it) } ?: "—"} albo $sl w XTB" +
-                    (if (TREND_EXIT) " albo potwierdzone odwrócenie trendu (zamykam sam)" else "") +
+                    (if (TREND_EXIT && !pos.entryReason.startsWith("ZAKRES") && !EntryFilters.isConsolidation(aggregators["$inst@${Learner.M5}"]?.closed().orEmpty())) " albo potwierdzone odwrócenie trendu (zamykam sam)" else "") +
                     ". +1R → SL na BE, od +1,5R SL 1R za ceną; duży wzrost od +%.0fR → TP dalej i SL ciasno za ceną (w otwartej pozycji XTB).".format(BIG_MOVE_MIN_R) +
                     (if (TREND_EXIT) "\n• 🔄 Odwrócenie: " + (reversalNote[inst] ?: "czekam na zamknięte świece 1m") else "") +
                     "\n" + compassLine(inst)
@@ -669,11 +669,14 @@ class BotOrchestrator(
             // 1) Odwrócenie trendu: potwierdzona tendencja przeciwna (≥ 2 z 3 sygnałów na 2 świecach) → bot zamyka sam.
             val m5c = aggregators["$inst@${Learner.M5}"]?.closed().orEmpty()
             val guardOff = when {
-                pos.entryReason.startsWith("ZAKRES") -> "wyłączone dla pozycji z ZAKRESU – chroni SL nad/pod zakresem"
-                EntryFilters.isConsolidation(m5c) -> "wyłączone w konsolidacji – chroni SL"
+                pos.entryReason.startsWith("ZAKRES") -> "automatyczne wyjście przy zwrocie wyłączone dla ZAKRESU"
+                EntryFilters.isConsolidation(m5c) -> "automatyczne wyjście przy zwrocie wyłączone w konsolidacji"
                 else -> null
             }
-            if (guardOff != null) reversalNote[inst] = guardOff
+            if (guardOff != null || !TREND_EXIT) {
+                reversalGuards.remove(inst)
+                reversalNote[inst] = guardOff ?: "automatyczne wyjście przy zwrocie wyłączone"
+            }
             if (TREND_EXIT && guardOff == null) {
                 val v = reversalGuards.getOrPut(inst) { ReversalGuard() }
                     .evaluate("${pos.openedAt}:${pos.entryPrice}", pos.side, pos.openedAt, best, closed, compass(inst))
@@ -1675,15 +1678,16 @@ class BotOrchestrator(
         val px = lastPx[inst]?.first
         val lines = ArrayList<String>()
         val day = journal.all().filter { !it.paper && now - it.closedAt < 24 * 3_600_000 && java.time.Instant.ofEpochMilli(it.closedAt).atZone(UsSession.PL).toLocalDate() == java.time.Instant.ofEpochMilli(now).atZone(UsSession.PL).toLocalDate() }
-        lines += "$inst ${px?.let { "%.2f".format(it + sh) } ?: "—"} • ${engine.mode.value.name} • dziś %+.2f zł (%d tr.)".format(day.sumOf { it.pnl }, day.size)
+        lines += "$inst ${px?.let { "%.2f".format(it + sh) } ?: "—"} • ${engine.mode.value.name} • dziennik bota: %+.2f zł (%d tr.)".format(day.sumOf { it.pnl }, day.size)
         val pos = risk.position(inst)
         if (pos != null) {
             val dir = pos.side.sign
             val pnl = px?.let { (it - pos.entryPrice) * dir * pos.quantity * pos.pointValue }
-            lines += "${if (pos.side == Side.BUY) "🟢" else "🔴"} W POZYCJI ${sideName(pos.side)} %s • świeca %s @ %.2f".format(
-                BigDecimal.valueOf(pos.quantity).toPlainString(), hhmm(pos.openedAt), pos.entryPrice + sh)
-            lines += "   SL %.2f • TP %s • teraz %s • %s".format(pos.stopPrice + sh, pos.takeProfit?.let { "%.2f".format(it + sh) } ?: "—",
+            lines += "${if (pos.side == Side.BUY) "🟢" else "🔴"} W POZYCJI ${sideName(pos.side)} %s • wejście %s • cena referencyjna feedu %.2f".format(
+                BigDecimal.valueOf(pos.quantity).toPlainString(), hhmm(pos.openedAt), pos.entryPrice)
+            lines += "   plan SL %.2f • TP %s • szacunek feedu %s • %s".format(pos.stopPrice + sh, pos.takeProfit?.let { "%.2f".format(it + sh) } ?: "—",
                 pnl?.let { "%+.2f zł".format(it) } ?: "—", stratName(pos.entryReason))
+            if (!pos.paper) lines += "   Wynik netto i cena wykonania: sprawdź w XTB"
             reversalNote[inst]?.let { lines += "   🔄 $it" }
         } else {
             val armed = armedNote[inst]?.takeIf { now - it.first < 30_000 }?.second

@@ -53,10 +53,26 @@ class ReversalGuard {
         score: TrendScore.Score?
     ): Verdict? {
         if (key != positionKey) { key = positionKey; lastBar = 0L; streak = 0; last = null; deferredBar = -1L }
-        val bar = m1.lastOrNull() ?: return last
+        val bar = m1.lastOrNull() ?: return null
         if (bar.start == lastBar) return last
+        if (bar.start < lastBar) {
+            streak = 0; deferredBar = -1L
+            last = Verdict(false, 0, 0, "nieaktualna świeca – brak potwierdzenia zwrotu")
+            return last
+        }
+        // Potwierdzenia muszą pochodzić z kolejnych minut, także po przerwie w odczycie.
+        if (lastBar != 0L && bar.start - lastBar != M1) {
+            streak = 0; deferredBar = -1L
+        }
         lastBar = bar.start
-        val v = judge(side, openedAt, best, m1, score)
+        val invalid = m1.takeLast(60).any {
+            !it.open.isFinite() || !it.high.isFinite() || !it.low.isFinite() || !it.close.isFinite() ||
+                it.low > minOf(it.open, it.close) || it.high < maxOf(it.open, it.close)
+        } || m1.takeLast(60).zipWithNext().any { (a, b) -> b.start - a.start != M1 }
+        val v = if (invalid || !best.isFinite()) {
+            streak = 0; deferredBar = -1L
+            Verdict(false, 0, 0, "niepełne lub błędne świece M1 – brak potwierdzenia zwrotu")
+        } else judge(side, openedAt, best, m1, score)
         last = v
         return v
     }
@@ -92,7 +108,7 @@ class ReversalGuard {
         if (met < 2 || retrace < MIN_RETRACE_ATR) {
             streak = 0
             val why = when {
-                met < 2 -> "trend pozycji trzyma ($met/3 sygnałów odwrócenia${if (names.isNotEmpty()) ": ${names.joinToString()}" else ""})"
+                met < 2 -> "brak potwierdzonego zwrotu ($met/3 sygnałów odwrócenia${if (names.isNotEmpty()) ": ${names.joinToString()}" else ""})"
                 else -> "sygnały przeciw, ale cofnięcie tylko %.1f×ATR < %.1f×ATR – szum".format(retrace, MIN_RETRACE_ATR)
             }
             return Verdict(false, met, 0, why)
