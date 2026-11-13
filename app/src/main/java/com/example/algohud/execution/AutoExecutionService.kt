@@ -947,7 +947,7 @@ class AutoExecutionService : AccessibilityService() {
         if (root == null) return "brak dostępu do okna"
         if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) return "XTB nie jest na ekranie"
         val title = ScreenScanner.findById(root, "ElementTitleHorizontalText").firstOrNull()
-            ?.text?.toString()?.trim()?.substringBefore(' ')
+            ?.text?.toString()?.trim()?.split(Regex("\\s+"))?.firstOrNull()
         if (title != instrument) return "na ekranie jest ${title ?: "?"}, a pozycja dotyczy $instrument"
         if (ScreenScanner.findById(root, "ModifyPositionButton").isEmpty()) {
             return "otwórz w XTB ekran pozycji $instrument (Take Profit / Stop Loss / Zamknij pozycję)"
@@ -1330,7 +1330,7 @@ class AutoExecutionService : AccessibilityService() {
         val onTicket = q != null && q.isFresh() && q.instrument != null && q.bid != null && q.ask != null
         if (onTicket && (!wantedUrgent || q?.instrument.equals(target, ignoreCase = true))) { offTargetSince = 0L; navFails = 0; return }
         // Bilet tego instrumentu jest otwarty, tylko przewinięty w dół (np. do listy pozycji) – nie wychodzimy z niego.
-        if (xtbTitle(root).equals(target, ignoreCase = true) && hasTicketHeader(root, target)) {
+        if (isTargetTicket(root, target)) {
             offTargetSince = 0L
             if (now - lastScrollUp > 10_000L && uiMutex.tryLock()) {
                 lastScrollUp = now
@@ -1450,13 +1450,20 @@ class AutoExecutionService : AccessibilityService() {
         }?.first
     }
 
+    private fun isTargetTicket(root: AccessibilityNodeInfo, target: String): Boolean {
+        val title = ScreenScanner.findById(root, "ElementTitleHorizontalText").firstOrNull()?.text?.toString()
+        return XtbTargetRecognition.matches(root.packageName?.toString(), title, target, hasTicketHeader(root, target))
+    }
+
+    private fun targetOpen(target: String): Boolean = appRoot()?.let { isTargetTicket(it, target) } == true
+
     private suspend fun onTarget(target: String): Boolean {
-        repeat(6) {
+        // Najpierw sprawdzenie, potem czekanie. Ceny/przyciski mogą doładować się później niż nagłówek.
+        repeat(20) {
+            if (targetOpen(target)) return true
             delay(400)
-            val r = appRoot()
-            if (r != null && xtbTitle(r).equals(target, ignoreCase = true) && hasTradeButtons(r)) return true
         }
-        return false
+        return targetOpen(target)
     }
 
     /** Przyciski „Sell …” / „Buy …” biletu (nie „Sellas Life Sciences” z listy – po słowie musi być koniec albo odstęp). */
@@ -1500,10 +1507,12 @@ class AutoExecutionService : AccessibilityService() {
         repeat(NAV_SCROLLS) {
             if (!inXtb()) return false
             val r = appRoot() ?: return false
+            if (isTargetTicket(r, target)) return true
             val row = instrumentRow(r, target)
             if (row != null) {
                 click(row)
                 if (onTarget(target)) return true
+                if (targetOpen(target)) return true
                 backStayInXtb()
                 return false
             }
@@ -1519,6 +1528,7 @@ class AutoExecutionService : AccessibilityService() {
     private suspend fun navigateTo(target: String): Boolean {
         Log.i(TAG, "Szukam $target w XTB")
         if (!inXtb()) return false // nigdy nie klikamy po pulpicie ani innych aplikacjach
+        if (targetOpen(target)) return true
         // 1) Rynki → CFD (lista obserwowanych) → przewijanie do wiersza instrumentu
         appRoot()?.let { r -> nodeWithText(r, "Rynki", minY = 0.8f)?.let { click(it); delay(1_200) } }
         appRoot()?.let { r -> nodeWithText(r, "CFD", maxY = 0.35f)?.let { click(it); delay(1_000) } }
@@ -1528,6 +1538,7 @@ class AutoExecutionService : AccessibilityService() {
         if (clickRowWithScroll(target)) return true
         lastNavDump = screenDump()
         if (!inXtb()) return false
+        if (targetOpen(target)) return true
         // 2) Wyszukiwarka: lupa („Wyszukaj”) dotknięta palcem → pole → nazwa → wiersz wyniku (nie pole tekstowe!)
         run {
             val r0 = appRoot() ?: return false
@@ -1540,7 +1551,9 @@ class AutoExecutionService : AccessibilityService() {
                 recentTile(r, target)?.let { tile ->
                     click(tile)
                     if (onTarget(target)) return true
-                    tapNode(tile) // gdy ACTION_CLICK nie zadziałał – dotknięcie palcem
+                    // Nie używamy węzła z poprzedniego ekranu po przejściu na instrument.
+                    if (targetOpen(target)) return true
+                    appRoot()?.let { recentTile(it, target) }?.let { fresh -> tapNode(fresh) }
                     if (onTarget(target)) return true
                 }
                 // bez rozpoznanego tekstu: pierwszy kafelek pod nagłówkiem „Ostatnio wyszukiwane”
@@ -1548,10 +1561,12 @@ class AutoExecutionService : AccessibilityService() {
                     val hb = Rect().also(head::getBoundsInScreen)
                     tap(screenW() * 0.21f, hb.bottom + screenH() * 0.055f)
                     if (onTarget(target)) return true
+                    if (targetOpen(target)) return true
                     backStayInXtb()
                     if (lupa != null) appRoot()?.findAccessibilityNodeInfosByText("Wyszukaj")?.firstOrNull { it.isVisibleToUser }?.let { tapNode(it); delay(1_500) }
                 }
             }
+            if (targetOpen(target)) return true
             var field = appRoot()?.let { findEditable(it) }
             if (field == null && inXtb() && appRoot()?.findAccessibilityNodeInfosByText("Ostatnio wyszukiwane").isNullOrEmpty()) {
                 tap(screenW() / 2, screenH() * 0.19f); delay(900); field = appRoot()?.let { findEditable(it) }
@@ -1574,6 +1589,7 @@ class AutoExecutionService : AccessibilityService() {
                     if (clickRowWithScroll(target)) return true
                 }
             }
+            if (targetOpen(target)) return true
             lastNavDump = lastNavDump + " || " + screenDump()
             backStayInXtb()
         }
@@ -1767,7 +1783,7 @@ class AutoExecutionService : AccessibilityService() {
 
     private fun xtbTitle(root: AccessibilityNodeInfo?): String? =
         root?.let { ScreenScanner.findById(it, "ElementTitleHorizontalText").firstOrNull() }
-            ?.text?.toString()?.trim()?.substringBefore(' ')
+            ?.text?.toString()?.trim()?.split(Regex("\\s+"))?.firstOrNull()
 
     /** Z ekranu instrumentu wchodzi w (jedyną) otwartą pozycję. null = jesteśmy na ekranie pozycji. */
     private suspend fun openPositionScreen(instrument: String): String? {
