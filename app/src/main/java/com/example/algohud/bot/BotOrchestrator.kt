@@ -1009,6 +1009,9 @@ class BotOrchestrator(
     fun start() {
         if (started) return
         started = true
+        // Powiadomienie testowe przy starcie – od razu widać na głównym telefonie, czy kanał ntfy działa.
+        Ntfy.send("✅ Algo HUD uruchomiony", "kanał ${Ntfy.topic ?: "?"} działa – tu będą wejścia, wyjścia, raporty i alarmy",
+            Ntfy.NORMAL, "white_check_mark")
         news.start()
         scope.launch { reconcileLoop() }
 
@@ -1648,7 +1651,11 @@ class BotOrchestrator(
             lines += "• %s %s %.2f→%.2f %+.2f zł%s".format(hhmm(t.closedAt), sideName(t.side), t.entry + sh, t.exit + sh, t.pnl, if (t.paper) " (papier)" else "")
         }
         AutoExecutionService.lastAlert?.takeIf { now - it.first < 15 * 60_000 }?.let { lines += "🚨 ${hhmm(it.first)} ${it.second}" }
-        Ntfy.topic?.let { lines += "🔔 ntfy: $it" }
+        Ntfy.topic?.let { t ->
+            val st = Ntfy.lastError?.let { " • ⚠️ wysyłka nieudana: ${it.take(60)}" }
+                ?: if (Ntfy.lastOkAt > 0) " • ostatnio wysłano ${hhmm(Ntfy.lastOkAt)} ✓" else " • jeszcze nic nie wysłano"
+            lines += "🔔 ntfy: $t$st"
+        }
         return lines.joinToString("\n")
     }
 

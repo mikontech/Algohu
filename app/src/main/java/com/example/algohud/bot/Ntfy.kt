@@ -33,12 +33,32 @@ object Ntfy {
         private set
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Stan ostatniej wysyłki – do HUD (żeby było widać, czy powiadomienia wychodzą). */
+    @Volatile var lastOkAt: Long = 0L
+        private set
+    @Volatile var lastError: String? = null
+        private set
     private val lastSent = ConcurrentHashMap<String, Long>()
 
     fun init(ctx: Context) {
         if (topic != null) return
         val p = ctx.applicationContext.getSharedPreferences("ntfy", Context.MODE_PRIVATE)
-        topic = p.getString("topic", null) ?: newTopic().also { p.edit().putString("topic", it).apply() }
+        // Kanał wyliczany z identyfikatora urządzenia – ten sam także po odinstalowaniu i ponownej instalacji
+        // (przy stałym kluczu podpisu), więc nie trzeba co chwilę subskrybować nowego kanału w ntfy.
+        val androidId = runCatching {
+            android.provider.Settings.Secure.getString(ctx.contentResolver, android.provider.Settings.Secure.ANDROID_ID)
+        }.getOrNull()
+        topic = p.getString("topic", null)
+            ?: (androidId?.takeIf { it.isNotBlank() }?.let { topicFor(it) } ?: newTopic())
+                .also { p.edit().putString("topic", it).apply() }
+    }
+
+    /** Stała, trudna do zgadnięcia nazwa kanału dla danego urządzenia. */
+    fun topicFor(deviceId: String): String {
+        val abc = "abcdefghijkmnpqrstuvwxyz23456789"
+        val h = java.security.MessageDigest.getInstance("SHA-256").digest("algohud:$deviceId".toByteArray())
+        return "algohud-" + (0 until 10).map { abc[(h[it].toInt() and 0xFF) % abc.length] }.joinToString("")
     }
 
     /** Losowa, trudna do zgadnięcia nazwa kanału, np. "algohud-k3x9q2m7ta". */
@@ -81,9 +101,10 @@ object Ntfy {
                     c.setRequestProperty("Content-Type", "text/plain; charset=utf-8")
                     c.outputStream.use { it.write(text.toByteArray(Charsets.UTF_8)) }
                     val code = c.responseCode
-                    if (code !in 200..299) Log.w(TAG, "ntfy HTTP $code")
+                    if (code in 200..299) { lastOkAt = System.currentTimeMillis(); lastError = null }
+                    else { lastError = "HTTP $code"; Log.w(TAG, "ntfy HTTP $code") }
                 } finally { c.disconnect() }
-            }.onFailure { Log.w(TAG, "ntfy: wysyłka nieudana", it) }
+            }.onFailure { lastError = it.javaClass.simpleName + ": " + (it.message ?: ""); Log.w(TAG, "ntfy: wysyłka nieudana", it) }
         }
     }
 }
