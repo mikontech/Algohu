@@ -428,7 +428,7 @@ class AutoExecutionService : AccessibilityService() {
         private const val NAV_WAIT_URGENT_MS = 5_000L
         private const val NAV_WAIT_MS = 20_000L
         private const val NAV_RETRY_MS = 20_000L
-        private const val NAV_SCROLLS = 6
+        private const val NAV_SCROLLS = 10
         /** Podpis instrumentu w XTB (wiersz listy/wyniku i nagłówek biletu). */
         private val SUBTITLES = mapOf("GOLD" to "Troy Ounce of Gold")
         private val TICKET_MARKERS = listOf("Otwarte pozycje", "Stop Loss", "Take Profit", "Opis instrumentu")
@@ -1383,15 +1383,37 @@ class AutoExecutionService : AccessibilityService() {
         textNodes(r, 300).map { it.second.replace('\n', ' ').take(30) }.distinct().take(30).joinToString(" | ")
     } ?: "brak okna"
 
+    private fun inXtb(): Boolean = appRoot()?.packageName?.toString() == ScreenScanner.XTB_PACKAGE
+
+    /** „Wstecz” tylko w obrębie XTB: jeśli po nim XTB zniknęło (pulpit), od razu otwieramy XTB z powrotem. */
+    private suspend fun backStayInXtb() {
+        performGlobalAction(GLOBAL_ACTION_BACK); delay(700)
+        if (!inXtb()) {
+            packageManager.getLaunchIntentForPackage(ScreenScanner.XTB_PACKAGE)?.let { i ->
+                i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                runCatching { startActivity(i) }
+            }
+            delay(2_000)
+        }
+    }
+
+    /** Dotknięcie środka węzła palcem (gest) – pewniejsze niż ACTION_CLICK dla ikon w nagłówku XTB. */
+    private suspend fun tapNode(n: AccessibilityNodeInfo): Boolean {
+        val r = Rect().also(n::getBoundsInScreen)
+        if (r.isEmpty) return false
+        return tap(r.exactCenterX(), r.exactCenterY())
+    }
+
     /** Na bieżącej liście: wiersz instrumentu → klik → bilet; inaczej przewijanie (maks. [NAV_SCROLLS] razy). */
     private suspend fun clickRowWithScroll(target: String): Boolean {
         repeat(NAV_SCROLLS) {
+            if (!inXtb()) return false
             val r = appRoot() ?: return false
             val row = instrumentRow(r, target)
             if (row != null) {
                 click(row)
                 if (onTarget(target)) return true
-                performGlobalAction(GLOBAL_ACTION_BACK); delay(700)
+                backStayInXtb()
                 return false
             }
             val scroller = findScrollable(r)
@@ -1405,18 +1427,25 @@ class AutoExecutionService : AccessibilityService() {
 
     private suspend fun navigateTo(target: String): Boolean {
         Log.i(TAG, "Szukam $target w XTB")
-        // 1) Wyszukiwarka: lupa → pole → wpisz nazwę → wiersz wyniku (nie pole tekstowe!)
+        if (!inXtb()) return false // nigdy nie klikamy po pulpicie ani innych aplikacjach
+        // 1) Rynki → CFD (lista obserwowanych) → przewijanie do wiersza instrumentu
+        appRoot()?.let { r -> nodeWithText(r, "Rynki", minY = 0.8f)?.let { click(it); delay(1_200) } }
+        appRoot()?.let { r -> nodeWithText(r, "CFD", maxY = 0.35f)?.let { click(it); delay(1_000) } }
+        // na początek listy, potem w dół
+        appRoot()?.let { r -> findScrollable(r)?.let { sc -> repeat(3) { sc.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) } } }
+        delay(500)
+        if (clickRowWithScroll(target)) return true
+        lastNavDump = screenDump()
+        if (!inXtb()) return false
+        // 2) Wyszukiwarka: lupa („Wyszukaj”) dotknięta palcem → pole → nazwa → wiersz wyniku (nie pole tekstowe!)
         run {
-            appRoot()?.let { r -> nodeWithText(r, "Rynki", minY = 0.8f)?.let { click(it); delay(1_000) } }
             val r0 = appRoot() ?: return false
-            val lupa = r0.findAccessibilityNodeInfosByText("Szukaj").firstOrNull { it.isVisibleToUser && !it.isEditable }
-            if (lupa != null) click(lupa) else tap(screenW() * 0.91f, screenH() * 0.085f)
+            val lupa = r0.findAccessibilityNodeInfosByText("Wyszukaj").firstOrNull { it.isVisibleToUser && !it.isEditable }
+                ?: r0.findAccessibilityNodeInfosByText("Szukaj").firstOrNull { it.isVisibleToUser && !it.isEditable }
+            if (lupa != null) tapNode(lupa) else tap(screenW() * 0.91f, screenH() * 0.085f)
             delay(1_200)
             var field = appRoot()?.let { findEditable(it) }
-            if (field == null) { // ekran „Instrumenty” bez aktywnego pola – dotknij miejsca pola u góry
-                tap(screenW() / 2, screenH() * 0.19f); delay(900)
-                field = appRoot()?.let { findEditable(it) }
-            }
+            if (field == null && inXtb()) { tap(screenW() / 2, screenH() * 0.19f); delay(900); field = appRoot()?.let { findEditable(it) } }
             if (field != null) {
                 val args = android.os.Bundle().apply {
                     putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, target)
@@ -1427,28 +1456,23 @@ class AutoExecutionService : AccessibilityService() {
                     click(row)
                     if (onTarget(target)) return true
                 }
-            } else {
-                // „Ostatnio wyszukiwane” (kafelek GOLD) albo kategoria „Surowce” na ekranie Instrumenty
-                appRoot()?.let { r -> instrumentRow(r, target) }?.let { tile ->
-                    click(tile)
-                    if (onTarget(target)) return true
-                }
+            } else if (inXtb()) {
+                // ekran „Instrumenty”: kafelek z „Ostatnio wyszukiwanych” albo kategoria „Surowce”
+                appRoot()?.let { r -> instrumentRow(r, target) }?.let { tile -> click(tile); if (onTarget(target)) return true }
                 appRoot()?.let { r -> nodeWithText(r, "Surowce", minY = 0.15f) }?.let { cat ->
                     click(cat); delay(1_500)
                     if (clickRowWithScroll(target)) return true
                 }
             }
-            lastNavDump = screenDump()
-            performGlobalAction(GLOBAL_ACTION_BACK); delay(600) // zamknij klawiaturę / wyszukiwarkę
-            performGlobalAction(GLOBAL_ACTION_BACK); delay(800)
+            lastNavDump = lastNavDump + " || " + screenDump()
+            backStayInXtb()
         }
-        // 2) Rynki → Surowce (albo CFD) → wiersz instrumentu (z przewijaniem)
-        appRoot()?.let { r -> nodeWithText(r, "Rynki", minY = 0.8f)?.let { click(it); delay(1_200) } }
-        appRoot()?.let { r -> (nodeWithText(r, "Surowce") ?: nodeWithText(r, "CFD", maxY = 0.3f))?.let { click(it); delay(1_200) } }
-        if (clickRowWithScroll(target)) return true
-        lastNavDump = lastNavDump + " || " + screenDump()
         return false
     }
+
+    /** Wiersze otwartych pozycji widoczne w drzewie bieżącego ekranu XTB (bez klikania) – do wykrycia pozycji spoza księgi. */
+    fun visiblePositionRows(): List<PositionRowInfo> =
+        appRoot()?.takeIf { it.packageName?.toString() == ScreenScanner.XTB_PACKAGE }?.let { runCatching { readPositionRows(it) }.getOrNull() }.orEmpty()
 
     private fun findEditable(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         val queue = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
