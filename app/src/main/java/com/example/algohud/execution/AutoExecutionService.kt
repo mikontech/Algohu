@@ -1331,6 +1331,25 @@ class AutoExecutionService : AccessibilityService() {
     private fun screenH() = resources.displayMetrics.heightPixels.toFloat()
     private fun screenW() = resources.displayMetrics.widthPixels.toFloat()
 
+    /** Tekst węzła to nazwa instrumentu: „GOLD”, „GOLD CFD”, „GOLD\nCFD” – ale nie „GOLD 24/7”, „Gold.com”. */
+    private fun isInstrumentLabel(t: String, target: String): Boolean {
+        val n = t.replace('\n', ' ').replace(Regex("\\s+"), " ").trim()
+        if (n.equals(target, ignoreCase = true)) return true
+        val first = n.substringBefore(' ')
+        return first.equals(target, ignoreCase = true) && !n.contains("24/7") &&
+            (n.length == first.length || n.substring(first.length).trim().startsWith("CFD", ignoreCase = true))
+    }
+
+    /** Pierwszy kafelek „Ostatnio wyszukiwane” z tym instrumentem (ekran po naciśnięciu lupy). */
+    private fun recentTile(root: AccessibilityNodeInfo, target: String): AccessibilityNodeInfo? {
+        val h = screenH()
+        val r = Rect()
+        return textNodes(root, 400).map { it.first to it.second }.firstOrNull { (n, t) ->
+            n.getBoundsInScreen(r)
+            !n.isEditable && r.centerY() > 0.1f * h && r.centerY() < 0.45f * h && isInstrumentLabel(t, target)
+        }?.first
+    }
+
     /** Widoczny, NIEEDYTOWALNY węzeł z dokładnie tym tekstem, w pasie ekranu [minY]–[maxY] (ułamki wysokości). */
     private fun nodeWithText(root: AccessibilityNodeInfo, text: String, minY: Float = 0f, maxY: Float = 1f): AccessibilityNodeInfo? {
         val r = Rect()
@@ -1356,7 +1375,11 @@ class AutoExecutionService : AccessibilityService() {
                 n.isVisibleToUser && !n.isEditable && r.centerY() > 0.15f * h && r.centerY() < 0.92f * h
             }?.let { return it }
         }
-        return nodeWithText(root, target, minY = 0.15f, maxY = 0.92f)
+        nodeWithText(root, target, minY = 0.15f, maxY = 0.92f)?.let { return it }
+        return textNodes(root, 400).firstOrNull { (n, t) ->
+            n.getBoundsInScreen(r)
+            n.isVisibleToUser && !n.isEditable && r.centerY() > 0.15f * h && r.centerY() < 0.92f * h && isInstrumentLabel(t, target)
+        }?.first
     }
 
     private suspend fun onTarget(target: String): Boolean {
@@ -1443,9 +1466,28 @@ class AutoExecutionService : AccessibilityService() {
             val lupa = r0.findAccessibilityNodeInfosByText("Wyszukaj").firstOrNull { it.isVisibleToUser && !it.isEditable }
                 ?: r0.findAccessibilityNodeInfosByText("Szukaj").firstOrNull { it.isVisibleToUser && !it.isEditable }
             if (lupa != null) tapNode(lupa) else tap(screenW() * 0.91f, screenH() * 0.085f)
-            delay(1_200)
+            delay(1_500)
+            // Ekran „Instrumenty”: w „Ostatnio wyszukiwane” instrument jest pierwszym kafelkiem u góry – wchodzimy w niego.
+            appRoot()?.let { r ->
+                recentTile(r, target)?.let { tile ->
+                    click(tile)
+                    if (onTarget(target)) return true
+                    tapNode(tile) // gdy ACTION_CLICK nie zadziałał – dotknięcie palcem
+                    if (onTarget(target)) return true
+                }
+                // bez rozpoznanego tekstu: pierwszy kafelek pod nagłówkiem „Ostatnio wyszukiwane”
+                r.findAccessibilityNodeInfosByText("Ostatnio wyszukiwane").firstOrNull { it.isVisibleToUser }?.let { head ->
+                    val hb = Rect().also(head::getBoundsInScreen)
+                    tap(screenW() * 0.21f, hb.bottom + screenH() * 0.055f)
+                    if (onTarget(target)) return true
+                    backStayInXtb()
+                    if (lupa != null) appRoot()?.findAccessibilityNodeInfosByText("Wyszukaj")?.firstOrNull { it.isVisibleToUser }?.let { tapNode(it); delay(1_500) }
+                }
+            }
             var field = appRoot()?.let { findEditable(it) }
-            if (field == null && inXtb()) { tap(screenW() / 2, screenH() * 0.19f); delay(900); field = appRoot()?.let { findEditable(it) } }
+            if (field == null && inXtb() && appRoot()?.findAccessibilityNodeInfosByText("Ostatnio wyszukiwane").isNullOrEmpty()) {
+                tap(screenW() / 2, screenH() * 0.19f); delay(900); field = appRoot()?.let { findEditable(it) }
+            }
             if (field != null) {
                 val args = android.os.Bundle().apply {
                     putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, target)
