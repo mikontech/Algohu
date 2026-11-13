@@ -99,101 +99,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         layout.addView(reverseSwitch)
-        // ───────────── Rada AI (4 agenty) i samonaprawa widoku ─────────────
-        TextView(this).apply { text = "\n🧠 Rada AI (4 agenty)"; textSize = 18f }.also { layout.addView(it) }
-        fun council() = getSharedPreferences("council", MODE_PRIVATE)
-        TextView(this).apply {
-            text = "Tryb oszczędny: do 4 zapytań/debatę, nie częściej niż co 10 min, maks. 12 debat/dobę UTC. " +
-                "Maks. 60 zapytań/dostawcę/dobę łącznie z nawigatorem. Po HTTP 429 przerwa min. 15 min. " +
-                "Analiza świec lokalnie co sekundę. Niezależny scenariusz AI: 1 zapytanie co 10 min, maks. 24/dobę, w ramach wspólnego limitu 60 zapytań/dostawcę. Nie otwiera zleceń. Limity konta mogą być niższe. " +
-                "Darmowość zależy od planu u dostawcy; aplikacja nie zmienia rozliczeń konta."
-        }.also { layout.addView(it) }
-        fun selectAi(route: AiRoute) {
-            council().edit().putString("ai_route", route.name).apply()
-            Toast.makeText(this, "Dostawca AI: ${route.name}; zmiana dla następnej debaty", Toast.LENGTH_LONG).show()
-            refresh()
-        }
-        button("AI: Gemini + Groq (oba klucze)") { selectAi(AiRoute.GEMINI_GROQ) }
-        button("AI: tylko Gemini") { selectAi(AiRoute.GEMINI) }
-        button("AI: tylko Groq") { selectAi(AiRoute.GROQ) }
-        button("AI: Claude (dotychczasowy)") { selectAi(AiRoute.CLAUDE) }
-        TextView(this).apply {
-            text = "Gemini + Groq: Gemini = Obserwator/Dowódca/nawigator; Groq = Strateg/Sceptyk. " +
-                "Wybrany dostawca otrzymuje dane analizy, a przy ocenie ekranu także zrzut XTB. " +
-                "Po przerwaniu połączenia, timeout lub 502/503/504 jedna ponowna próba. Klucze zostają po restarcie i aktualizacji APK; odinstalowanie usuwa dane."
-        }.also { layout.addView(it) }
-        for (provider in listOf(AiProvider.GEMINI, AiProvider.GROQ, AiProvider.CLAUDE)) {
-            val keyEdit = android.widget.EditText(this).apply {
-                hint = "${provider.name}: " + if (AiSettings.key(council(), provider).isNullOrBlank()) "wklej klucz API" else "klucz zapisany ✓"
-                inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
-                isSaveEnabled = false
-            }.also { layout.addView(it) }
-            val keyStatus = TextView(this).also { layout.addView(it) }
-            fun keyStatusRefresh() { keyStatus.text = "${provider.name}: " + if (AiSettings.key(council(), provider).isNullOrBlank()) "brak klucza" else "klucz zapisany na telefonie ✓" }
-            keyStatusRefresh()
-            keyEdit.doAfterTextChanged { value ->
-                val key = value.toString().trim()
-                if (key.isNotBlank() && key.none { it.isWhitespace() }) {
-                    council().edit().putString(AiSettings.keyPref(provider), key).apply()
-                    keyStatusRefresh()
-                }
-            }
-            button("Zapisz klucz ${provider.name}") {
-                val key = keyEdit.text.toString().trim()
-                if (key.isBlank() || key.any { it.isWhitespace() }) Toast.makeText(this, "Wklej poprawny klucz bez spacji", Toast.LENGTH_LONG).show()
-                else {
-                    if (!council().edit().putString(AiSettings.keyPref(provider), key).commit()) {
-                        keyStatus.text = "Błąd zapisu klucza"; return@button
-                    }
-                    keyStatusRefresh()
-                    keyEdit.setText(""); keyEdit.hint = "${provider.name}: klucz zapisany ✓"; refresh()
-                }
-            }
-        }
-        val apiStatus = TextView(this).also { layout.addView(it) }
-        var testingApi = false
-        button("Testuj zapisane klucze i modele API") {
-            if (!testingApi) lifecycleScope.launch {
-                testingApi = true
-                apiStatus.text = "Test API trwa…"
-                try {
-                    val plan = AiSettings.plan(council())
-                    val client = com.example.algohud.council.ClaudeClient.configured(council())
-                    val results = mutableListOf<String>()
-                    for (model in listOf(plan.fast, plan.deep).distinct()) {
-                        val result = try {
-                            client.askJson(model, "Return only a JSON object.", "Return {\"ok\":true}", maxTokens = 100)
-                            "$model: połączenie działa ✓"
-                        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                        catch (e: Exception) { "$model: ${e.message}" }
-                        results += result
-                        apiStatus.text = results.joinToString("\n")
-                    }
-                } finally { testingApi = false }
-            }
-        }
-        for ((pref, defaultModel) in listOf("gemini_model" to AiSettings.GEMINI_MODEL, "groq_model" to AiSettings.GROQ_MODEL)) {
-            val modelEdit = android.widget.EditText(this).apply {
-                hint = "Model ${pref.substringBefore('_')}"
-                setText(council().getString(pref, defaultModel))
-                isSingleLine = true
-            }.also { layout.addView(it) }
-            button("Zapisz model ${pref.substringBefore('_')}") {
-                val model = modelEdit.text.toString().trim()
-                if (!model.matches(Regex("[A-Za-z0-9._/-]+")) || (pref == "gemini_model" && model.contains('/')))
-                    Toast.makeText(this, "Nieprawidłowa nazwa modelu", Toast.LENGTH_LONG).show()
-                else { council().edit().putString(pref, model).apply(); Toast.makeText(this, "Zapisano model", Toast.LENGTH_SHORT).show() }
-            }
-        }
-        fun councilMode(m: com.example.algohud.council.CouncilMode, note: String) {
-            council().edit().putString(com.example.algohud.council.AgentCouncil.PREF_MODE, m.name).apply()
-            Toast.makeText(this, "Rada AI: ${m.name} – $note", Toast.LENGTH_LONG).show(); refresh()
-        }
-        button("Rada: ADVISORY – tylko komentuje (domyślnie)") { councilMode(com.example.algohud.council.CouncilMode.ADVISORY, "bot wchodzi jak dotąd") }
-        button("Rada: GATE – może zawetować wejście") { councilMode(com.example.algohud.council.CouncilMode.GATE, "weto blokuje wejście, błąd API = brak wejścia") }
-        button("Rada: OFF") { councilMode(com.example.algohud.council.CouncilMode.OFF, "wyłączona") }
-        button("Nawigator AI (zapas, gdy bot nie znajdzie GOLD): WŁĄCZ") { council().edit().putBoolean("ai_nav", true).apply(); refresh() }
-        button("Nawigator AI: wyłącz") { council().edit().putBoolean("ai_nav", false).apply(); refresh() }
+        TextView(this).apply { text = "Agenci AI odłączeni. Bot działa lokalnie." }.also { layout.addView(it) }
         button("Samonaprawa widoku we WSZYSTKICH trybach (też DRY_RUN): WŁĄCZ") {
             getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("nav_autonomy", true).apply()
             AutoExecutionService.navAutonomy = true; refresh()
@@ -286,10 +192,7 @@ class MainActivity : ComponentActivity() {
             appendLine("Nakładka: " + if (Settings.canDrawOverlays(this@MainActivity)) "✅" else "❌")
             appendLine("Ułatwienia dostępu: " + if (AutoExecutionService.instance != null) "✅" else "❌ (potrzebne tylko w Wariancie B)")
             appendLine("Domyślny tryb: DRY_RUN (paper trading)")
-            val cp = getSharedPreferences("council", MODE_PRIVATE)
-            appendLine("Rada AI: " + (cp.getString(com.example.algohud.council.AgentCouncil.PREF_MODE, null) ?: "ADVISORY") +
-                " • " + AiSettings.route(cp).name + " • klucze: " + (if (AiSettings.hasKeys(cp)) "✅" else "❌ uzupełnij") +
-                " • nawigator AI: " + (if (cp.getBoolean("ai_nav", true)) "✅" else "wył."))
+            appendLine("Agenci AI: odłączeni")
             val paused = AutoExecutionService.navPausedUntil > System.currentTimeMillis()
             append("Samonaprawa widoku: " + (if (getSharedPreferences("ui", MODE_PRIVATE).getBoolean("nav_autonomy", true)) "wszystkie tryby" else "tylko AUTO") +
                 (if (paused) " (⏸ pauza)" else "") + " • zrzuty ekranu: " + (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) "✅ Android 11+" else "❌ za stary Android"))

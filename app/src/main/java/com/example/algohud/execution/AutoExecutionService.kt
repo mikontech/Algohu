@@ -1584,10 +1584,13 @@ class AutoExecutionService : AccessibilityService() {
     private val profitAnchors = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     /** Wyłącznie świeży odczyt pozycji, której otwarcie potwierdził bot. */
-    fun profitSnapshot(instrument: String, side: Side, quantity: Double): Pair<ScreenQuote, PositionRowInfo>? {
+    fun profitSnapshot(instrument: String, side: Side, quantity: Double): Pair<ScreenQuote, PositionRowInfo>? =
+        positionSnapshot(instrument, side, quantity)?.takeIf { it.first.accountCurrency == "PLN" }
+
+    fun positionSnapshot(instrument: String, side: Side, quantity: Double): Pair<ScreenQuote, PositionRowInfo>? {
         val root = appRoot()?.takeIf { it.packageName?.toString() == ScreenScanner.XTB_PACKAGE } ?: return null
         val q = ScreenScanner.scanXtb(root, ScreenScanner.XTB_PACKAGE, "XTB", System.currentTimeMillis()) ?: return null
-        if (q.instrument != instrument || q.accountCurrency != "PLN") return null
+        if (q.instrument != instrument) return null
         val row = readPositionRows(root).singleOrNull() ?: return null
         if (row.signature != profitAnchors[instrument] || row.side != side ||
             row.volume?.let { abs(abs(it) - quantity) > 1e-8 } != false) return null

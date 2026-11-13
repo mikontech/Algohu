@@ -807,8 +807,7 @@ class BotOrchestrator(
             val step = maxOf(2 * spreadOf(inst), if (perPrice > 0) BROKER_STEP_PLN / perPrice else 0.3)
             // SL: tylko po stronie zysku (startowy SL 15–20 zł zostaje w XTB), maks. co BROKER_SYNC_EVERY_MS.
             val profitDue = t.profitStopXtb != null && ts - t.brokerAt >= BROKER_SYNC_EVERY_MS
-            val slDue = profitDue || (stopNow - be) * dir >= 0 && ts - t.brokerAt >= BROKER_SYNC_EVERY_MS &&
-                (t.brokerSl.isNaN() || abs(stopNow - t.brokerSl) >= step)
+            val slDue = profitDue
             // TP: od razu po odsunięciu (bez czekania 20 s) – inaczej XTB zamknie na starym TP w środku wzrostu.
             val tpDue = tpNow != null && (t.brokerTp.isNaN() || abs(tpNow - t.brokerTp) >= step)
             if (!slDue && !tpDue) return@launch
@@ -818,7 +817,15 @@ class BotOrchestrator(
                 val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
                 if (q == null) return@launch
                 val sh = basis(inst, q)
-                val requestedSl = if (profitDue) t.profitStopXtb else if (slDue) stopNow + sh else null
+                val snapshot = AutoExecutionService.instance?.profitSnapshot(inst, p.side, p.quantity)
+                val requestedSl = if (profitDue && snapshot != null) {
+                    val row = snapshot.second
+                    val entry = row.entryText?.let { com.example.algohud.execution.PositionRowParser.number(it) }
+                    val bid = snapshot.first.bid; val ask = snapshot.first.ask
+                    if (entry == null || row.netPnl == null || bid == null || ask == null) null
+                    else ProfitTrail.target(entry, dir, row.netPnl, perPrice, ask - bid, if (dir > 0) bid else ask, row.sl)
+                } else null
+                if (slDue && requestedSl == null) { t.profitStopXtb = null; return@launch }
                 val res = AutoExecutionService.instance?.setProtection(
                     inst, requestedSl, if (tpDue) tpNow!! + sh else null
                 )
@@ -1704,42 +1711,16 @@ class BotOrchestrator(
 
     /** Uproszczony HUD: tylko pozycja, „co dalej”, ostatnie transakcje, alarm i kanał ntfy. */
     private suspend fun compactView(inst: String, now: Long, sh: Double): String {
-        val px = lastPx[inst]?.first
-        val lines = ArrayList<String>()
-        val day = journal.all().filter { !it.paper && now - it.closedAt < 24 * 3_600_000 && java.time.Instant.ofEpochMilli(it.closedAt).atZone(UsSession.PL).toLocalDate() == java.time.Instant.ofEpochMilli(now).atZone(UsSession.PL).toLocalDate() }
-        lines += "$inst ${px?.let { "%.2f".format(it + sh) } ?: "—"} • ${engine.mode.value.name} • dziennik bota: %+.2f zł (%d tr.)".format(day.sumOf { it.pnl }, day.size)
         val pos = risk.position(inst)
         if (pos != null) {
-            val dir = pos.side.sign
-            val pnl = px?.let { (it - pos.entryPrice) * dir * pos.quantity * pos.pointValue }
-            lines += "${if (pos.side == Side.BUY) "🟢" else "🔴"} W POZYCJI ${sideName(pos.side)} %s • wejście %s • cena referencyjna feedu %.2f".format(
-                BigDecimal.valueOf(pos.quantity).toPlainString(), hhmm(pos.openedAt), pos.entryPrice)
-            lines += "   plan SL %.2f • TP %s • szacunek feedu %s • %s".format(pos.stopPrice + sh, pos.takeProfit?.let { "%.2f".format(it + sh) } ?: "—",
-                pnl?.let { "%+.2f zł".format(it) } ?: "—", stratName(pos.entryReason))
-            if (!pos.paper) lines += "   Wynik netto i cena wykonania: sprawdź w XTB"
-            reversalNote[inst]?.let { lines += "   🔄 $it" }
-        } else {
-            val armed = armedNote[inst]?.takeIf { now - it.first < 30_000 }?.second
-            val skipped = skipNote[inst]?.takeIf { now - it.first < 90_000 }?.second
-            val block = dataNote[inst] ?: sessionBlock(inst, now) ?: smc.newsBlackout(now)
-            lines += when {
-                block != null -> "⏸ CZEKAM • ❌ nie wejdę: $block"
-                armed != null -> "⏳ SZYKUJĘ SIĘ: $armed"
-                skipped != null -> "⏸ CZEKAM • ❌ nie wszedłem: $skipped"
-                else -> "⏸ CZEKAM • brak setupu – obserwuję"
-            }
+            val state = if (aiTrades[inst]?.closing == true) "WYCHODZĘ" else "WEJŚCIE ${hhmm(pos.openedAt)} • W POZYCJI"
+            val row = if (pos.paper) null else AutoExecutionService.instance?.positionSnapshot(inst, pos.side, pos.quantity)?.second
+            val protection = if (pos.paper) "PAPIER • SL %.2f".format(pos.stopPrice)
+                else com.example.algohud.execution.ProtectionDisplay.line(row)
+            return "$state ${sideName(pos.side)} $inst\n$protection"
         }
-        journal.all().filter { it.symbol == inst }.takeLast(3).reversed().forEach { t ->
-            lines += "• %s %s %.2f→%.2f %+.2f zł%s".format(hhmm(t.closedAt), sideName(t.side), t.entry + sh, t.exit + sh, t.pnl, if (t.paper) " (papier)" else "")
-        }
-        AutoExecutionService.lastAlert?.takeIf { now - it.first < 15 * 60_000 }?.let { lines += "🚨 ${hhmm(it.first)} ${it.second}" }
-        Ntfy.topic?.let { t ->
-            val st = Ntfy.lastError?.let { " • ⚠️ wysyłka nieudana: ${it.take(60)}" }
-                ?: if (Ntfy.lastOkAt > 0) " • ostatnio wysłano ${hhmm(Ntfy.lastOkAt)} ✓" else " • jeszcze nic nie wysłano"
-            lines += "🔔 ntfy: $t$st"
-        }
-        council?.let { lines += it.observationLine(inst, now) }
-        return lines.joinToString("\n")
+        val last = journal.all().lastOrNull { it.symbol == inst && now - it.closedAt in 0..120_000 }
+        return if (last != null) "WYJŚCIE ${hhmm(last.closedAt)} • ${sideName(last.side)} $inst" else "CZEKAM NA WEJŚCIE • $inst"
     }
 
     private fun compassLine(inst: String): String =

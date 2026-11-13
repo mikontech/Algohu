@@ -255,25 +255,10 @@ class OverlayService : LifecycleService() {
             autoGate = { null }
         )
 
-        // ── Rada AI (4 agenty) + nawigator wizyjny. Klucz API i tryb: aplikacja Algo HUD → „Rada AI”. ──
-        val councilPrefs = getSharedPreferences("council", MODE_PRIVATE)
-        val claude = com.example.algohud.council.ClaudeClient.configured(councilPrefs)
-        val c = com.example.algohud.council.AgentCouncil(
-            prefs = councilPrefs, client = claude,
-            log = { line -> if (::bot.isInitialized) bot.councilLog(line) },
-            isKilled = { risk.killSwitch.value },
-            priceNow = { inst -> if (::bot.isInitialized) bot.lastPrice(inst) else null }
-        )
-        council = c
-        val nav = com.example.algohud.council.AiNavigator(
-            client = claude,
-            model = { com.example.algohud.council.AiSettings.plan(councilPrefs).fast },
-            hasKey = { !com.example.algohud.council.AiSettings.key(councilPrefs,
-                com.example.algohud.council.AiSettings.provider(com.example.algohud.council.AiSettings.plan(councilPrefs).fast)).isNullOrBlank() },
-            log = { line -> if (::bot.isInitialized) bot.councilLog(line) }
-        )
-        aiNav = nav
-        AutoExecutionService.aiNavigator = { target -> if (councilPrefs.getBoolean("ai_nav", true)) nav.open(target) else false }
+        // Agenci i nawigator AI odłączeni; brak wywołań API z usługi.
+        council = null
+        aiNav = null
+        AutoExecutionService.aiNavigator = null
         AutoExecutionService.navAbort = { risk.killSwitch.value }
         AutoExecutionService.navAutonomy = uiPrefs().getBoolean("nav_autonomy", true)
 
@@ -294,7 +279,7 @@ class OverlayService : LifecycleService() {
                     else -> null
                 }
             },
-            council = c
+            council = null
         )
         bot.start()
     }
@@ -353,10 +338,6 @@ class OverlayService : LifecycleService() {
                 stopAi() // najpierw przerwij debatę i nawigację AI – zwalnia blokadę UI dla zamykania pozycji
                 botScope.launch { engine.flattenAll("KILL ręczny z HUD") }
             })
-            addView(actionButton("🧠", 0xFF4A148C.toInt()) {
-                showDebate = !showDebate
-                tvDebate.visibility = if (showDebate) View.VISIBLE else View.GONE
-            })
             addView(actionButton("⏸", 0xFF37474F.toInt()) {
                 val paused = AutoExecutionService.navPausedUntil > System.currentTimeMillis()
                 AutoExecutionService.navPausedUntil = if (paused) 0L else System.currentTimeMillis() + 10 * 60_000L
@@ -368,7 +349,7 @@ class OverlayService : LifecycleService() {
                 btnDetails.text = if (showDetails) "▴ Zwiń" else "ℹ️ Szczegóły"
                 applyDetailsVisibility()
             }
-            addView(btnDetails)
+            btnDetails.visibility = View.GONE
             addView(btnConfirm)
         }
         fun full() = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
@@ -542,11 +523,9 @@ class OverlayService : LifecycleService() {
 
     /** Uproszczony HUD: widać tylko [tvCompact] + przyciski; szczegóły po „ℹ️ Szczegóły”. */
     private fun applyDetailsVisibility() {
-        val d = if (showDetails) View.VISIBLE else View.GONE
-        tvCompact.visibility = if (showDetails) View.GONE else View.VISIBLE
-        tvStatus.visibility = d; tvStats.visibility = d; tvMessage.visibility = d
-        tvPlan.visibility = if (showDetails && tvPlan.text.isNotBlank()) View.VISIBLE else View.GONE
-        tvPredict.visibility = if (showDetails && tvPredict.text.isNotBlank()) View.VISIBLE else View.GONE
+        tvCompact.visibility = View.VISIBLE
+        listOf(tvStatus, tvStats, tvMessage, tvPlan, tvPredict, tvCouncil, tvDebate, tvScreen).forEach { it.visibility = View.GONE }
+
     }
 
     private fun render(s: HudState) {
@@ -558,7 +537,7 @@ class OverlayService : LifecycleService() {
         val q = s.screen?.takeIf { it.isFresh() }
         bubble.text = when {
             s.killSwitch -> "⛔ KILL"
-            q?.instrument != null -> "${q.instrument} ${q.mid?.let(::fmtPrice) ?: ""} • ${s.mode.name}"
+            q?.instrument != null -> "${q.instrument} • ${s.mode.name}"
             else -> "Algo HUD • ${s.mode.name}"
         }
         tvScreen.text = when {
