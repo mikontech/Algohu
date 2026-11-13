@@ -11,7 +11,8 @@ android {
         applicationId = "com.example.algohud"   // zmień przed publikacją
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
+        // Kolejny numer z GitHub Actions – nowy APK zawsze instaluje się jako aktualizacja.
+        versionCode = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
         versionName = "0.1.0"
         buildConfigField("String", "GIT_SHA", "\"${(System.getenv("GITHUB_SHA") ?: "local").take(7)}\"")
     }
@@ -20,7 +21,22 @@ android {
         buildConfig = true
     }
 
+    // Stały klucz podpisu wersji debug (app/debug.keystore w repo). Bez tego każdy build z GitHub Actions
+    // miał inny, losowy klucz – Android nie pozwalał zaktualizować aplikacji, trzeba było ją odinstalować,
+    // a razem z nią znikały dziennik transakcji, kanał ntfy i zgoda na ułatwienia dostępu.
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
+        getByName("debug") {
+            signingConfig = signingConfigs.getByName("debug")
+        }
         release {
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
