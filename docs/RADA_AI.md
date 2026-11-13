@@ -83,3 +83,32 @@ Oznaczane są luki, błędny OHLC, nieaktualna świeca oraz wiek ceny powyżej 1
 Nie ma danych o wolumenie. OHLC feedu nie musi pokrywać się z OHLC XTB; przesunięcie
 cen nie gwarantuje zgodności knotów. Analiza nie zmienia parametrów ryzyka ani sama
 nie otwiera/zamyka pozycji. W GATE stanowi dodatkowe dane do oceny rady.
+
+## Gemini i Groq — tryb oszczędny
+
+W aplikacji wybierz Gemini, Groq, Gemini + Groq albo dotychczasowe Claude. Dla trybu
+mieszanego wymagane są oba klucze: Gemini ocenia ekran i podsumowuje decyzję, Groq
+realizuje Stratega i Sceptyka. Nawigator używa dostawcy Obserwatora. Klucze są osobne,
+nie trafiają do repo/artefaktów; dane i zrzuty trafiają tylko do wybranych dostawców.
+Dotychczasowy klucz Claude zachowuje wybór Claude do ręcznej zmiany.
+
+Debata: Obserwator → Strateg → Sceptyk → Dowódca, do 4 zapytań zamiast 6.
+Bez drugiej rundy, najwyżej raz na 10 minut, 12 debat/dobę UTC. Liczniki są zapisane
+przed żądaniem i przetrwają restart. Rada i nawigator współdzielą limit 60 żądań na
+dostawcę/dobę. HTTP 429 włącza przerwę minimum 15 minut (dłuższą dla Retry-After w sekundach).
+Nie ma automatycznych ponowień ani przełączania dostawcy przy błędzie. GATE blokuje
+wejście przy limitach, błędzie API, braku klucza lub niepełnym JSON. ADVISORY pomija
+opinię bez zatrzymywania dotychczasowej logiki bota; OFF nie odpytuje rady.
+
+Limity aplikacji nie gwarantują darmowości: rozliczenia, tokeny i dostępność modeli
+zależą od planu dostawcy. Domyślnie gemini-3.8-flash oraz qwen/qwen3.8-27b; nazwy
+można zmienić w aplikacji, wybierając model obsługujący JSON i obrazy.
+Dokumentacja sprawdzona 13.11.2026:
+- https://ai.google.dev/api/generate-content
+- https://ai.google.dev/gemini-api/docs/pricing
+- https://console.groq.com/docs/vision
+- https://console.groq.com/docs/structured-outputs
+
+Testy bez kluczy sprawdzają żądania, odpowiedzi, odrzucanie uciętych odpowiedzi,
+429 bez wycieku treści błędu, budżety po restarcie i blokadę GATE. Połączenie z
+prawdziwym kontem wymaga sprawdzenia na telefonie po wpisaniu własnych kluczy.

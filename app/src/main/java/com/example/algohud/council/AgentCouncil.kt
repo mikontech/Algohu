@@ -20,10 +20,9 @@ import kotlin.math.abs
 /**
  * Rada 4 agentów AI – bramka PRZED wejściem w pozycję (nie dotyczy wyjść, SL-schodków ani kill-switcha).
  *
- * Przebieg (2 rundy, żeby trzymać opóźnienie ~10–20 s):
+ * Przebieg oszczędny: najwyżej 4 wywołania; 10 minut przerwy, 12 debat/dobę UTC.
  *   R0  Obserwator (wizja/tekst) – czy ekran XTB zgadza się z danymi bota
- *   R1  Strateg ‖ Sceptyk – równolegle, niezależne opinie
- *   R2  Strateg odpowiada na zarzuty ‖ Sceptyk wydaje werdykt po argumentach Stratega
+ *   R1  Strateg → Sceptyk wydaje werdykt po argumentach Stratega
  *   R3  Dowódca – synteza w ustrukturyzowane zlecenie
  *   ⟶  RiskGate (Kotlin, bez AI) – ostateczna weryfikacja; dopiero potem engine.submit()
  *
@@ -31,7 +30,7 @@ import kotlin.math.abs
  */
 class AgentCouncil(
     private val prefs: SharedPreferences,
-    private val client: ClaudeClient = ClaudeClient({ prefs.getString(PREF_KEY, null) }),
+    private val client: ClaudeClient = ClaudeClient.configured(prefs),
     private val log: (String) -> Unit,
     private val isKilled: () -> Boolean,
     /** Aktualna cena bota (po debacie) – do kontroli poślizgu. */
@@ -41,10 +40,10 @@ class AgentCouncil(
         get() = runCatching { CouncilMode.valueOf(prefs.getString(PREF_MODE, CouncilMode.ADVISORY.name)!!) }.getOrDefault(CouncilMode.ADVISORY)
 
     fun setMode(m: CouncilMode) = prefs.edit().putString(PREF_MODE, m.name).apply()
-    fun hasKey() = !prefs.getString(PREF_KEY, null).isNullOrBlank()
+    fun hasKey() = AiSettings.hasKeys(prefs)
+    private val limits = AiLimits(prefs)
+    private val reviewMutex = kotlinx.coroutines.sync.Mutex()
 
-    private val fastModel get() = prefs.getString(PREF_FAST_MODEL, null) ?: DEFAULT_FAST_MODEL
-    private val deepModel get() = prefs.getString(PREF_DEEP_MODEL, null) ?: DEFAULT_DEEP_MODEL
 
     private val _transcript = MutableStateFlow<List<String>>(emptyList())
     /** Ostatnia debata linia po linii – do rozwijanego okna w HUD (krok 3). */
@@ -66,22 +65,34 @@ class AgentCouncil(
      * (werdykt rady trafia tylko do logu), w GATE – to, co przepuści [RiskGate].
      */
     suspend fun review(ctx: CouncilContext): CouncilDecision {
+        if (!reviewMutex.tryLock()) return unavailable(ctx, mode, "rada już pracuje")
+        return try { reviewLocked(ctx) } finally { running = null; reviewMutex.unlock() }
+    }
+
+    private fun unavailable(ctx: CouncilContext, m: CouncilMode, why: String): CouncilDecision {
+        note("🧠 $why" + if (m == CouncilMode.GATE) " – wejście zablokowane" else " – pomijam opinię")
+        return if (m == CouncilMode.GATE) CouncilDecision.Veto(why, listOf(why))
+            else CouncilDecision.Approve(ctx.order, listOf(why))
+    }
+
+    private suspend fun reviewLocked(ctx: CouncilContext): CouncilDecision {
         val m = mode
+        val plan = AiSettings.plan(prefs)
         if (m == CouncilMode.OFF) return CouncilDecision.Approve(ctx.order, emptyList())
-        if (!hasKey()) {
+        if (!AiSettings.hasKeys(prefs, plan)) {
             val why = "brak klucza API rady AI"
             note(if (m == CouncilMode.GATE) "⛔ Rada AI: $why – wejście zablokowane" else "🧠 Rada AI: $why – pomijam debatę")
             return if (m == CouncilMode.GATE) CouncilDecision.Veto(why, listOf(why))
                 else CouncilDecision.Approve(ctx.order, emptyList())
         }
-        running?.cancel()
+        limits.reserveDebate()?.let { return unavailable(ctx, m, it) }
         val lines = mutableListOf<String>()
         fun say(s: String) { lines += s; _transcript.value = lines.toList(); log(s) }
 
         // Debata w osobnym zadaniu – kill-switch anuluje tylko ją, nie pętlę bota.
         val result = runCatching {
             coroutineScope {
-                val d = async { withTimeout(TOTAL_TIMEOUT_MS) { debate(ctx, ::say) } }
+                val d = async { withTimeout(TOTAL_TIMEOUT_MS) { debate(ctx, plan, ::say) } }
                 running = d
                 d.await()
             }
@@ -121,7 +132,9 @@ class AgentCouncil(
         return if (m == CouncilMode.ADVISORY) CouncilDecision.Approve(ctx.order, decision.log) else decision
     }
 
-    private suspend fun debate(ctx: CouncilContext, say: (String) -> Unit): CouncilDecision = coroutineScope {
+    private suspend fun debate(ctx: CouncilContext, plan: AiPlan, say: (String) -> Unit): CouncilDecision = coroutineScope {
+        val fastModel = plan.fast
+        val deepModel = plan.deep
         val o = ctx.order
         val side = RiskGate.sideName(o.side)
         say("🧠 Rada AI: kandydat ${ctx.strategy} $side ${ctx.instrument} – debata…")
@@ -146,29 +159,14 @@ class AgentCouncil(
 
         val base = facts + "\nRAPORT OBSERWATORA: " + observer.raw
 
-        // ── R1: równolegle ──
-        val s1 = async { CouncilParsing.strategist(client.askJson(deepModel, CouncilPrompts.STRATEGIST, "$base\nRUNDA 1.")) }
-        val k1 = async { CouncilParsing.skeptic(client.askJson(deepModel, CouncilPrompts.SKEPTIC, "$base\nRUNDA 1.")) }
-        val strat1 = s1.await(); val skep1 = k1.await()
-        say("🌍 Strateg: ${strat1.stance} (%.0f%%, %s, pułapka: %s) – %s".format(strat1.confidence * 100, strat1.regime, strat1.trapRisk, strat1.arguments.firstOrNull() ?: ""))
-        say("🛡️ Sceptyk: ${skep1.verdict} – ${skep1.reasons.firstOrNull() ?: ""}")
+        // Tryb oszczędny: Strateg → Sceptyk (widzi argumenty Stratega), bez drugiej rundy.
+        val strat2 = CouncilParsing.strategist(client.askJson(deepModel, CouncilPrompts.STRATEGIST, "$base\nJEDNA RUNDA: oceń kandydata."))
+        say("🌍 Strateg: ${strat2.stance} – ${strat2.arguments.firstOrNull() ?: ""}")
         guard()
-
-        // ── R2: wymiana argumentów ──
-        val s2 = async {
-            CouncilParsing.strategist(client.askJson(deepModel, CouncilPrompts.STRATEGIST,
-                "$base\nRUNDA 2. Twoja opinia z rundy 1: ${strat1.raw}\nZarzuty Sceptyka: ${skep1.raw}"))
-        }
-        val k2 = async {
-            CouncilParsing.skeptic(client.askJson(deepModel, CouncilPrompts.SKEPTIC,
-                "$base\nRUNDA 2 (werdykt końcowy). Twoja opinia z rundy 1: ${skep1.raw}\nArgumenty Stratega: ${strat1.raw}"))
-        }
-        val strat2 = s2.await(); val skep2 = k2.await()
-        say("🌍 Strateg (R2): ${strat2.stance} – ${strat2.arguments.lastOrNull() ?: ""}")
-        say("🛡️ Sceptyk (R2): ${skep2.verdict}" + (if (skep2.verdict == SkepticVerdict.ADJUST) " ×%.2f lota".format(skep2.volumeFactor) else "") +
-            " – ${skep2.reasons.firstOrNull() ?: ""}")
+        val skep2 = CouncilParsing.skeptic(client.askJson(deepModel, CouncilPrompts.SKEPTIC,
+            "$base\nWERDYKT KOŃCOWY. Argumenty Stratega: ${strat2.raw}"))
+        say("🛡️ Sceptyk: ${skep2.verdict} – ${skep2.reasons.firstOrNull() ?: ""}")
         guard()
-
         if (skep2.verdict == SkepticVerdict.VETO)
             return@coroutineScope CouncilDecision.Veto("WETO Sceptyka: ${skep2.reasons.firstOrNull() ?: "bez powodu"}", emptyList())
 

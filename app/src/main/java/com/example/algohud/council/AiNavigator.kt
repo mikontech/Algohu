@@ -40,6 +40,7 @@ class AiNavigator(
     }
 
     private suspend fun run(svc: AutoExecutionService, target: String): Boolean {
+        val selectedModel = model()
         return withTimeoutOrNull(TOTAL_MS) {
             val history = mutableListOf<String>()
             repeat(MAX_STEPS) { step ->
@@ -51,7 +52,7 @@ class AiNavigator(
                     appendLine("KROK ${step + 1}/$MAX_STEPS. Dotychczas: ${history.joinToString(" → ").ifBlank { "nic" }}")
                     if (img == null) appendLine("ZRZUT NIEDOSTĘPNY (${ScreenGrabber.lastError}). Teksty na ekranie: ${svc.navScreenText()}")
                 }
-                val j = runCatching { client.askJson(model(), PROMPT, text, img, 250) }.getOrElse {
+                val j = runCatching { client.askJson(selectedModel, PROMPT, text, img, 250) }.getOrElse {
                     log("👁️ Nawigator AI: błąd API – ${it.message?.take(60)}"); return@withTimeoutOrNull false
                 }
                 val action = j.optString("action")

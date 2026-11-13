@@ -42,4 +42,18 @@ class AgentCouncilTest {
     @Test fun offWithoutKeyApproves() = runTest {
         assertTrue(council(CouncilMode.OFF, null).review(ctx) is CouncilDecision.Approve)
     }
+    @Test fun gateBlocksWhenDebateBudgetIsExhaustedButAdvisoryContinues() = runTest {
+        val data = mutableMapOf<String, Any>("ai_route" to "GEMINI", "gemini_api_key" to "test-key",
+            AgentCouncil.PREF_MODE to "GATE")
+        val prefs = memoryPrefs(data)
+        val now = System.currentTimeMillis()
+        val day = java.time.Instant.ofEpochMilli(now).atZone(java.time.ZoneOffset.UTC).toLocalDate().toEpochDay()
+        data["ai_limit_debates_day"] = day
+        data["ai_limit_debates_count"] = 12L
+        val c = AgentCouncil(prefs, log = {}, isKilled = { false }, priceNow = { 3900.0 })
+        assertTrue(c.review(ctx) is CouncilDecision.Veto)
+        data[AgentCouncil.PREF_MODE] = "ADVISORY"
+        assertTrue(c.review(ctx) is CouncilDecision.Approve)
+    }
+
 }

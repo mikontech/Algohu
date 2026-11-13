@@ -256,7 +256,7 @@ class OverlayService : LifecycleService() {
 
         // ── Rada AI (4 agenty) + nawigator wizyjny. Klucz API i tryb: aplikacja Algo HUD → „Rada AI”. ──
         val councilPrefs = getSharedPreferences("council", MODE_PRIVATE)
-        val claude = com.example.algohud.council.ClaudeClient({ councilPrefs.getString(com.example.algohud.council.AgentCouncil.PREF_KEY, null) })
+        val claude = com.example.algohud.council.ClaudeClient.configured(councilPrefs)
         val c = com.example.algohud.council.AgentCouncil(
             prefs = councilPrefs, client = claude,
             log = { line -> if (::bot.isInitialized) bot.councilLog(line) },
@@ -266,9 +266,9 @@ class OverlayService : LifecycleService() {
         council = c
         val nav = com.example.algohud.council.AiNavigator(
             client = claude,
-            model = { councilPrefs.getString(com.example.algohud.council.AgentCouncil.PREF_FAST_MODEL, null)
-                ?: com.example.algohud.council.AgentCouncil.DEFAULT_FAST_MODEL },
-            hasKey = { c.hasKey() },
+            model = { com.example.algohud.council.AiSettings.plan(councilPrefs).fast },
+            hasKey = { !com.example.algohud.council.AiSettings.key(councilPrefs,
+                com.example.algohud.council.AiSettings.provider(com.example.algohud.council.AiSettings.plan(councilPrefs).fast)).isNullOrBlank() },
             log = { line -> if (::bot.isInitialized) bot.councilLog(line) }
         )
         aiNav = nav

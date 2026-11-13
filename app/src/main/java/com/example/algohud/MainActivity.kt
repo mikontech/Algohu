@@ -1,5 +1,8 @@
 package com.example.algohud
 
+import com.example.algohud.council.AiSettings
+import com.example.algohud.council.AiProvider
+import com.example.algohud.council.AiRoute
 import android.Manifest
 import android.content.Intent
 import android.net.Uri
@@ -88,20 +91,50 @@ class MainActivity : ComponentActivity() {
         TextView(this).apply { text = "\n🧠 Rada AI (4 agenty)"; textSize = 18f }.also { layout.addView(it) }
         fun council() = getSharedPreferences("council", MODE_PRIVATE)
         TextView(this).apply {
-            text = "Obserwator → Strateg ⇄ Sceptyk (weto) → Dowódca → RiskGate. Rada ocenia tylko NOWE wejścia; " +
-                "wyjścia, SL i kill-switch działają bez AI. Klucz API Anthropic zostaje tylko w tym telefonie."
+            text = "Tryb oszczędny: do 4 zapytań/debatę, nie częściej niż co 10 min, maks. 12 debat/dobę UTC. " +
+                "Maks. 60 zapytań/dostawcę/dobę łącznie z nawigatorem. Po HTTP 429 przerwa min. 15 min. " +
+                "Analiza świec nadal działa lokalnie co sekundę. Limity konta mogą być niższe. " +
+                "Darmowość zależy od planu u dostawcy; aplikacja nie zmienia rozliczeń konta."
         }.also { layout.addView(it) }
-        val keyEdit = android.widget.EditText(this).apply {
-            hint = if (council().getString(com.example.algohud.council.AgentCouncil.PREF_KEY, null).isNullOrBlank()) "Klucz API Anthropic (sk-ant-…)" else "Klucz zapisany ✓ (wpisz nowy, by zmienić)"
-            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        fun selectAi(route: AiRoute) {
+            council().edit().putString("ai_route", route.name).apply()
+            Toast.makeText(this, "Dostawca AI: ${route.name}; zmiana dla następnej debaty", Toast.LENGTH_LONG).show()
+            refresh()
+        }
+        button("AI: Gemini + Groq (oba klucze)") { selectAi(AiRoute.GEMINI_GROQ) }
+        button("AI: tylko Gemini") { selectAi(AiRoute.GEMINI) }
+        button("AI: tylko Groq") { selectAi(AiRoute.GROQ) }
+        button("AI: Claude (dotychczasowy)") { selectAi(AiRoute.CLAUDE) }
+        TextView(this).apply {
+            text = "Gemini + Groq: Gemini = Obserwator/Dowódca/nawigator; Groq = Strateg/Sceptyk. " +
+                "Wybrany dostawca otrzymuje dane analizy, a przy ocenie ekranu także zrzut XTB. " +
+                "Nie ma automatycznego przełączania na innego dostawcę. Klucze zapisujesz tylko na telefonie."
         }.also { layout.addView(it) }
-        button("Zapisz klucz API") {
-            val k = keyEdit.text.toString().trim()
-            if (!k.startsWith("sk-ant-")) Toast.makeText(this, "To nie wygląda na klucz Anthropic (sk-ant-…)", Toast.LENGTH_LONG).show()
-            else {
-                council().edit().putString(com.example.algohud.council.AgentCouncil.PREF_KEY, k).apply()
-                keyEdit.setText(""); keyEdit.hint = "Klucz zapisany ✓ (wpisz nowy, by zmienić)"
-                Toast.makeText(this, "Zapisano", Toast.LENGTH_SHORT).show()
+        for (provider in listOf(AiProvider.GEMINI, AiProvider.GROQ, AiProvider.CLAUDE)) {
+            val keyEdit = android.widget.EditText(this).apply {
+                hint = "${provider.name}: " + if (AiSettings.key(council(), provider).isNullOrBlank()) "wklej klucz API" else "klucz zapisany ✓"
+                inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+            }.also { layout.addView(it) }
+            button("Zapisz klucz ${provider.name}") {
+                val key = keyEdit.text.toString().trim()
+                if (key.isBlank() || key.any { it.isWhitespace() }) Toast.makeText(this, "Wklej poprawny klucz bez spacji", Toast.LENGTH_LONG).show()
+                else {
+                    council().edit().putString(AiSettings.keyPref(provider), key).apply()
+                    keyEdit.setText(""); keyEdit.hint = "${provider.name}: klucz zapisany ✓"; refresh()
+                }
+            }
+        }
+        for ((pref, defaultModel) in listOf("gemini_model" to AiSettings.GEMINI_MODEL, "groq_model" to AiSettings.GROQ_MODEL)) {
+            val modelEdit = android.widget.EditText(this).apply {
+                hint = "Model ${pref.substringBefore('_')}"
+                setText(council().getString(pref, defaultModel))
+                isSingleLine = true
+            }.also { layout.addView(it) }
+            button("Zapisz model ${pref.substringBefore('_')}") {
+                val model = modelEdit.text.toString().trim()
+                if (!model.matches(Regex("[A-Za-z0-9._/-]+")) || (pref == "gemini_model" && model.contains('/')))
+                    Toast.makeText(this, "Nieprawidłowa nazwa modelu", Toast.LENGTH_LONG).show()
+                else { council().edit().putString(pref, model).apply(); Toast.makeText(this, "Zapisano model", Toast.LENGTH_SHORT).show() }
             }
         }
         fun councilMode(m: com.example.algohud.council.CouncilMode, note: String) {
@@ -207,7 +240,7 @@ class MainActivity : ComponentActivity() {
             appendLine("Domyślny tryb: DRY_RUN (paper trading)")
             val cp = getSharedPreferences("council", MODE_PRIVATE)
             appendLine("Rada AI: " + (cp.getString(com.example.algohud.council.AgentCouncil.PREF_MODE, null) ?: "ADVISORY") +
-                " • klucz API: " + (if (cp.getString(com.example.algohud.council.AgentCouncil.PREF_KEY, null).isNullOrBlank()) "❌ brak" else "✅") +
+                " • " + AiSettings.route(cp).name + " • klucze: " + (if (AiSettings.hasKeys(cp)) "✅" else "❌ uzupełnij") +
                 " • nawigator AI: " + (if (cp.getBoolean("ai_nav", true)) "✅" else "wył."))
             val paused = AutoExecutionService.navPausedUntil > System.currentTimeMillis()
             append("Samonaprawa widoku: " + (if (getSharedPreferences("ui", MODE_PRIVATE).getBoolean("nav_autonomy", true)) "wszystkie tryby" else "tylko AUTO") +
