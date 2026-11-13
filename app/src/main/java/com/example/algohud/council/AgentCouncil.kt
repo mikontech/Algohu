@@ -103,7 +103,8 @@ class AgentCouncil(
             onFailure = { e ->
                 if (e is CancellationException && isKilled()) CouncilDecision.Veto("przerwane kill-switchem", lines)
                 else {
-                    val why = "rada AI niedostępna: ${e.message?.take(90) ?: e.javaClass.simpleName}"
+                    val why = if (e is kotlinx.coroutines.TimeoutCancellationException) "rada AI: przekroczony czas całej debaty (40 s)"
+                        else "rada AI niedostępna: ${e.message?.take(140) ?: e.javaClass.simpleName}"
                     say("⚠️ $why")
                     Ntfy.send("🧠 ${ctx.instrument}: $why", if (m == CouncilMode.GATE) "wejście zablokowane (fail-closed)" else "tryb doradczy – bot działa dalej",
                         Ntfy.HIGH, "warning", key = "council-err", minGapMs = 30 * 60_000L)

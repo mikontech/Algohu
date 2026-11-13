@@ -120,7 +120,7 @@ class MainActivity : ComponentActivity() {
         TextView(this).apply {
             text = "Gemini + Groq: Gemini = Obserwator/Dowódca/nawigator; Groq = Strateg/Sceptyk. " +
                 "Wybrany dostawca otrzymuje dane analizy, a przy ocenie ekranu także zrzut XTB. " +
-                "Po 502/503/504 jedna ponowna próba u tego samego dostawcy. Klucze zostają po restarcie i aktualizacji APK; odinstalowanie usuwa dane."
+                "Po przerwaniu połączenia, timeout lub 502/503/504 jedna ponowna próba. Klucze zostają po restarcie i aktualizacji APK; odinstalowanie usuwa dane."
         }.also { layout.addView(it) }
         for (provider in listOf(AiProvider.GEMINI, AiProvider.GROQ, AiProvider.CLAUDE)) {
             val keyEdit = android.widget.EditText(this).apply {

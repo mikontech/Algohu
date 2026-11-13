@@ -112,4 +112,39 @@ class AiProvidersTest {
         assertEquals(1, calls)
         assertEquals(2_200_000L, p.getLong("ai_backoff_GROQ", 0))
     }
+    @Test fun networkDiagnosticsNeverLeakExceptionMessage() {
+        val errors = listOf(java.net.UnknownHostException("SECRET"),
+            java.net.SocketTimeoutException("SECRET"), javax.net.ssl.SSLHandshakeException("SECRET"))
+        val messages = errors.map { ClaudeClient.networkFailure(AiProvider.GEMINI, it) }
+        assertTrue(messages[0].message!!.contains("DNS"))
+        assertTrue(messages[1].message!!.contains("timeout"))
+        assertTrue(messages[2].message!!.contains("TLS"))
+        assertFalse(messages[2].retryable)
+        messages.forEach { assertFalse(it.message!!.contains("SECRET")) }
+    }
+
+    @Test fun transientConnectionFailureIsRetriedOnce() = runTest {
+        var calls = 0
+        val http = OkHttpClient.Builder().addInterceptor { chain ->
+            calls++
+            if (calls == 1) throw java.net.SocketTimeoutException("SECRET")
+            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                .body("""{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"{\"ok\":true}"}]}}]}""".toResponseBody()).build()
+        }.build()
+        val client = ClaudeClient({ "key" }, http)
+        assertTrue(client.askJson("gemini:test", "s", "u").getBoolean("ok"))
+        assertEquals(2, calls)
+    }
+
+    @Test fun tlsFailureIsNotRetried() = runTest {
+        var calls = 0
+        val http = OkHttpClient.Builder().addInterceptor {
+            calls++; throw javax.net.ssl.SSLHandshakeException("SECRET")
+        }.build()
+        val e = runCatching { ClaudeClient({ "key" }, http).askJson("gemini:test", "s", "u") }.exceptionOrNull()
+        assertTrue(e!!.message!!.contains("TLS"))
+        assertFalse(e.message!!.contains("SECRET"))
+        assertEquals(1, calls)
+    }
+
 }

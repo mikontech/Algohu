@@ -21,12 +21,13 @@ import kotlin.coroutines.resumeWithException
 class ClaudeClient(
     private val apiKey: () -> String?,
     private val http: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS).callTimeout(25, TimeUnit.SECONDS)
+        .connectTimeout(10, TimeUnit.SECONDS).readTimeout(25, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS).callTimeout(30, TimeUnit.SECONDS)
         .retryOnConnectionFailure(false).followRedirects(false).build(),
     private val providerKey: (AiProvider) -> String? = { apiKey() },
     private val limits: AiLimits? = null
 ) {
-    class ApiException(message: String, val status: Int? = null) : IOException(message)
+    class ApiException(message: String, val status: Int? = null, val retryable: Boolean = false) : IOException(message)
 
     suspend fun askJson(model: String, system: String, userText: String,
                         imageJpegBase64: String? = null, maxTokens: Int = 700): JSONObject {
@@ -39,7 +40,7 @@ class ClaudeClient(
             try {
                 return withContext(Dispatchers.IO) { http.newCall(req).await(provider) }
             } catch (e: ApiException) {
-                if (attempt == 1 || e.status !in listOf(502, 503, 504)) throw e
+                if (attempt == 1 || (!e.retryable && e.status !in listOf(502, 503, 504))) throw e
                 kotlinx.coroutines.delay(1500)
             }
         }
@@ -50,7 +51,7 @@ class ClaudeClient(
         cont.invokeOnCancellation { cancel() }
         enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                if (cont.isActive) cont.resumeWithException(ApiException("${provider.name}: błąd połączenia"))
+                if (cont.isActive) cont.resumeWithException(networkFailure(provider, e))
             }
             override fun onResponse(call: Call, response: Response) {
                 response.use { r ->
@@ -71,7 +72,7 @@ class ClaudeClient(
                         parse(provider, r.body?.string().orEmpty())
                     }
                     if (cont.isActive) result.fold({ cont.resume(it) }, {
-                        cont.resumeWithException(if (it is ApiException) it else ApiException("${provider.name}: nieprawidłowa odpowiedź JSON"))
+                        cont.resumeWithException(if (it is ApiException) it else if (it is IOException) networkFailure(provider, it) else ApiException("${provider.name}: nieprawidłowa odpowiedź JSON"))
                     })
                 }
             }
@@ -79,6 +80,19 @@ class ClaudeClient(
     }
 
     companion object {
+        /** Stałe opisy: nigdy surowe wyjątki mogące zawierać URL, klucz lub treść żądania. */
+        internal fun networkFailure(provider: AiProvider, error: IOException): ApiException {
+            val (detail, retry) = when (error) {
+                is java.net.UnknownHostException -> "DNS: nie można odnaleźć serwera; sprawdź sieć / prywatny DNS" to true
+                is javax.net.ssl.SSLException -> "TLS: nie można zestawić bezpiecznego połączenia; sprawdź datę i VPN" to false
+                is java.net.SocketTimeoutException -> "timeout odczytu lub połączenia – serwer nie odpowiedział na czas" to true
+                is java.io.InterruptedIOException -> "przekroczony czas całego zapytania (30 s)" to true
+                is java.net.ConnectException -> "nie można połączyć z serwerem; sprawdź sieć / VPN" to true
+                else -> "przerwane połączenie podczas przesyłania danych" to true
+            }
+            return ApiException("${provider.name}: $detail", retryable = retry)
+        }
+
         fun configured(prefs: android.content.SharedPreferences) = ClaudeClient(
             { AiSettings.key(prefs, AiProvider.CLAUDE) },
             providerKey = { AiSettings.key(prefs, it) }, limits = AiLimits(prefs))
