@@ -590,7 +590,7 @@ class OverlayService : LifecycleService() {
         tvPredict.setTextColor(
             when (s.predictionUp) { true -> 0xFF66BB6A.toInt(); false -> 0xFFEF5350.toInt(); null -> 0xFFBDBDBD.toInt() }
         )
-        tvStats.text = listOf(s.learning, s.paperStats).filter { it.isNotBlank() }.joinToString("\n")
+        tvStats.text = listOf(s.candles, s.learning, s.paperStats).filter { it.isNotBlank() }.joinToString("\n")
         if (s.status.isNotEmpty()) tvStatus.text = s.status
         tvScreen.visibility = View.GONE
         tvCompact.text = s.compact.ifBlank { s.lastMessage }

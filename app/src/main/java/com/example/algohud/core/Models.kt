@@ -125,6 +125,8 @@ data class HudState(
     /** Czytelny, wielolinijkowy stan bota (prawdziwe wartości z XTB i księgi bota). */
     val status: String = "",
     val learning: String = "",
+    /** Bieżący monitoring M1/M5, aktualizowany lokalnie co sekundę. */
+    val candles: String = "",
     /** Jedna linia: czy dane są wiarygodne i jak świeże (XTB / feed). */
     val dataStatus: String = "",
     /** Plan bota: LONG/SHORT/czekam, na co czeka, kiedy zamknie. */

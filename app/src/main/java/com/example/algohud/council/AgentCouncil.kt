@@ -211,8 +211,11 @@ class AgentCouncil(
             appendLine("CENA TERAZ: ${us(c.priceNow)}  SPREAD: ${us(c.spread)}  PRZESUNIĘCIE XTB: ${us(c.xtbShift)} (cena w XTB = cena bota + przesunięcie)")
             appendLine("WOLNE ŚRODKI: ${c.freeFunds?.let { us(it) + " zł" } ?: "?"}  WYNIK DNIA: ${us(c.dailyPnl)} zł  SENTYMENT NEWSÓW: ${us(c.newsSentiment)}")
             if (c.botNotes.isNotEmpty()) appendLine("NOTATKI BOTA: " + c.botNotes.joinToString(" | "))
-            appendLine("M5 ostatnie 24 (O,H,L,C): ${bars(c.m5, 24)}")
-            appendLine("M1 ostatnie 30 (O,H,L,C): ${bars(c.m1, 30)}")
+            if (c.candleReport.isNotBlank()) appendLine(c.candleReport) else {
+                appendLine("M5 ostatnie 24 ZAMKNIĘTE (O,H,L,C): ${bars(c.m5, 24)}")
+                appendLine("M1 ostatnie 30 ZAMKNIĘTE (O,H,L,C): ${bars(c.m1, 30)}")
+                appendLine("Brak szczegółowego raportu świec i świecy w budowie.")
+            }
             if (c.awareness.isNotBlank()) { appendLine("STAN APLIKACJI I EKRANU:"); appendLine(c.awareness) }
         }
     }

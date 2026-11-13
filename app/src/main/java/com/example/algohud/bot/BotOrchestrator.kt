@@ -1102,7 +1102,11 @@ class BotOrchestrator(
         scope.launch {
             while (isActive) {
                 delay(1_000)
-                guarded("zegar świec") { lock.withLock { candleClock(System.currentTimeMillis()) } }
+                guarded("zegar świec") { lock.withLock {
+                    val now = System.currentTimeMillis()
+                    candleClock(now)
+                    _hud.update { it.copy(candles = candleSnapshot(hudLearningInstrument, now).summary()) }
+                } }
             }
         }
         scope.launch {
@@ -1291,9 +1295,12 @@ class BotOrchestrator(
         }
         aiManage(inst, px, ts)
         countTick(inst, ts)
-        for (tf in Learner.TIMEFRAMES) {
+        // Aktualizuj oba interwały przed oceną sygnału: rada musi widzieć ten sam tick na M1 i M5.
+        val newlyClosed = Learner.TIMEFRAMES.mapNotNull { tf ->
+            agg(inst, tf).onTick(px, ts)?.let { tf to it }
+        }
+        for ((tf, closed) in newlyClosed) {
             val a = agg(inst, tf)
-            val closed = a.onTick(px, ts) ?: continue
             if (tf == Learner.M1) onM1Closed(inst, a.closed())
             // Instrumenty bez historii (lub bez cen w tle): zapisujemy świece – nauka rośnie z każdym dniem i przetrwa restart.
             if (!hasBackground(inst) || inst in noHistory) runCatching { barStore.append(inst, tf, closed) }
@@ -1975,6 +1982,14 @@ class BotOrchestrator(
 
     private fun us(v: Double?) = v?.let { String.format(java.util.Locale.US, "%.2f", it) } ?: "—"
 
+    /** Wywołuj pod lock, aby M1, M5 i znacznik ticka pochodziły z jednego odczytu. */
+    private fun candleSnapshot(inst: String, now: Long): CandleWatch.Snapshot = CandleWatch.snapshot(
+        aggregators["$inst@${Learner.M1}"]?.closed().orEmpty(),
+        aggregators["$inst@${Learner.M5}"]?.closed().orEmpty(),
+        aggregators["$inst@${Learner.M1}"]?.current(),
+        aggregators["$inst@${Learner.M5}"]?.current(), now, lastPx[inst]?.second
+    )
+
     private suspend fun councilContext(inst: String, order: OrderRequest): CouncilContext {
         val now = System.currentTimeMillis()
         val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
@@ -1990,7 +2005,9 @@ class BotOrchestrator(
             botNotes = listOfNotNull(compassLine(inst), usOpenLine(inst, now), traderNote[inst], smcNote[inst]),
             xtbShift = q?.let { basis(inst, it) } ?: 0.0,
             awareness = awareness(inst),
-            untrackedXtbRows = rows
+            untrackedXtbRows = rows,
+            createdAt = now,
+            candleReport = candleSnapshot(inst, now).report()
         )
     }
 

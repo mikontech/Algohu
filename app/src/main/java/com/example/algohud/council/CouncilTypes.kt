@@ -32,7 +32,9 @@ data class CouncilContext(
     val awareness: String = "",
     /** Wiersze otwartych pozycji widoczne na bilecie XTB tego instrumentu, których bot NIE ma w księdze. */
     val untrackedXtbRows: Int = 0,
-    val createdAt: Long = System.currentTimeMillis()
+    val createdAt: Long = System.currentTimeMillis(),
+    /** Odczyt świec zamkniętych i bieżących z tego samego momentu. */
+    val candleReport: String = ""
 )
 
 data class ObserverReport(

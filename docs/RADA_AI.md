@@ -65,3 +65,21 @@ Jeśli XTB blokuje zrzuty (FLAG_SECURE), Obserwator dostaje tekst drzewa widokó
 ## Klucz API
 Klucz Anthropic wpisuje się w aplikacji (prefs `council_api_key`). Nie wolno go wkładać do kodu ani do sekretów
 GitHub Actions – APK z artefaktów publicznego repo może pobrać każdy.
+
+## Dokładniejsza obserwacja świec
+
+`CandleWatch` liczy geometrię OHLC i relacje świec z istniejącego feedu bota. M1 i M5
+są aktualizowane tym samym tickiem przed oceną strategii. Lokalny HUD w Szczegółach
+odświeża podsumowanie co sekundę; częstotliwość źródła cen pozostaje bez zmian.
+Rada otrzymuje snapshot przy kandydacie na wejście, a nie wywołanie API co sekundę.
+
+Raport zawiera 30 zamkniętych M1 i 24 M5 z czasem UTC, korpusy, knoty, położenie
+zamknięcia w zakresie, geometrię ostatnich sześciu świec, objęcia, inside/outside bar,
+zamknięcia poza H/L poprzedniej świecy i powroty do jej zakresu. Świeca w budowie ma
+osobną sekcję: upływ czasu, czas do końca i wstępne relacje. Nie jest potwierdzonym sygnałem.
+
+Oznaczane są luki, błędny OHLC, nieaktualna świeca oraz wiek ceny powyżej 10 sekund
+(próg informacyjny, nie dodatkowa bramka wykonania). Brakujące świece nie są uzupełniane.
+Nie ma danych o wolumenie. OHLC feedu nie musi pokrywać się z OHLC XTB; przesunięcie
+cen nie gwarantuje zgodności knotów. Analiza nie zmienia parametrów ryzyka ani sama
+nie otwiera/zamyka pozycji. W GATE stanowi dodatkowe dane do oceny rady.
