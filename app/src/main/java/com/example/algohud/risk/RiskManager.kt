@@ -62,6 +62,19 @@ class RiskManager(
     }
 
     private val mutex = Mutex()
+    private val _entriesPaused = MutableStateFlow(prefs.getBoolean("entries_paused", false))
+    val entriesPaused: StateFlow<Boolean> = _entriesPaused.asStateFlow()
+    fun pauseEntries(paused: Boolean) {
+        _entriesPaused.value = paused
+        prefs.edit().putBoolean("entries_paused", paused).apply()
+    }
+    private fun lossLimit(): Double = prefs.getString("session_loss_limit", null)?.toDoubleOrNull()
+        ?.takeIf { it.isFinite() && it > 0 } ?: (dayStartEquity * config.maxDailyLossPct)
+    suspend fun remainingBudget(): Double? = mutex.withLock {
+        rolloverLocked()
+        lossLimit().takeIf { it > 0 }?.let { (it - (-_dailyPnl.value).coerceAtLeast(0.0)).coerceAtLeast(0.0) }
+    }
+
 
     /** Przerwa po stratnej transakcji – profil agresywny skraca ją (ustawiane przez orkiestrator). */
     @Volatile var cooldownAfterLossMs: Long = config.cooldownAfterLossMs
@@ -189,7 +202,9 @@ class RiskManager(
         val existing = positions[order.symbol]
         val reducing = existing != null && existing.side != order.side &&
             order.quantity <= existing.quantity + 1e-12
+        if (order.reduceOnly && !reducing) return@withLock reject("Brak zgodnej pozycji do zamknięcia")
         if (reducing) return@withLock Decision.Approved(order)
+        if (_entriesPaused.value) return@withLock reject("STOP WEJŚĆ aktywny")
 
         if (_killSwitch.value) return@withLock reject("KILL-SWITCH aktywny: $killReason")
         if (equity <= 0.0 || dayStartEquity <= 0.0) return@withLock reject("Brak danych o kapitale")
@@ -227,7 +242,7 @@ class RiskManager(
                 return@withLock reject("Zbyt duża ekspozycja (dźwignia > %.0f×)".format(leverage(order.tier)))
             }
         }
-        val dailyLimit = dayStartEquity * config.maxDailyLossPct
+        val dailyLimit = lossLimit()
         val currentLoss = (-_dailyPnl.value).coerceAtLeast(0.0)
         if (currentLoss + tradeRisk > dailyLimit) {
             return@withLock reject("Trafienie SL przekroczyłoby dzienny limit straty")
@@ -415,7 +430,7 @@ class RiskManager(
         _dailyPnl.value = realizedToday + unreal(false)          // prawdziwe konto → limit dzienny / KILL
         _dailyPnlPaper.value = realizedPaperToday + unreal(true)
         if (dayStartEquity > 0 && !_killSwitch.value &&
-            _dailyPnl.value <= -dayStartEquity * config.maxDailyLossPct
+            _dailyPnl.value <= -lossLimit()
         ) {
             setKillLocked(true, REASON_DAILY_LOSS)
         }

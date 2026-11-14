@@ -51,6 +51,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.delay
+import com.example.algohud.core.HudUiState
 import okhttp3.OkHttpClient
 import java.math.BigDecimal
 import java.util.concurrent.TimeUnit
@@ -92,6 +95,21 @@ class OverlayService : LifecycleService() {
             CoroutineExceptionHandler { _, t -> Log.e("OverlayService", "Błąd bota", t) }
     )
 
+    private lateinit var btnStopEntries: Button
+    private lateinit var btnCloseBot: Button
+    private lateinit var holdProgress: android.widget.ProgressBar
+    private lateinit var tvProtection: TextView
+    private lateinit var tvFreshness: TextView
+    private lateinit var tvSpreadCost: TextView
+    private lateinit var tvBudget: TextView
+    private val hudUi = MutableStateFlow(HudUiState())
+    private var renderedUi: HudUiState? = null
+    private var closeBusy = false
+    private val lastSpread = MutableStateFlow<com.example.algohud.risk.SpreadCost?>(null)
+    @Volatile private var lastCandidate: com.example.algohud.core.OrderRequest? = null
+    @Volatile private var lastCandidateAt = 0L
+    private var detailDialog: android.app.AlertDialog? = null
+    private lateinit var tradeJournal: TradeJournal
     private lateinit var wm: WindowManager
     private lateinit var params: WindowManager.LayoutParams
     private var rootView: LinearLayout? = null
@@ -187,7 +205,7 @@ class OverlayService : LifecycleService() {
         super.onStartCommand(intent, flags, startId)
         when (intent?.action) {
             ACTION_STOP -> { uiPrefs().edit().putBoolean("autostart", false).apply(); stopSelf() }
-            ACTION_KILL -> if (::engine.isInitialized) { stopAi(); botScope.launch { engine.flattenAll("KILL z powiadomienia") } }
+            ACTION_KILL -> if (::engine.isInitialized) { engine.stopEntries() }
             ACTION_MODE -> if (::engine.isInitialized) {
                 val m = runCatching { ExecutionMode.valueOf(intent.getStringExtra(EXTRA_VALUE)!!) }.getOrNull()
                 if (m != null) {
@@ -206,6 +224,7 @@ class OverlayService : LifecycleService() {
                 uiPrefs().edit().putBoolean("shield", on).apply()
                 toast(if (on) "🛡 Tarcza dotyku włączona (działa w trybie AUTO)" else "Tarcza dotyku wyłączona")
             }
+            "RESUME_ENTRIES" -> if (::risk.isInitialized) risk.pauseEntries(false)
             ACTION_RESET_KILL -> if (::risk.isInitialized) botScope.launch {
                 toast(if (risk.resetKillSwitch()) "Kill-switch zdjęty" else "Blokada dziennego limitu – do jutra")
             }
@@ -216,6 +235,9 @@ class OverlayService : LifecycleService() {
     override fun onDestroy() {
         stopAi()
         AutoExecutionService.aiNavigator = null
+        detailDialog?.dismiss()
+        AutoExecutionService.entryBlocked = null
+        AutoExecutionService.entryCheck = null
         botScope.cancel()
         setShield(false)
         rootView?.let { runCatching { wm.removeView(it) } }
@@ -234,6 +256,7 @@ class OverlayService : LifecycleService() {
         val news = MarketNewsEngine(botScope, http, MarketNewsEngine.Config(), KeywordSentimentScorer())
 
         val journal = TradeJournal(getSharedPreferences("journal", MODE_PRIVATE))
+        tradeJournal = journal
         risk = RiskManager(
             prefs = getSharedPreferences("risk_state", MODE_PRIVATE),
             config = RiskManager.Config(),
@@ -249,6 +272,13 @@ class OverlayService : LifecycleService() {
 
         engine = ExecutionEngine(
             risk, executor, initialMode = ExecutionMode.DRY_RUN,
+            entryGate = { order ->
+                lastCandidate = order; lastCandidateAt = System.currentTimeMillis()
+                val threshold = uiPrefs().getString("spread_limit_pct", "25")?.toDoubleOrNull() ?: 25.0
+                val cost = com.example.algohud.risk.SpreadGuard.assess(order, AutoExecutionService.screenQuote.value, threshold, System.currentTimeMillis())
+                lastSpread.value = cost
+                cost.block
+            },
             reverseEntries = { getSharedPreferences("ui", MODE_PRIVATE).getBoolean("reverse_entries", true) },
             // AUTO dopiero po udokumentowanym dodatnim wyniku na papierze.
             positionProbe = { sym -> AutoExecutionService.instance?.xtbPositionExists(sym) },
@@ -259,6 +289,11 @@ class OverlayService : LifecycleService() {
         council = null
         aiNav = null
         AutoExecutionService.aiNavigator = null
+        AutoExecutionService.entryBlocked = { risk.entriesPaused.value || risk.killSwitch.value }
+        AutoExecutionService.entryCheck = { order ->
+            com.example.algohud.risk.SpreadGuard.assess(order, AutoExecutionService.screenQuote.value,
+                uiPrefs().getString("spread_limit_pct", "25")?.toDoubleOrNull() ?: 25.0, System.currentTimeMillis()).block
+        }
         AutoExecutionService.navAbort = { risk.killSwitch.value }
         AutoExecutionService.navAutonomy = uiPrefs().getBoolean("nav_autonomy", true)
 
@@ -331,52 +366,49 @@ class OverlayService : LifecycleService() {
         btnConfirm = actionButton("✔ Potwierdź", 0xFF1565C0.toInt()) {
             botScope.launch { engine.confirmPending() }
         }.apply { visibility = View.GONE }
-        // HUD bez przycisków sterowania – bot działa sam. Zostaje tylko awaryjny KILL (sterowanie: aplikacja Algo HUD).
+        tvCompact.typeface = android.graphics.Typeface.MONOSPACE
+        tvCompact.setLines(2)
+        tvCompact.ellipsize = TextUtils.TruncateAt.END
+        tvCompact.setOnClickListener { showHudDetails() }
+        fun metric(): TextView = TextView(this).apply {
+            setTextColor(Color.WHITE); textSize = 11f; typeface = android.graphics.Typeface.MONOSPACE
+            setLines(1); ellipsize = TextUtils.TruncateAt.END
+            setOnClickListener { showHudDetails() }
+        }
+        tvProtection = metric(); tvFreshness = metric(); tvSpreadCost = metric(); tvBudget = metric()
+        btnStopEntries = actionButton("STOP WEJŚĆ", 0xFF37474F.toInt()) { engine.stopEntries() }
+        btnCloseBot = actionButton("PRZYTRZYMAJ: ZAMKNIJ", 0xFF7F0000.toInt()) { }
+        btnCloseBot.textSize = 10f
+        holdProgress = android.widget.ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 1000; progress = 0 }
+        installCloseHold()
         val killRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(actionButton("⛔ KILL", 0xFF7F0000.toInt(), longPress = true) {
-                stopAi() // najpierw przerwij debatę i nawigację AI – zwalnia blokadę UI dla zamykania pozycji
-                botScope.launch { engine.flattenAll("KILL ręczny z HUD") }
-            })
-            addView(actionButton("⏸", 0xFF37474F.toInt()) {
-                val paused = AutoExecutionService.navPausedUntil > System.currentTimeMillis()
-                AutoExecutionService.navPausedUntil = if (paused) 0L else System.currentTimeMillis() + 10 * 60_000L
-                toast(if (paused) "▶ Samonaprawa widoku wznowiona" else "⏸ Samonaprawa widoku wstrzymana na 10 min – możesz używać telefonu")
-            })
-            btnDetails = actionButton(if (showDetails) "▴ Zwiń" else "ℹ️ Szczegóły", 0xFF37474F.toInt()) {
-                showDetails = !showDetails
-                getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("hud_details", showDetails).apply()
-                btnDetails.text = if (showDetails) "▴ Zwiń" else "ℹ️ Szczegóły"
-                applyDetailsVisibility()
-            }
-            btnDetails.visibility = View.GONE
-            addView(btnConfirm)
+            addView(btnStopEntries, LinearLayout.LayoutParams(0, dp(48), 1f))
+            addView(btnCloseBot, LinearLayout.LayoutParams(0, dp(48), 1.35f).apply { leftMargin = dp(16) })
         }
+        btnDetails = actionButton("SZCZEGÓŁY", 0xFF37474F.toInt()) { showHudDetails() }
         fun full() = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         listOf(tvStatus, tvPlan, tvPredict, tvStats, tvMessage).forEach { it.maxWidth = Int.MAX_VALUE; it.maxLines = 12 }
-        tvCompact.maxWidth = Int.MAX_VALUE; tvCompact.maxLines = 14
+        tvCompact.maxWidth = Int.MAX_VALUE; tvCompact.setLines(2)
         tvStatus.setTextColor(0xFFEEEEEE.toInt())
         panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = roundedBg(0xE8121212.toInt(), 14)
             setPadding(dp(10), dp(8), dp(10), dp(8))
             visibility = View.GONE
-            addView(tvCompact, full())
-            addView(tvStatus, full())
-            addView(tvPlan, full().apply { topMargin = dp(4) })
-            addView(tvPredict, full().apply { topMargin = dp(4) })
-            addView(tvStats, full().apply { topMargin = dp(4) })
-            addView(tvMessage, full().apply { topMargin = dp(4) })
-            addView(tvCouncil, full().apply { topMargin = dp(4) })
-            addView(tvDebate, full().apply { topMargin = dp(2) })
-            addView(killRow, wrap().apply { topMargin = dp(6) })
+            addView(tvCompact, LinearLayout.LayoutParams(-1, dp(38)))
+            for (metric in listOf(tvProtection, tvFreshness, tvSpreadCost, tvBudget)) addView(metric, LinearLayout.LayoutParams(-1, dp(19)))
+            addView(killRow, LinearLayout.LayoutParams(-1, dp(48)).apply { topMargin = dp(4) })
+            addView(holdProgress, LinearLayout.LayoutParams(-1, dp(4)))
+            addView(btnConfirm, LinearLayout.LayoutParams(-1, dp(40)))
+
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             addView(bubble)
             // Stała szerokość panelu (cały tekst widoczny, bez ucinania) – maks. 360 dp albo szerokość ekranu.
             val w = minOf(resources.displayMetrics.widthPixels - dp(12), dp(360))
-            addView(panel, LinearLayout.LayoutParams(w, LinearLayout.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
+            addView(panel, LinearLayout.LayoutParams(w, dp(230)).apply { topMargin = dp(4) })
         }
 
         params = WindowManager.LayoutParams(
@@ -388,8 +420,8 @@ class OverlayService : LifecycleService() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = dp(16)
-            y = dp(160)
+            x = uiPrefs().getInt("hud_x", 0)
+            y = uiPrefs().getInt("hud_y", dp(28))
         }
 
         bubble.setOnTouchListener(DragListener())
@@ -419,7 +451,9 @@ class OverlayService : LifecycleService() {
                     if (!dragging && hypot(dx, dy) > slop) dragging = true
                     if (dragging) moveTo(startX + dx.toInt(), startY + dy.toInt())
                 }
-                MotionEvent.ACTION_UP -> if (dragging) snapToEdge() else { v.performClick(); toggleExpanded() }
+                MotionEvent.ACTION_UP -> if (dragging) {
+                    uiPrefs().edit().putInt("hud_x", params.x).putInt("hud_y", params.y).apply()
+                } else { v.performClick(); toggleExpanded() }
             }
             return true
         }
@@ -451,6 +485,11 @@ class OverlayService : LifecycleService() {
 
     private fun toggleExpanded() {
         expanded = !expanded
+        val proposed = android.graphics.Rect(params.x, params.y + bubble.height, params.x + panel.layoutParams.width, params.y + bubble.height + dp(234))
+        if (expanded && AutoExecutionService.hudObstacles.any { android.graphics.Rect.intersects(it, proposed) }) {
+            expanded = false
+            toast("Przesuń HUD: ten obszar zasłania wykres lub przyciski XTB")
+        }
         panel.visibility = if (expanded) View.VISIBLE else View.GONE
     }
 
@@ -478,10 +517,19 @@ class OverlayService : LifecycleService() {
     // ───────────── Stan → UI ─────────────
 
     private fun observeState() {
-        lifecycleScope.launch { bot.hud.collect { render(it) } }
+        // Market/strategy streams are not sampled. Only the rendering projection runs at 5 Hz.
+        lifecycleScope.launch {
+            while (true) { projectHud(); delay(200) }
+        }
+        lifecycleScope.launch { hudUi.distinctUntilChanged { a, b -> a == b }.collect { renderUi(it) } }
+        lifecycleScope.launch { engine.operation.collect { projectHud() } }
+        lifecycleScope.launch { risk.entriesPaused.collect { projectHud() } }
+        lifecycleScope.launch { risk.killSwitch.collect { projectHud() } }
+        lifecycleScope.launch { AutoExecutionService.protectionStatus.collect { projectHud() } }
+        lifecycleScope.launch { AutoExecutionService.brokerReading.map { it?.row?.signature to it?.row?.sl }.distinctUntilChanged().collect { projectHud() } }
         lifecycleScope.launch {
             engine.pendingConfirmation.collect { pending ->
-                btnConfirm.visibility = if (pending != null) View.VISIBLE else View.GONE
+                btnConfirm.visibility = if (pending != null) View.VISIBLE else View.INVISIBLE
                 if (pending != null && !expanded) toggleExpanded()
             }
         }
@@ -528,59 +576,139 @@ class OverlayService : LifecycleService() {
 
     }
 
-    private fun render(s: HudState) {
-        val arrow = when {
-            s.sentiment > 0.15 -> "▲"
-            s.sentiment < -0.15 -> "▼"
-            else -> "■"
+    private suspend fun projectHud() {
+        val now = System.currentTimeMillis()
+        val s = bot.hud.value
+        val op = engine.operation.value
+        val symbols = risk.openSymbols()
+        val pos = symbols.firstOrNull()?.let { risk.position(it) }
+        val inst = pos?.symbol ?: AutoExecutionService.screenQuote.value?.instrument ?: s.symbol
+        val reading = AutoExecutionService.brokerReading.value?.takeIf {
+            it.quote.instrument == inst && pos != null && it.row.side == pos.side &&
+                it.row.volume?.let { v -> kotlin.math.abs(kotlin.math.abs(v) - pos.quantity) < 1e-8 } == true &&
+                now - it.quote.timestamp in 0..3000
         }
-        val q = s.screen?.takeIf { it.isFresh() }
-        bubble.text = when {
-            s.killSwitch -> "⛔ KILL"
-            q?.instrument != null -> "${q.instrument} • ${s.mode.name}"
-            else -> "Algo HUD • ${s.mode.name}"
+        val protectionOp = AutoExecutionService.protectionStatus.value
+        val writing = protectionOp.active && protectionOp.symbol == inst
+        val slMissing = pos != null && !pos.paper && reading?.row?.sl == null
+        val protection = when {
+            pos == null -> "SL: —"
+            pos.paper -> "SL PAPER: %.2f".format(pos.stopPrice)
+            writing -> "SL: ZAPISUJĘ…"
+            reading == null -> "SL: BRAK POTWIERDZENIA"
+            reading.row.sl == null -> "SL: BRAK USTAWIONEGO STOPA"
+            else -> "SL %.2f ✓".format(reading.row.sl)
         }
-        tvScreen.text = when {
-            q == null -> "XTB: niewidoczne"
-            q.instrument == null -> "${q.appLabel}: otwórz ekran instrumentu"
-            else -> buildString {
-                append(q.appLabel).append(": ").append(q.instrument)
-                q.bid?.let { append("  S ").append(fmtPrice(it)) }
-                q.ask?.let { append("  K ").append(fmtPrice(it)) }
-                append("  📰 %+.2f (%d)".format(s.screenSentiment, s.screenNews))
-            }
+        val status = when {
+            risk.killSwitch.value -> "BLOKADA RYZYKA • sprawdź szczegóły"
+            op.active -> "${op.text} ${op.symbol}"
+            pos != null -> (if (pos.paper) "PAPER " else if (reading != null) "POTWIERDZONY " else "WERYFIKUJĘ ") +
+                (if (pos.side == Side.BUY) "LONG " else "SHORT ") + inst
+            op.text.isNotEmpty() && now - op.at in 0..15000 -> op.text
+            risk.entriesPaused.value -> "STOP WEJŚĆ • ochrona działa"
+            else -> "CZEKAM NA WEJŚCIE • $inst"
         }
-        (bubble.background as GradientDrawable).setColor(
-            when {
-                s.killSwitch -> 0xE0B71C1C.toInt()
-                s.sentiment > 0.15 -> 0xE01B5E20.toInt()
-                s.sentiment < -0.15 -> 0xE0880E4F.toInt()
-                else -> 0xE0202020.toInt()
-            }
-        )
-        tvStatus.text = "${s.symbol} • ${if (s.feedConnected) "● LIVE" else "○ offline"} • PnL dnia: %+.2f"
-            .format(s.dailyPnl)
-        tvMessage.text = s.lastMessage
-        setKeepScreenOn(s.mode == ExecutionMode.AUTO && !s.killSwitch)
-        val planText = listOf(s.dataStatus, s.plan).filter { it.isNotBlank() }.joinToString("\n")
-        tvPlan.visibility = if (planText.isBlank()) View.GONE else View.VISIBLE
-        tvPlan.text = planText
-        tvPredict.visibility = if (s.prediction.isBlank()) View.GONE else View.VISIBLE
-        tvPredict.text = s.prediction
-        tvPredict.setTextColor(
-            when (s.predictionUp) { true -> 0xFF66BB6A.toInt(); false -> 0xFFEF5350.toInt(); null -> 0xFFBDBDBD.toInt() }
-        )
-        tvStats.text = listOf(s.candles, s.learning, s.paperStats).filter { it.isNotBlank() }.joinToString("\n")
-        if (s.status.isNotEmpty()) tvStatus.text = s.status
-        tvScreen.visibility = View.GONE
-        tvCompact.text = s.compact.ifBlank { s.lastMessage }
-        applyDetailsVisibility()
+        val quote = AutoExecutionService.screenQuote.value?.takeIf { it.instrument == inst }
+        val age = quote?.let { now - it.timestamp }?.takeIf { it >= 0 }
+        val stale = age == null || age > 3000
+        val freshText = if (age == null) "XTB: BRAK ODCZYTU" else "XTB %.1f s%s".format(age / 1000.0, if (stale) " • NIEAKTUALNY" else "")
+        val candidate = lastCandidate?.takeIf { it.symbol == inst && now - lastCandidateAt in 0..30000 }
+        val cost = candidate?.let { com.example.algohud.risk.SpreadGuard.assess(it, quote,
+            uiPrefs().getString("spread_limit_pct", "25")?.toDoubleOrNull() ?: 25.0, now) }
+        val spread = if (cost?.amount != null && cost.percent != null) "SPREAD %.2f %s • %.1f%% R%s".format(cost.amount, cost.currency, cost.percent,
+            if (cost.block != null) " • STOP" else "") else if (candidate != null) "SPREAD: BRAK ODCZYTU • STOP" else "SPREAD: brak planowanego wejścia"
+        val remaining = risk.remainingBudget()
+        val budgetCurrency = AutoExecutionService.lastAccountCurrency ?: "wal.konta"
+        val budget = "POZOSTAŁO: " + (remaining?.let { "%.2f".format(it) } ?: "—") + " $budgetCurrency • bot*"
+        val closing = closeBusy || (op.active && op.text.startsWith("ZAMYKAM"))
+        val severity = if (risk.killSwitch.value || (slMissing && !writing && reading != null)) 2
+            else if (stale || slMissing || writing || op.active || cost?.block != null || risk.entriesPaused.value) 1 else 0
+        hudUi.value = HudUiState(status, protection, freshText, spread, budget, severity,
+            risk.entriesPaused.value, closing, pos?.symbol, pos?.openedAt,
+            "${if (op.active || !op.error) op.id + op.active else ""}|${protectionOp.id}:${protectionOp.active}:${protectionOp.error}|${pos?.openedAt}|${reading != null}|${risk.killSwitch.value}")
+    }
 
-        val key = "${s.mode}|${s.killSwitch}|${s.feedConnected}"
-        if (key != lastNotifKey) { // nie aktualizuj powiadomienia przy każdym ticku
-            lastNotifKey = key
-            val text = if (s.killSwitch) "⛔ KILL-SWITCH aktywny" else "Tryb ${s.mode} • ${if (s.feedConnected) "online" else "offline"}"
-            getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification(text))
+    private fun renderUi(s: HudUiState) {
+        val previous = renderedUi
+        fun update(view: TextView, text: String) { if (view.text.toString() != text) view.text = text }
+        update(tvCompact, s.status); update(tvProtection, s.protection); update(tvFreshness, s.freshness)
+        update(tvSpreadCost, s.spread); update(tvBudget, s.budget)
+        update(bubble, "HUD • ${engine.mode.value} • dotknij / przesuń")
+        val color = when (s.severity) { 2 -> 0xFFFF5252.toInt(); 1 -> 0xFFFFCA28.toInt(); else -> Color.WHITE }
+        tvCompact.setTextColor(color)
+        tvProtection.setTextColor(if (s.protection.contains("BRAK")) 0xFFFFCA28.toInt() else Color.WHITE)
+        update(btnStopEntries, if (s.paused) "WEJŚCIA STOP" else "STOP WEJŚĆ")
+        update(btnCloseBot, if (s.closing) "ZAMYKAM…" else "PRZYTRZYMAJ: ZAMKNIJ")
+        btnCloseBot.isEnabled = s.positionSymbol != null && !s.closing
+        if (previous != null && previous.eventKey != s.eventKey && android.os.SystemClock.uptimeMillis() - lastHaptic > 1000) {
+            tvCompact.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+            lastHaptic = android.os.SystemClock.uptimeMillis()
+        }
+        renderedUi = s
+        if (expanded && !closeBusy) {
+            val bounds = android.graphics.Rect()
+            panel.getGlobalVisibleRect(bounds)
+            if (AutoExecutionService.hudObstacles.any { android.graphics.Rect.intersects(it, bounds) }) {
+                expanded = false; panel.visibility = View.GONE
+            }
+        }
+        setKeepScreenOn(engine.mode.value == ExecutionMode.AUTO && !risk.killSwitch.value)
+    }
+    private var lastHaptic = 0L
+
+    private fun showHudDetails() {
+        detailDialog?.dismiss()
+        bot.detailsRequested = true
+        val s = bot.hud.value
+        val content = android.widget.ScrollView(this).apply {
+            addView(TextView(this@OverlayService).apply {
+                setPadding(dp(16), dp(12), dp(16), dp(12)); textSize = 13f
+                text = listOf(hudUi.value.status, hudUi.value.protection, hudUi.value.spread,
+                    "* Budżet: szacowana księga bota w walucie konta, z otwartym wynikiem feedu; nie pełny rachunek XTB.",
+                    "STOP WEJŚĆ nie zamyka pozycji. Wznawianie w ustawieniach aplikacji.",
+                    "Operacja: ${engine.operation.value.id} • ${engine.operation.value.text}",
+                    s.dataStatus, s.plan, s.prediction, s.paperStats, s.lastMessage,
+                    "Historia (księga bota):\n" + tradeJournal.all().takeLast(10).reversed().joinToString("\n") {
+                        "${it.symbol} ${it.side} %.2f %s".format(it.pnl, if (it.paper) "PAPER" else "szacunek")
+                    }).filter { it.isNotBlank() }.joinToString("\n\n")
+            })
+        }
+        detailDialog = android.app.AlertDialog.Builder(this).setTitle("Szczegóły HUD").setView(content)
+            .setPositiveButton("Zamknij", null).create().also { dialog ->
+                dialog.window?.setType(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY)
+                dialog.setOnDismissListener { bot.detailsRequested = false }
+                dialog.show()
+            }
+    }
+
+    private fun installCloseHold() {
+        var hold: kotlinx.coroutines.Job? = null
+        btnCloseBot.setOnTouchListener { view, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    hold?.cancel(); holdProgress.progress = 0
+                    val expected = hudUi.value
+                    if (expected.positionSymbol != null && expected.positionAt != null && !closeBusy) {
+                        hold = lifecycleScope.launch {
+                            val start = android.os.SystemClock.uptimeMillis()
+                            while (android.os.SystemClock.uptimeMillis() - start < 900) {
+                                holdProgress.progress = ((android.os.SystemClock.uptimeMillis() - start) * 1000 / 900).toInt()
+                                delay(16)
+                            }
+                            if (hudUi.value.positionAt != expected.positionAt || hudUi.value.positionSymbol != expected.positionSymbol) return@launch
+                            closeBusy = true; holdProgress.progress = 1000; projectHud()
+                            // Execution lives outside the press coroutine: ACTION_UP cannot cancel a submitted close.
+                            botScope.launch {
+                                try { engine.closeBotPosition(expected.positionSymbol, expected.positionAt) }
+                                finally { kotlinx.coroutines.withContext(Dispatchers.Main) { closeBusy = false; holdProgress.progress = 0; projectHud() } }
+                            }
+                        }
+                    }
+                }
+                MotionEvent.ACTION_MOVE -> if (event.x < 0 || event.y < 0 || event.x > view.width || event.y > view.height) { hold?.cancel(); holdProgress.progress = 0 }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { hold?.cancel(); if (!closeBusy) holdProgress.progress = 0 }
+            }
+            true
         }
     }
 
@@ -610,7 +738,7 @@ class OverlayService : LifecycleService() {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
-            .addAction(0, "⛔ KILL", pi(ACTION_KILL, 1))
+            .addAction(0, "STOP WEJŚĆ", pi(ACTION_KILL, 1))
             .addAction(0, "Zatrzymaj", pi(ACTION_STOP, 2))
             .build()
     }

@@ -17,6 +17,8 @@ android {
         buildConfigField("String", "GIT_SHA", "\"${(System.getenv("GITHUB_SHA") ?: "local").take(7)}\"")
     }
 
+    testOptions { unitTests.isReturnDefaultValues = true }
+
     buildFeatures {
         buildConfig = true
     }

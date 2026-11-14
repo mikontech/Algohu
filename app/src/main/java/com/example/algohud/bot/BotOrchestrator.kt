@@ -422,7 +422,11 @@ class BotOrchestrator(
     }
 
     /** Plan bota po ludzku: co robi teraz, na co czeka, kiedy zamknie. */
+    @Volatile var detailsRequested: Boolean = false
+    private var lastPlanRenderAt = 0L
     private suspend fun updatePlan(inst: String, now: Long) {
+        if (!detailsRequested && now - lastPlanRenderAt < 5000) return
+        lastPlanRenderAt = now
         val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
         val sh = q?.let { basis(inst, it) } ?: 0.0
         fun f(v: Double) = "%.2f".format(v + sh)
@@ -873,6 +877,7 @@ class BotOrchestrator(
     }
 
     private fun updatePredictionHud(inst: String) = runCatching {
+        if (!detailsRequested) return@runCatching
         val pr = predictors[inst] ?: return@runCatching
         val (hit, graded) = pr.hitStats()
         val acc = if (graded > 0) "%d/%d (%.0f%%)".format(hit, graded, hit * 100.0 / graded) else "brak ocen"
@@ -1714,7 +1719,7 @@ class BotOrchestrator(
         val pos = risk.position(inst)
         if (pos != null) {
             val state = if (aiTrades[inst]?.closing == true) "WYCHODZĘ" else "WEJŚCIE ${hhmm(pos.openedAt)} • W POZYCJI"
-            val row = if (pos.paper) null else AutoExecutionService.instance?.positionSnapshot(inst, pos.side, pos.quantity)?.second
+            val row = if (pos.paper) null else AutoExecutionService.brokerReading.value?.takeIf { it.quote.instrument == inst && now - it.quote.timestamp in 0..3000 && it.row.side == pos.side }?.row
             val protection = if (pos.paper) "PAPIER • SL %.2f".format(pos.stopPrice)
                 else com.example.algohud.execution.ProtectionDisplay.line(row)
             return "$state ${sideName(pos.side)} $inst\n$protection"

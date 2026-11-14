@@ -69,6 +69,7 @@ class ExecutionEngine(
     private val autoGate: () -> String? = { null },
     /** Czy pozycja instrumentu istnieje w aplikacji brokera: true / false / null = nie da się ustalić. */
     private val reverseEntries: () -> Boolean = { false },
+    private val entryGate: (OrderRequest) -> String? = { null },
     private val positionProbe: suspend (String) -> Boolean? = { null }
 ) {
     private var pendingAt = 0L
@@ -81,7 +82,16 @@ class ExecutionEngine(
     private val _pending = MutableStateFlow<OrderRequest?>(null)
     val pendingConfirmation: StateFlow<OrderRequest?> = _pending.asStateFlow()
 
-    private val execMutex = Mutex()
+    private val queue = OperationQueue()
+    private val _operation = MutableStateFlow(OperationStatus())
+    val operation: StateFlow<OperationStatus> = _operation.asStateFlow()
+    fun stopEntries() { risk.pauseEntries(true); rejectPending() }
+    suspend fun closeBotPosition(symbol: String, openedAt: Long) {
+        stopEntries()
+        for (order in risk.flattenOrders().filter { it.symbol == symbol })
+            submit(order.copy(reason = "ZAMKNIĘCIE Z HUD", expectedPositionAt = openedAt), bypassConfirmation = true)
+    }
+
     private val flattenMutex = Mutex()
 
     /**
@@ -119,20 +129,52 @@ class ExecutionEngine(
 
     suspend fun submit(request: OrderRequest, bypassConfirmation: Boolean = false): ExecutionResult {
         val order = prepareEntry(request)
-        when (val d = risk.evaluate(order)) {
-            is RiskManager.Decision.Rejected -> {
-                log("✋ ${d.reason}")
-                return ExecutionResult.Rejected(d.reason)
-            }
-            is RiskManager.Decision.Approved -> Unit
-        }
-        if (_mode.value == ExecutionMode.CONFIRM && !bypassConfirmation) {
+        if (_mode.value == ExecutionMode.CONFIRM && !bypassConfirmation && !order.reduceOnly) {
+            if (_pending.value != null) return ExecutionResult.Rejected("Jest już propozycja do potwierdzenia")
+            if (risk.entriesPaused.value) return ExecutionResult.Rejected("STOP WEJŚĆ aktywny")
             _pending.value = order
             pendingAt = System.currentTimeMillis()
-            log("❓ Potwierdź: ${order.side} ${formatQty(order.quantity)} ${order.symbol}")
             return ExecutionResult.Rejected("Oczekuje na potwierdzenie")
         }
-        return execMutex.withLock { execute(order) }
+        val requestedMode = _mode.value
+        return queue.run(order.clientOrderId, "${order.symbol}:${order.reduceOnly}", if (order.reduceOnly) 90_000 else 5_000) {
+            if (order.expectedPositionAt != null && risk.position(order.symbol)?.openedAt != order.expectedPositionAt)
+                return@run ExecutionResult.Rejected("Pozycja zmieniła się – anulowano zamknięcie")
+            if (_mode.value != requestedMode) return@run ExecutionResult.Rejected("Tryb zmienił się w kolejce")
+            if (!order.reduceOnly && _mode.value != ExecutionMode.DRY_RUN) entryGate(order)?.let { why ->
+                _operation.value = OperationStatus(order.clientOrderId, order.symbol, why, error = true)
+                return@run ExecutionResult.Rejected(why)
+            }
+            when (val decision = risk.evaluate(order)) {
+                is RiskManager.Decision.Rejected -> {
+                    _operation.value = OperationStatus(order.clientOrderId, order.symbol, decision.reason, error = true)
+                    return@run ExecutionResult.Rejected(decision.reason)
+                }
+                else -> Unit
+            }
+            val side = if (order.side == Side.BUY) "LONG" else "SHORT"
+            _operation.value = OperationStatus(order.clientOrderId, order.symbol,
+                if (order.reduceOnly) "ZAMYKAM…" else "OTWIERAM $side…", active = true)
+            try {
+                val result = execute(order)
+                val text = when (result) {
+                    is ExecutionResult.Filled -> if (order.reduceOnly) "ZAMKNIĘTO" else "OTWARTO $side"
+                    is ExecutionResult.Submitted -> if (order.reduceOnly) "ZAMKNIĘCIE POTWIERDZONE" else "WYSŁANO $side • weryfikacja pozycji"
+                    is ExecutionResult.Rejected -> result.reason
+                    is ExecutionResult.Failed -> "STAN NIEZNANY • sprawdź XTB"
+                }
+                _operation.value = OperationStatus(order.clientOrderId, order.symbol, text,
+                    error = result is ExecutionResult.Failed || result is ExecutionResult.Rejected)
+                result
+            } catch (e: CancellationException) {
+                _operation.value = OperationStatus(order.clientOrderId, order.symbol, "PRZERWANO • sprawdź XTB", error = true)
+                throw e
+            } catch (e: Exception) {
+                risk.engageKillSwitch("Nieznany stan operacji")
+                _operation.value = OperationStatus(order.clientOrderId, order.symbol, "STAN NIEZNANY • sprawdź XTB", error = true)
+                ExecutionResult.Failed(e)
+            }
+        }
     }
 
     suspend fun confirmPending() {
@@ -436,6 +478,12 @@ class AutoExecutionService : AccessibilityService() {
         /** Kill-switch: przerywa trwającą nawigację AI (sprawdzane przed każdym krokiem). */
         @Volatile var navAbort: () -> Boolean = { false }
         /** Jedna linia: co robi samonaprawa widoku (do HUD i świadomości agentów). */
+        val protectionStatus = MutableStateFlow(OperationStatus())
+        data class BrokerReading(val quote: ScreenQuote, val row: PositionRowInfo)
+        val brokerReading = MutableStateFlow<BrokerReading?>(null)
+        @Volatile var entryBlocked: (() -> Boolean)? = null
+        @Volatile var entryCheck: ((OrderRequest) -> String?)? = null
+        @Volatile var hudObstacles: List<Rect> = emptyList()
         @Volatile var navStatus: String = "—"
         /** Pakiet aplikacji, która jest teraz na wierzchu (gdy nie XTB) – do świadomości agentów. */
         @Volatile var foregroundPackage: String? = null
@@ -724,6 +772,7 @@ class AutoExecutionService : AccessibilityService() {
         val label = pkg?.let { targetLabel(it) }
         if (root == null || pkg == null || label == null) {
             foregroundPackage = pkg
+            brokerReading.value = null
             if (notVisibleSince == 0L) notVisibleSince = now
             diag = "nie widzę okna XTB" + (if (root != null) " (na wierzchu: $pkg)" else "") +
                 (if (lastTargetEventAt > 0) ", ostatni sygnał z XTB ${(now - lastTargetEventAt) / 1000} s temu" else ", brak sygnałów z XTB")
@@ -754,6 +803,26 @@ class AutoExecutionService : AccessibilityService() {
         }
         if (quote != null) {
             _screenQuote.value = quote
+            val obstacles = mutableListOf<Rect>()
+            val nodes = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+            var count = 0
+            while (nodes.isNotEmpty() && count++ < 1500) {
+                val n = nodes.removeFirst()
+                val id = n.viewIdResourceName?.substringAfterLast('/').orEmpty()
+                val isChart = id.contains("chart", true) || n.className?.toString()?.contains("chart", true) == true
+                val isControl = id in setOf("TradingBuyButton", "TradingSellButton", "ModifyPositionButton", "CloseVolumeButton", "StepperTextField")
+                if (n.isVisibleToUser && (isChart || isControl)) {
+                    val rect = Rect().also { n.getBoundsInScreen(it) }
+                    if (isChart) rect.left = rect.left + rect.width() * 2 / 3
+                    if (!rect.isEmpty) obstacles.add(rect)
+                }
+                for (i in 0 until n.childCount) n.getChild(i)?.let { nodes.add(it) }
+            }
+            hudObstacles = obstacles
+            brokerReading.value = if (quote.instrument != null) runCatching {
+                readPositionRows(root).singleOrNull()?.takeIf { it.signature == profitAnchors[quote.instrument] }
+                    ?.let { BrokerReading(quote, it) }
+            }.getOrNull() else null
             quote.availableFunds?.let { lastAccountFunds = it; lastAccountCurrency = quote.accountCurrency }
         }
         (profilePrice ?: quote?.mid)?.let { _screenPrice.value = it }
@@ -863,7 +932,6 @@ class AutoExecutionService : AccessibilityService() {
         if (order.reduceOnly && !p.canClosePositions) {
             // Przycisk przeciwny otworzyłby NOWĄ pozycję. Zamykamy przez ekran pozycji, jeśli jest otwarty.
             if (pkg == ScreenScanner.XTB_PACKAGE) {
-                openPositionScreen(order.symbol)?.let { return ExecutionResult.Rejected("ZAMKNIJ ${order.symbol}: $it") }
                 return doClosePosition(order.symbol)
             }
             return ExecutionResult.Rejected("ZAMKNIJ POZYCJĘ ${order.symbol} ręcznie w aplikacji brokera")
@@ -919,10 +987,23 @@ class AutoExecutionService : AccessibilityService() {
     // ───────────── Ekran pozycji XTB: SL/TP i zamykanie ─────────────
 
     /** Wpisuje SL/TP na ekranie pozycji XTB i dotyka "Modyfikuj pozycję". */
+    private val protectionMutex = Mutex()
     suspend fun setProtection(instrument: String, sl: Double?, tp: Double?): ExecutionResult =
         withContext(Dispatchers.Main.immediate) {
             try {
-                withAction { doSetProtection(instrument, sl, tp) }
+                if (!protectionMutex.tryLock()) return@withContext ExecutionResult.Rejected("Zapis SL/TP już trwa")
+                val id = java.util.UUID.randomUUID().toString()
+                protectionStatus.value = OperationStatus(id, instrument, "SL: ZAPISUJĘ…", active = true)
+                try {
+                    val result = withAction { doSetProtection(instrument, sl, tp) }
+                    protectionStatus.value = OperationStatus(id, instrument,
+                        if (result is ExecutionResult.Submitted || result is ExecutionResult.Filled) "SL: ZAPISANY ✓" else "SL: BRAK POTWIERDZENIA",
+                        error = result !is ExecutionResult.Submitted && result !is ExecutionResult.Filled)
+                    result
+                } finally {
+                    if (protectionStatus.value.active) protectionStatus.value = OperationStatus(id, instrument, "SL: BRAK POTWIERDZENIA", error = true)
+                    protectionMutex.unlock()
+                }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {
@@ -982,6 +1063,13 @@ class AutoExecutionService : AccessibilityService() {
     }
 
     private suspend fun doClosePosition(instrument: String): ExecutionResult {
+        // Re-read the ticket and exact bot-owned row before opening the close sheet.
+        if (appRoot()?.let { ScreenScanner.findById(it, "ModifyPositionButton").isNotEmpty() } == true) backStayInXtb()
+        revealById("PositionRow0") ?: return ExecutionResult.Rejected("brak wiersza pozycji do potwierdzenia")
+        val rootBefore = appRoot() ?: return ExecutionResult.Rejected("brak okna XTB")
+        val rowBefore = readPositionRows(rootBefore).singleOrNull()
+        if (xtbTitle(rootBefore) != instrument || rowBefore == null || rowBefore.signature != profitAnchors[instrument])
+            return ExecutionResult.Rejected("nie potwierdzono tożsamości pozycji bota – nie zamykam ręcznej pozycji")
         openPositionScreen(instrument)?.let { return ExecutionResult.Rejected(it) }
         val close = appRoot()?.let { ScreenScanner.findById(it, "CloseVolumeButton").firstOrNull() }
             ?: return ExecutionResult.Rejected("brak przycisku Zamknij pozycję")
@@ -1007,8 +1095,15 @@ class AutoExecutionService : AccessibilityService() {
             while (appRoot()?.let { ScreenScanner.findById(it, "CloseButton").isNotEmpty() } != false) delay(200)
             true
         } ?: false
-        return if (gone) ExecutionResult.Submitted("Zamknięto pozycję $instrument w XTB")
-        else ExecutionResult.Failed(IllegalStateException("arkusz zamknięcia nadal otwarty – sprawdź XTB"))
+        if (gone && probeInternal(instrument) == false) {
+            delay(500)
+            if (probeInternal(instrument) == false) {
+                profitAnchors.remove(instrument)
+                brokerReading.value = null
+                return ExecutionResult.Submitted("Zamknięcie $instrument potwierdzone w XTB")
+            }
+        }
+        return ExecutionResult.Failed(IllegalStateException("brak potwierdzenia zamknięcia – sprawdź XTB"))
     }
 
     private fun valueInside(root: AccessibilityNodeInfo, containerId: String): String? {
@@ -1895,8 +1990,12 @@ class AutoExecutionService : AccessibilityService() {
                 return ExecutionResult.Rejected("cena ruszyła o %.2f w stronę SL – setup nieaktualny".format(abs(pxNow - sidePx)))
             }
         }
+        if (entryBlocked?.invoke() == true) return ExecutionResult.Rejected("STOP WEJŚĆ – przerwano przed wysłaniem")
         val btn = revealById(if (order.side == Side.BUY) "TradingBuyButton" else "TradingSellButton")
             ?: return ExecutionResult.Rejected("nie znaleziono przycisku ${order.side}")
+        scanNow()
+        if (entryBlocked?.invoke() == true) return ExecutionResult.Rejected("STOP WEJŚĆ aktywny")
+        entryCheck?.invoke(order)?.let { return ExecutionResult.Rejected(it) }
         if (!click(btn)) return ExecutionResult.Rejected("kliknięcie ${order.side} nie powiodło się")
         _uiEvents.tryEmit("⏱ ${order.symbol}: od decyzji do kliknięcia %.1f s".format((SystemClock.uptimeMillis() - t0) / 1000.0))
 
@@ -1910,10 +2009,18 @@ class AutoExecutionService : AccessibilityService() {
             n
         }
         if (confirm != null) {
+            if (entryBlocked?.invoke() == true) {
+                backStayInXtb()
+                return ExecutionResult.Rejected("STOP WEJŚĆ – anulowano potwierdzenie")
+            }
             // Zabezpieczenie: na ekranie potwierdzenia musi być nasz wolumen.
             val screenText = appRoot()?.let { ScreenScanner.collect(it).joinToString(" ") { t -> t.text } }.orEmpty()
             if (!screenText.contains(formatQty(order.quantity))) {
                 return ExecutionResult.Failed(IllegalStateException("ekran potwierdzenia XTB pokazuje inny wolumen – NIE potwierdzam, sprawdź ręcznie"))
+            }
+            entryCheck?.invoke(order)?.let { why ->
+                backStayInXtb()
+                return ExecutionResult.Rejected(why)
             }
             if (!click(confirm)) {
                 return ExecutionResult.Failed(IllegalStateException("nie udało się dotknąć 'Potwierdź zlecenie' – stan NIEZNANY, sprawdź XTB"))

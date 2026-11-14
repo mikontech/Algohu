@@ -77,6 +77,33 @@ class MainActivity : ComponentActivity() {
         }.also { layout.addView(it) }
 
         TextView(this).apply { text = "\nBezpieczeństwo"; textSize = 18f }.also { layout.addView(it) }
+        button("WZNÓW WEJŚCIA (ochrona pozycji pozostaje aktywna)") {
+            getSharedPreferences("risk_state", MODE_PRIVATE).edit().putBoolean("entries_paused", false).apply()
+            OverlayService.command(this, "RESUME_ENTRIES")
+        }
+        val spreadLimit = android.widget.EditText(this).apply {
+            hint = "Maks. koszt spreadu / ryzyko (%)"
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText(getSharedPreferences("ui", MODE_PRIVATE).getString("spread_limit_pct", "25"))
+        }.also { layout.addView(it) }
+        val lossLimit = android.widget.EditText(this).apply {
+            hint = "Limit straty dnia w walucie konta (puste = dotychczasowy limit %)"
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText(getSharedPreferences("risk_state", MODE_PRIVATE).getString("session_loss_limit", ""))
+        }.also { layout.addView(it) }
+        button("Zapisz limity ryzyka") {
+            val spread = spreadLimit.text.toString().replace(',', '.').toDoubleOrNull()
+            val lossText = lossLimit.text.toString().trim().replace(',', '.')
+            val loss = lossText.toDoubleOrNull()
+            if (spread == null || !spread.isFinite() || spread !in 1.0..100.0 ||
+                (lossText.isNotEmpty() && (loss == null || !loss.isFinite() || loss <= 0))) {
+                Toast.makeText(this, "Spread 1–100%; limit straty dodatni lub pusty", Toast.LENGTH_LONG).show()
+            } else {
+                getSharedPreferences("ui", MODE_PRIVATE).edit().putString("spread_limit_pct", spread.toString()).apply()
+                getSharedPreferences("risk_state", MODE_PRIVATE).edit().putString("session_loss_limit", lossText).apply()
+                Toast.makeText(this, "Zapisano limity", Toast.LENGTH_SHORT).show()
+            }
+        }
         button("Reset KILL (nie działa po dziennym limicie)") { OverlayService.command(this, OverlayService.ACTION_RESET_KILL) }
         button("🛡 Tarcza dotyku: WŁĄCZ (w AUTO ekran ignoruje dotyk)") { OverlayService.command(this, OverlayService.ACTION_SHIELD, "on") }
         button("Tarcza dotyku: wyłącz") { OverlayService.command(this, OverlayService.ACTION_SHIELD, "off") }
