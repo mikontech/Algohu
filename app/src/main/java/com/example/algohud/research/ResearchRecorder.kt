@@ -10,6 +10,7 @@ import java.util.concurrent.atomic.AtomicLong
 /** Ograniczona kolejka; JSONL na IO, rotacja 4 × 2 MB; żadnych kluczy ani zrzutów ekranu. */
 class ResearchRecorder(dir: File) {
     companion object { val fileLock = Any() }
+    private val sessionId = java.util.UUID.randomUUID().toString()
     private val folder = File(dir, "research").apply { mkdirs() }
     private val channel = Channel<Pair<String, Map<String, Any?>>>(2048)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -32,7 +33,7 @@ class ResearchRecorder(dir: File) {
         scope.cancel()
     } }
     fun record(event: String, data: Map<String, Any?>) {
-        if (!channel.trySend(event to (data + ("recordedAt" to System.currentTimeMillis()))).isSuccess) dropped.incrementAndGet()
+        if (!channel.trySend(event to (data + mapOf("recordedAt" to System.currentTimeMillis(), "session" to sessionId))).isSuccess) dropped.incrementAndGet()
     }
     fun observe(o: OrderRequest, mode: ExecutionMode, result: ExecutionResult?, q: ScreenQuote?) {
         val data = mapOf("id" to o.clientOrderId, "symbol" to o.symbol, "side" to o.side.name,
@@ -52,5 +53,5 @@ class ResearchRecorder(dir: File) {
         record("quote", mapOf("symbol" to q.instrument,"bid" to q.bid,"ask" to q.ask,"at" to q.timestamp))
     }
     fun summary() = book.summary()+"\nUtracone rekordy: ${dropped.get()}. Zapis JSONL: research/.\nKandydaci = propozycje przekazane do silnika; wcześniejsze filtry strategii nie są symulowane."
-    fun close() { channel.close() }
+    fun close() { record("session_end", mapOf("open_simulations" to "not_closed_or_carried_forward")); channel.close() }
 }

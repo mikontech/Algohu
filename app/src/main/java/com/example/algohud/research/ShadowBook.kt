@@ -10,7 +10,7 @@ class ShadowBook(private val emit: (String, Map<String, Any?>) -> Unit) {
     private val open = mutableListOf<Trade>()
     private val seen = LinkedHashSet<String>()
     private val stats = mutableMapOf<String, Pair<Int, Double>>()
-    private var lastQuote = 0L
+    private val lastQuote = mutableMapOf<String, Long>()
     @Synchronized fun candidate(o: OrderRequest, q: ScreenQuote?, now: Long) {
         if (o.reduceOnly || o.clientOrderId in seen || q?.instrument != o.symbol || !q.isFresh(now, 3000)) return
         val bid = q.bid ?: return; val ask = q.ask ?: return
@@ -32,11 +32,12 @@ class ShadowBook(private val emit: (String, Map<String, Any?>) -> Unit) {
     }
     @Synchronized fun quote(q: ScreenQuote, now: Long) {
         val bid = q.bid ?: return; val ask = q.ask ?: return
-        if (!q.isFresh(now, 3000) || q.timestamp <= lastQuote || !bid.isFinite() || !ask.isFinite() || bid <= 0 || ask < bid) return
-        lastQuote = q.timestamp
+        if (!q.isFresh(now, 3000) || q.timestamp <= (lastQuote[q.instrument] ?: 0L) || !bid.isFinite() || !ask.isFinite() || bid <= 0 || ask < bid) return
+        val symbol = q.instrument ?: return
+        lastQuote[symbol] = q.timestamp
         val iterator = open.iterator()
         while (iterator.hasNext()) {
-            val t = iterator.next(); if (q.instrument != t.o.symbol) continue
+            val t = iterator.next(); if (q.instrument != t.o.symbol || (q.accountCurrency ?: "?") != t.currency) continue
             val exit = if (t.side == Side.BUY) bid else ask
             val reason = when {
                 (exit-t.sl)*t.side.sign <= 0 -> "SL"
@@ -46,7 +47,7 @@ class ShadowBook(private val emit: (String, Map<String, Any?>) -> Unit) {
             }
             val pnl = (exit-t.entry)*t.side.sign*t.o.quantity*t.o.pointValue
             val old = stats[t.key] ?: (0 to 0.0)
-            stats[t.key] = old.first+1 to old.second+pnl
+            if (t.key in stats || stats.size < 256) stats[t.key] = old.first+1 to old.second+pnl
             emit("shadow_close", mapOf("id" to t.o.clientOrderId, "variant" to t.key, "exit" to exit, "pnl_estimate" to pnl, "reason" to reason, "currency" to t.currency))
             iterator.remove()
         }

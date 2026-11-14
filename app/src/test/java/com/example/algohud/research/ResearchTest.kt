@@ -27,6 +27,13 @@ class ResearchTest {
         assertEquals(3,closed.size)
         assertTrue(closed.all { it.second["pnl_estimate"] == -1.0 })
     }
+    @Test fun currencyChangesDoNotClosePaperTrades() {
+        val events=mutableListOf<String>()
+        val book=ShadowBook { e,_ -> events.add(e) }
+        book.candidate(order(),quote(),1000)
+        book.quote(quote(220.0,221.0,at=2000).copy(accountCurrency="USD"),2000)
+        assertEquals(0,events.count { it=="shadow_close" })
+    }
     @Test fun missingOrStaleQuotesDoNotProducePaperProfit() {
         val events = mutableListOf<String>()
         val book=ShadowBook { e,_ -> events.add(e) }
