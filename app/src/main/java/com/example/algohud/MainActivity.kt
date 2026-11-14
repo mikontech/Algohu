@@ -28,6 +28,26 @@ import com.example.algohud.overlay.OverlayService
 class MainActivity : ComponentActivity() {
 
     private val notifPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { refresh() }
+    private val exportResearch = registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        if (uri != null) lifecycleScope.launch {
+            val ok = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching {
+                    val snapshots = synchronized(com.example.algohud.research.ResearchRecorder.fileLock) {
+                        java.io.File(filesDir, "research").listFiles().orEmpty()
+                            .filter { it.name.endsWith(".jsonl") }.map { it.name to it.readBytes() }
+                    }
+                    require(snapshots.isNotEmpty()) { "Brak zapisanych danych" }
+                    val output = contentResolver.openOutputStream(uri) ?: error("Brak dostępu do pliku")
+                    java.util.zip.ZipOutputStream(output).use { zip ->
+                        for ((name, bytes) in snapshots) {
+                            zip.putNextEntry(java.util.zip.ZipEntry(name)); zip.write(bytes); zip.closeEntry()
+                        }
+                    }
+                }.isSuccess
+            }
+            Toast.makeText(this@MainActivity, if (ok) "Zapisano dziennik badań" else "Brak danych lub błąd zapisu", Toast.LENGTH_LONG).show()
+        }
+    }
     private lateinit var status: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -46,6 +66,7 @@ class MainActivity : ComponentActivity() {
             textSize = 24f
             setPadding(0, 0, 0, pad)
         }.also { layout.addView(it) }
+        button("Eksportuj sygnały i testy PAPER (ZIP)") { exportResearch.launch("AlgoHUD-research.zip") }
         status = TextView(this).apply { setPadding(0, 0, 0, pad) }.also { layout.addView(it) }
         button("1. Zezwól na wyświetlanie nad aplikacjami") {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))

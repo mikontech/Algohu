@@ -51,6 +51,8 @@ data class OrderRequest(
     val fixedSize: Boolean = false,
     val directionPrepared: Boolean = false,
     val expectedPositionAt: Long? = null,
+    val signalAt: Long = System.currentTimeMillis(),
+    val brokerReferencePrice: Double? = null,
     val clientOrderId: String = "hud" + UUID.randomUUID().toString().replace("-", "").take(16)
 )
 

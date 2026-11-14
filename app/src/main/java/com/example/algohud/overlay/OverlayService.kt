@@ -106,6 +106,7 @@ class OverlayService : LifecycleService() {
     private var renderedUi: HudUiState? = null
     private var closeBusy = false
     private val lastSpread = MutableStateFlow<com.example.algohud.risk.SpreadCost?>(null)
+    private lateinit var research: com.example.algohud.research.ResearchRecorder
     @Volatile private var lastCandidate: com.example.algohud.core.OrderRequest? = null
     @Volatile private var lastCandidateAt = 0L
     private var detailDialog: android.app.AlertDialog? = null
@@ -237,6 +238,7 @@ class OverlayService : LifecycleService() {
         AutoExecutionService.aiNavigator = null
         detailDialog?.dismiss()
         AutoExecutionService.entryBlocked = null
+        if (::research.isInitialized) research.close()
         AutoExecutionService.entryCheck = null
         botScope.cancel()
         setShield(false)
@@ -270,14 +272,22 @@ class OverlayService : LifecycleService() {
         // Wariant A (API) – preferowany, gdy broker ma API:
         // val executor = BinanceSpotExecutor(http, apiKey, apiSecret, risk.config.allowedSymbols)
 
+        research = com.example.algohud.research.ResearchRecorder(filesDir)
+        botScope.launch { AutoExecutionService.screenQuote.filterNotNull().collect { research.quote(it) } }
         engine = ExecutionEngine(
             risk, executor, initialMode = ExecutionMode.DRY_RUN,
+            anchorEntry = { order ->
+                val q = AutoExecutionService.screenQuote.value
+                if (order.reduceOnly || order.brokerReferencePrice != null || q?.instrument != order.symbol || !q.isFresh(maxAgeMs = 3000)) order
+                else order.copy(brokerReferencePrice = if (order.side == Side.BUY) q.ask else q.bid)
+            },
+            observer = { order, mode, result -> research.observe(order, mode, result, AutoExecutionService.screenQuote.value) },
             entryGate = { order ->
                 lastCandidate = order; lastCandidateAt = System.currentTimeMillis()
                 val threshold = uiPrefs().getString("spread_limit_pct", "25")?.toDoubleOrNull() ?: 25.0
                 val cost = com.example.algohud.risk.SpreadGuard.assess(order, AutoExecutionService.screenQuote.value, threshold, System.currentTimeMillis())
                 lastSpread.value = cost
-                cost.block
+                cost.block ?: com.example.algohud.research.EntryTimingGuard.check(order, AutoExecutionService.screenQuote.value, System.currentTimeMillis())
             },
             reverseEntries = { getSharedPreferences("ui", MODE_PRIVATE).getBoolean("reverse_entries", true) },
             // AUTO dopiero po udokumentowanym dodatnim wyniku na papierze.
@@ -292,7 +302,7 @@ class OverlayService : LifecycleService() {
         AutoExecutionService.entryBlocked = { risk.entriesPaused.value || risk.killSwitch.value }
         AutoExecutionService.entryCheck = { order, quote ->
             com.example.algohud.risk.SpreadGuard.assess(order, quote,
-                uiPrefs().getString("spread_limit_pct", "25")?.toDoubleOrNull() ?: 25.0, System.currentTimeMillis()).block
+                uiPrefs().getString("spread_limit_pct", "25")?.toDoubleOrNull() ?: 25.0, System.currentTimeMillis()).block ?: com.example.algohud.research.EntryTimingGuard.check(order, quote, System.currentTimeMillis())
         }
         AutoExecutionService.navAbort = { risk.killSwitch.value }
         AutoExecutionService.navAutonomy = uiPrefs().getBoolean("nav_autonomy", true)
@@ -670,6 +680,7 @@ class OverlayService : LifecycleService() {
                     "* Budżet: szacowana księga bota w walucie konta, z otwartym wynikiem feedu; nie pełny rachunek XTB.",
                     "STOP WEJŚĆ nie zamyka pozycji. Wznawianie w ustawieniach aplikacji.",
                     "Operacja: ${engine.operation.value.id} • ${engine.operation.value.text}",
+                    research.summary(),
                     s.dataStatus, s.plan, s.prediction, s.paperStats, s.lastMessage,
                     "Historia (księga bota):\n" + tradeJournal.all().takeLast(10).reversed().joinToString("\n") {
                         "${it.symbol} ${it.side} %.2f %s".format(it.pnl, if (it.paper) "PAPER" else "szacunek")

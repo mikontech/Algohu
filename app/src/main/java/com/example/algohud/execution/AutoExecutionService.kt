@@ -69,6 +69,8 @@ class ExecutionEngine(
     private val autoGate: () -> String? = { null },
     /** Czy pozycja instrumentu istnieje w aplikacji brokera: true / false / null = nie da się ustalić. */
     private val reverseEntries: () -> Boolean = { false },
+    private val anchorEntry: (OrderRequest) -> OrderRequest = { it },
+    private val observer: (OrderRequest, ExecutionMode, ExecutionResult?) -> Unit = { _, _, _ -> },
     private val entryGate: (OrderRequest) -> String? = { null },
     private val positionProbe: suspend (String) -> Boolean? = { null }
 ) {
@@ -129,7 +131,17 @@ class ExecutionEngine(
         com.example.algohud.core.EntryDirection.prepare(order, reverseEntries())
 
     suspend fun submit(request: OrderRequest, bypassConfirmation: Boolean = false): ExecutionResult {
-        val order = prepareEntry(request)
+        val order = anchorEntry(prepareEntry(request))
+        val observedMode = _mode.value
+        runCatching { observer(order, observedMode, null) }
+        return try {
+            submitPrepared(order, bypassConfirmation).also { result -> runCatching { observer(order, observedMode, result) } }
+        } catch (e: CancellationException) {
+            runCatching { observer(order, observedMode, ExecutionResult.Failed(e)) }; throw e
+        }
+    }
+
+    private suspend fun submitPrepared(order: OrderRequest, bypassConfirmation: Boolean): ExecutionResult {
         if (_mode.value == ExecutionMode.CONFIRM && !bypassConfirmation && !order.reduceOnly) {
             synchronized(pendingLock) {
                 if (_pending.value != null) return ExecutionResult.Rejected("Jest już propozycja do potwierdzenia")
@@ -1962,7 +1974,7 @@ class AutoExecutionService : AccessibilityService() {
         val sidePx = q?.let { if (order.side == Side.BUY) it.ask else it.bid }
             ?: return ExecutionResult.Rejected("brak ceny Buy/Sell na ekranie XTB")
         // Ceny bota mogą pochodzić z feedu w tle (PAXG) – przesuwamy SL/TP o różnicę do ceny XTB.
-        val shift = sidePx - order.referencePrice
+        val shift = (order.brokerReferencePrice ?: sidePx) - order.referencePrice
         val sl = order.stopPrice + shift
         val tp = order.takeProfit?.plus(shift)
 
