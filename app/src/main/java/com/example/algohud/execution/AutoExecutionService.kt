@@ -513,7 +513,7 @@ class AutoExecutionService : AccessibilityService() {
         private const val NAV_SCROLLS = 10
         /** Podpis instrumentu w XTB (wiersz listy/wyniku i nagłówek biletu). */
         private val SUBTITLES = mapOf("GOLD" to "Troy Ounce of Gold")
-        private val TICKET_MARKERS = listOf("Otwarte pozycje", "Stop Loss", "Take Profit", "Opis instrumentu")
+        private val TICKET_MARKERS = listOf("Otwarte pozycje", "Stop Loss", "Take Profit", "Opis instrumentu", "Zlecenie Market", "Zlecenie Stop / Limit", "Market Order", "Stop / Limit Order")
 
         /** Diagnostyka: ostatnio widziane okno nagrywania (do skopiowania z aplikacji, gdy auto-akceptacja nie trafi). */
         @Volatile var lastCaptureDump: String? = null
@@ -1438,6 +1438,10 @@ class AutoExecutionService : AccessibilityService() {
         // Bilet tego instrumentu jest otwarty, tylko przewinięty w dół (np. do listy pozycji) – nie wychodzimy z niego.
         if (isTargetTicket(root, target)) {
             offTargetSince = 0L
+            navFails = 0
+            // Bilet u góry jest poprawnym celem również bez notowań (zamknięty rynek).
+            // Nie przewijamy ani nie opuszczamy go tylko dlatego, że Buy/Sell są wyłączone.
+            if (ticketOrderControlsVisible(root)) return
             if (now - lastScrollUp > 10_000L && uiMutex.tryLock()) {
                 lastScrollUp = now
                 try { scrollTicketUp(root) } finally { uiMutex.unlock() }
@@ -1488,9 +1492,19 @@ class AutoExecutionService : AccessibilityService() {
      * („Otwarte pozycje”, „Stop Loss”, „Opis instrumentu”). Lista wyników i lista Rynki ich nie mają.
      */
     private fun hasTicketHeader(root: AccessibilityNodeInfo, target: String): Boolean =
-        hasTradeButtons(root) || TICKET_MARKERS.any { m ->
+        hasTradeButtons(root) || ticketOrderControlsVisible(root) || TICKET_MARKERS.any { m ->
             root.findAccessibilityNodeInfosByText(m).any { it.isVisibleToUser && !it.isEditable }
         }
+
+    private fun ticketOrderControlsVisible(root: AccessibilityNodeInfo): Boolean =
+        XtbTargetRecognition.hasOrderControls(
+            XtbTargetRecognition.orderControlIds.filter { id ->
+                ScreenScanner.findById(root, id).any { it.isVisibleToUser }
+            },
+            XtbTargetRecognition.orderControlLabels.filter { label ->
+                root.findAccessibilityNodeInfosByText(label).any { it.isVisibleToUser && !it.isEditable }
+            }
+        )
 
     private suspend fun scrollTicketUp(root: AccessibilityNodeInfo) {
         val sc = findScrollable(root)
@@ -1557,7 +1571,9 @@ class AutoExecutionService : AccessibilityService() {
     }
 
     private fun isTargetTicket(root: AccessibilityNodeInfo, target: String): Boolean {
-        val title = ScreenScanner.findById(root, "ElementTitleHorizontalText").firstOrNull()?.text?.toString()
+        val title = ScreenScanner.findById(root, "ElementTitleHorizontalText")
+            .firstOrNull { it.isVisibleToUser }?.let { (it.text ?: it.contentDescription)?.toString() }
+            ?: nodeWithText(root, target, maxY = 0.25f)?.let { (it.text ?: it.contentDescription)?.toString() }
         return XtbTargetRecognition.matches(root.packageName?.toString(), title, target, hasTicketHeader(root, target))
     }
 
@@ -1634,6 +1650,15 @@ class AutoExecutionService : AccessibilityService() {
     private suspend fun navigateTo(target: String): Boolean {
         Log.i(TAG, "Szukam $target w XTB")
         if (!inXtb()) return false // nigdy nie klikamy po pulpicie ani innych aplikacjach
+        if (targetOpen(target)) return true
+        appRoot()?.let { root ->
+            if (root.findAccessibilityNodeInfosByText("Ostatnio wyszukiwane").any { it.isVisibleToUser }) {
+                recentTile(root, target)?.let { tile ->
+                    click(tile)
+                    if (onTarget(target)) return true
+                }
+            }
+        }
         if (targetOpen(target)) return true
         // 1) Rynki → CFD (lista obserwowanych) → przewijanie do wiersza instrumentu
         appRoot()?.let { r -> nodeWithText(r, "Rynki", minY = 0.8f)?.let { click(it); delay(1_200) } }
