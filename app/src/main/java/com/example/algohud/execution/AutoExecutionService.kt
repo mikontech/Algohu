@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
 import android.graphics.Rect
+import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
@@ -67,9 +68,14 @@ class ExecutionEngine(
     /** Dodatkowa bramka AUTO (np. wyniki papierowe); null = OK. */
     private val autoGate: () -> String? = { null },
     /** Czy pozycja instrumentu istnieje w aplikacji brokera: true / false / null = nie da się ustalić. */
+    private val reverseEntries: () -> Boolean = { false },
+    private val anchorEntry: (OrderRequest) -> OrderRequest = { it },
+    private val observer: (OrderRequest, ExecutionMode, ExecutionResult?) -> Unit = { _, _, _ -> },
+    private val entryGate: (OrderRequest) -> String? = { null },
     private val positionProbe: suspend (String) -> Boolean? = { null }
 ) {
     private var pendingAt = 0L
+    private val pendingLock = Any()
     private val _mode = MutableStateFlow(initialMode)
     val mode: StateFlow<ExecutionMode> = _mode.asStateFlow()
 
@@ -79,7 +85,16 @@ class ExecutionEngine(
     private val _pending = MutableStateFlow<OrderRequest?>(null)
     val pendingConfirmation: StateFlow<OrderRequest?> = _pending.asStateFlow()
 
-    private val execMutex = Mutex()
+    private val queue = OperationQueue()
+    private val _operation = MutableStateFlow(OperationStatus())
+    val operation: StateFlow<OperationStatus> = _operation.asStateFlow()
+    fun stopEntries() { risk.pauseEntries(true); rejectPending() }
+    suspend fun closeBotPosition(symbol: String, openedAt: Long) {
+        stopEntries()
+        for (order in risk.flattenOrders().filter { it.symbol == symbol })
+            submit(order.copy(reason = "ZAMKNIĘCIE Z HUD", expectedPositionAt = openedAt), bypassConfirmation = true)
+    }
+
     private val flattenMutex = Mutex()
 
     /**
@@ -112,34 +127,85 @@ class ExecutionEngine(
     }
 
     /** @param bypassConfirmation true dla akcji człowieka i stopów ochronnych. */
-    suspend fun submit(order: OrderRequest, bypassConfirmation: Boolean = false): ExecutionResult {
-        when (val d = risk.evaluate(order)) {
-            is RiskManager.Decision.Rejected -> {
-                log("✋ ${d.reason}")
-                return ExecutionResult.Rejected(d.reason)
-            }
-            is RiskManager.Decision.Approved -> Unit
+    fun prepareEntry(order: OrderRequest): OrderRequest =
+        com.example.algohud.core.EntryDirection.prepare(order, reverseEntries())
+
+    suspend fun submit(request: OrderRequest, bypassConfirmation: Boolean = false): ExecutionResult {
+        val order = anchorEntry(prepareEntry(request))
+        val observedMode = _mode.value
+        runCatching { observer(order, observedMode, null) }
+        return try {
+            submitPrepared(order, bypassConfirmation).also { result -> runCatching { observer(order, observedMode, result) } }
+        } catch (e: CancellationException) {
+            runCatching { observer(order, observedMode, ExecutionResult.Failed(e)) }; throw e
         }
-        if (_mode.value == ExecutionMode.CONFIRM && !bypassConfirmation) {
-            _pending.value = order
-            pendingAt = System.currentTimeMillis()
-            log("❓ Potwierdź: ${order.side} ${formatQty(order.quantity)} ${order.symbol}")
+    }
+
+    private suspend fun submitPrepared(order: OrderRequest, bypassConfirmation: Boolean): ExecutionResult {
+        if (_mode.value == ExecutionMode.CONFIRM && !bypassConfirmation && !order.reduceOnly) {
+            synchronized(pendingLock) {
+                if (_pending.value != null) return ExecutionResult.Rejected("Jest już propozycja do potwierdzenia")
+                if (risk.entriesPaused.value) return ExecutionResult.Rejected("STOP WEJŚĆ aktywny")
+                _pending.value = order
+                pendingAt = System.currentTimeMillis()
+            }
             return ExecutionResult.Rejected("Oczekuje na potwierdzenie")
         }
-        return execMutex.withLock { execute(order) }
+        val requestedMode = _mode.value
+        return queue.run(order.clientOrderId, "${order.symbol}:${order.reduceOnly}", if (order.reduceOnly) 90_000 else 5_000) {
+            if (order.expectedPositionAt != null && risk.position(order.symbol)?.openedAt != order.expectedPositionAt)
+                return@run ExecutionResult.Rejected("Pozycja zmieniła się – anulowano zamknięcie")
+            if (_mode.value != requestedMode) return@run ExecutionResult.Rejected("Tryb zmienił się w kolejce")
+            if (!order.reduceOnly && _mode.value != ExecutionMode.DRY_RUN) entryGate(order)?.let { why ->
+                _operation.value = OperationStatus(order.clientOrderId, order.symbol, why, error = true)
+                return@run ExecutionResult.Rejected(why)
+            }
+            when (val decision = risk.evaluate(order)) {
+                is RiskManager.Decision.Rejected -> {
+                    _operation.value = OperationStatus(order.clientOrderId, order.symbol, decision.reason, error = true)
+                    return@run ExecutionResult.Rejected(decision.reason)
+                }
+                else -> Unit
+            }
+            val side = if (order.side == Side.BUY) "LONG" else "SHORT"
+            _operation.value = OperationStatus(order.clientOrderId, order.symbol,
+                if (order.reduceOnly) "ZAMYKAM…" else "OTWIERAM $side…", active = true)
+            try {
+                val result = execute(order)
+                val text = when (result) {
+                    is ExecutionResult.Filled -> if (order.reduceOnly) "ZAMKNIĘTO" else "OTWARTO $side"
+                    is ExecutionResult.Submitted -> if (order.reduceOnly) "ZAMKNIĘCIE POTWIERDZONE" else "WYSŁANO $side • weryfikacja pozycji"
+                    is ExecutionResult.Rejected -> result.reason
+                    is ExecutionResult.Failed -> "STAN NIEZNANY • sprawdź XTB"
+                }
+                _operation.value = OperationStatus(order.clientOrderId, order.symbol, text,
+                    error = result is ExecutionResult.Failed || result is ExecutionResult.Rejected)
+                result
+            } catch (e: CancellationException) {
+                _operation.value = OperationStatus(order.clientOrderId, order.symbol, "PRZERWANO • sprawdź XTB", error = true)
+                throw e
+            } catch (e: Exception) {
+                risk.engageKillSwitch("Nieznany stan operacji")
+                _operation.value = OperationStatus(order.clientOrderId, order.symbol, "STAN NIEZNANY • sprawdź XTB", error = true)
+                ExecutionResult.Failed(e)
+            }
+        }
     }
 
     suspend fun confirmPending() {
-        val o = _pending.value ?: return
-        _pending.value = null
-        if (System.currentTimeMillis() - pendingAt > 60_000) {
+        val (o, at) = synchronized(pendingLock) {
+            val pending = _pending.value ?: return
+            _pending.value = null
+            pending to pendingAt
+        }
+        if (System.currentTimeMillis() - at > 60_000) {
             log("⌛ Propozycja wygasła (starsza niż 60 s) – cena mogła się zmienić")
             return
         }
         submit(o, bypassConfirmation = true)
     }
 
-    fun rejectPending() { _pending.value = null }
+    fun rejectPending() { synchronized(pendingLock) { _pending.value = null } }
 
     /** KILL: blokada nowych wejść, anulowanie zleceń oczekujących, zamknięcie pozycji. */
     suspend fun flattenAll(reason: String) = flattenMutex.withLock {
@@ -418,6 +484,34 @@ class AutoExecutionService : AccessibilityService() {
         @Volatile var wantedInstrument: String? = null
         @Volatile var wantedUrgent: Boolean = false
 
+        /**
+         * Autonomia nawigacji we WSZYSTKICH trybach (także DRY_RUN): XTB wraca na wierzch, bot wraca na bilet GOLD,
+         * zamyka wiszące okna i ekran błędu. Zlecenia dalej tylko w AUTO. Ustawia nakładka z prefs „nav_autonomy”.
+         */
+        @Volatile var navAutonomy: Boolean = true
+        /** Pauza autonomii (np. „chcę chwilę użyć telefonu”) – do tej chwili (System.currentTimeMillis). */
+        @Volatile var navPausedUntil: Long = 0L
+        /** Zapasowy nawigator wizyjny (AI) – wołany, gdy zwykłe szukanie biletu zawiedzie. Ustawia nakładka. */
+        @Volatile var aiNavigator: (suspend (target: String) -> Boolean)? = null
+        /** Kill-switch: przerywa trwającą nawigację AI (sprawdzane przed każdym krokiem). */
+        @Volatile var navAbort: () -> Boolean = { false }
+        /** Jedna linia: co robi samonaprawa widoku (do HUD i świadomości agentów). */
+        val protectionStatus = MutableStateFlow(OperationStatus())
+        data class BrokerReading(val quote: ScreenQuote, val row: PositionRowInfo)
+        val brokerReading = MutableStateFlow<BrokerReading?>(null)
+        @Volatile var entryBlocked: (() -> Boolean)? = null
+        @Volatile var entryCheck: ((OrderRequest, ScreenQuote?) -> String?)? = null
+        @Volatile var hudObstacles: List<Rect> = emptyList()
+        @Volatile var navStatus: String = "—"
+        /** Pakiet aplikacji, która jest teraz na wierzchu (gdy nie XTB) – do świadomości agentów. */
+        @Volatile var foregroundPackage: String? = null
+        /** Aplikacje, z których bot NIE wyciąga użytkownika na siłę (ustawienia, instalator, Algo HUD, okna systemowe). */
+        private val NO_YANK_PREFIXES = listOf(
+            "com.example.algohud", "com.android.settings", "com.android.packageinstaller", "com.google.android.packageinstaller",
+            "com.android.systemui", "android", "com.google.android.permissioncontroller", "com.android.permissioncontroller"
+        )
+        private const val AI_NAV_MAX_PER_HOUR = 6
+
         private val _gestureActive = MutableStateFlow(false)
         /** HUD obserwuje to i chowa się na czas gestu, żeby nie przechwycić dotyku. */
         val gestureActive: StateFlow<Boolean> = _gestureActive.asStateFlow()
@@ -431,7 +525,7 @@ class AutoExecutionService : AccessibilityService() {
         private const val NAV_SCROLLS = 10
         /** Podpis instrumentu w XTB (wiersz listy/wyniku i nagłówek biletu). */
         private val SUBTITLES = mapOf("GOLD" to "Troy Ounce of Gold")
-        private val TICKET_MARKERS = listOf("Otwarte pozycje", "Stop Loss", "Take Profit", "Opis instrumentu")
+        private val TICKET_MARKERS = listOf("Otwarte pozycje", "Stop Loss", "Take Profit", "Opis instrumentu", "Zlecenie Market", "Zlecenie Stop / Limit", "Market Order", "Stop / Limit Order")
 
         /** Diagnostyka: ostatnio widziane okno nagrywania (do skopiowania z aplikacji, gdy auto-akceptacja nie trafi). */
         @Volatile var lastCaptureDump: String? = null
@@ -460,6 +554,12 @@ class AutoExecutionService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        // Ponownie ustaw flagi również po aktualizacji APK z działającą usługą.
+        serviceInfo = serviceInfo.apply {
+            flags = flags or android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or
+                android.accessibilityservice.AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
+            eventTypes = eventTypes or AccessibilityEvent.TYPE_WINDOWS_CHANGED
+        }
         instance = this
         com.example.algohud.bot.Ntfy.init(this)
         startPolling()
@@ -668,6 +768,7 @@ class AutoExecutionService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event?.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED) { scanNow(); return }
         val pkg = event?.packageName?.toString() ?: return
         if (pkg.startsWith("com.anydesk")) {
             if (event.eventType == AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) handleAnydeskNotification(event)
@@ -680,6 +781,7 @@ class AutoExecutionService : AccessibilityService() {
     }
 
     /** Odczyt okna brokera. Wywoływany przy zdarzeniach XTB ORAZ co sekundę (nie polegamy tylko na zdarzeniach). */
+    private var lastObstacleScan = 0L
     private fun scanNow(): Boolean {
         val now = SystemClock.uptimeMillis()
         if (now - lastScan < 300) return true // throttling – drzewo widoków jest drogie
@@ -688,12 +790,15 @@ class AutoExecutionService : AccessibilityService() {
         val pkg = root?.packageName?.toString()
         val label = pkg?.let { targetLabel(it) }
         if (root == null || pkg == null || label == null) {
+            foregroundPackage = pkg
+            brokerReading.value = null
             if (notVisibleSince == 0L) notVisibleSince = now
             diag = "nie widzę okna XTB" + (if (root != null) " (na wierzchu: $pkg)" else "") +
                 (if (lastTargetEventAt > 0) ", ostatni sygnał z XTB ${(now - lastTargetEventAt) / 1000} s temu" else ", brak sygnałów z XTB")
             return false
         }
         notVisibleSince = 0L
+        foregroundPackage = null
         val profile = activeProfile?.takeIf { it.packageName == pkg }
         val profilePrice = profile?.priceLabel?.let { sel -> find(root, sel)?.text?.toString()?.let(::parsePrice) }
         val ts = System.currentTimeMillis()
@@ -717,6 +822,30 @@ class AutoExecutionService : AccessibilityService() {
         }
         if (quote != null) {
             _screenQuote.value = quote
+            if (now - lastObstacleScan >= 1000) {
+            lastObstacleScan = now
+            val controlIds = setOf("TradingBuyButton", "TradingSellButton", "ModifyPositionButton", "CloseVolumeButton", "StepperTextField")
+            val obstacles = mutableListOf<Rect>()
+            val nodes = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
+            var count = 0
+            while (nodes.isNotEmpty() && count++ < 1500) {
+                val n = nodes.removeFirst()
+                val id = n.viewIdResourceName?.substringAfterLast('/').orEmpty()
+                val isChart = id.contains("chart", true) || n.className?.toString()?.contains("chart", true) == true
+                val isControl = id in controlIds
+                if (n.isVisibleToUser && (isChart || isControl)) {
+                    val rect = Rect().also { n.getBoundsInScreen(it) }
+                    if (isChart) rect.left = rect.left + rect.width() * 2 / 3
+                    if (!rect.isEmpty) obstacles.add(rect)
+                }
+                for (i in 0 until n.childCount) n.getChild(i)?.let { nodes.add(it) }
+            }
+            hudObstacles = obstacles
+            }
+            brokerReading.value = if (quote.instrument != null) runCatching {
+                readPositionRows(root).singleOrNull()?.takeIf { it.signature == profitAnchors[quote.instrument] }
+                    ?.let { BrokerReading(quote, it) }
+            }.getOrNull() else null
             quote.availableFunds?.let { lastAccountFunds = it; lastAccountCurrency = quote.accountCurrency }
         }
         (profilePrice ?: quote?.mid)?.let { _screenPrice.value = it }
@@ -783,6 +912,7 @@ class AutoExecutionService : AccessibilityService() {
     /** Etykieta aplikacji, jeśli to aplikacja docelowa (np. "XTB"); dla pozostałych null. */
     private fun targetLabel(pkg: String): String? {
         if (pkg == packageName) return null
+        if (pkg == ScreenScanner.XTB_PACKAGE) return "XTB"
         return labelCache.getOrPut(pkg) {
             val label = runCatching {
                 packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
@@ -825,7 +955,6 @@ class AutoExecutionService : AccessibilityService() {
         if (order.reduceOnly && !p.canClosePositions) {
             // Przycisk przeciwny otworzyłby NOWĄ pozycję. Zamykamy przez ekran pozycji, jeśli jest otwarty.
             if (pkg == ScreenScanner.XTB_PACKAGE) {
-                openPositionScreen(order.symbol)?.let { return ExecutionResult.Rejected("ZAMKNIJ ${order.symbol}: $it") }
                 return doClosePosition(order.symbol)
             }
             return ExecutionResult.Rejected("ZAMKNIJ POZYCJĘ ${order.symbol} ręcznie w aplikacji brokera")
@@ -881,10 +1010,23 @@ class AutoExecutionService : AccessibilityService() {
     // ───────────── Ekran pozycji XTB: SL/TP i zamykanie ─────────────
 
     /** Wpisuje SL/TP na ekranie pozycji XTB i dotyka "Modyfikuj pozycję". */
+    private val protectionMutex = Mutex()
     suspend fun setProtection(instrument: String, sl: Double?, tp: Double?): ExecutionResult =
         withContext(Dispatchers.Main.immediate) {
             try {
-                withAction { doSetProtection(instrument, sl, tp) }
+                if (!protectionMutex.tryLock()) return@withContext ExecutionResult.Rejected("Zapis SL/TP już trwa")
+                val id = java.util.UUID.randomUUID().toString()
+                protectionStatus.value = OperationStatus(id, instrument, if (sl != null) "SL: ZAPISUJĘ…" else "TP: ZAPISUJĘ…", active = true)
+                try {
+                    val result = withAction { doSetProtection(instrument, sl, tp) }
+                    protectionStatus.value = OperationStatus(id, instrument,
+                        if (result is ExecutionResult.Submitted || result is ExecutionResult.Filled) "SL: ZAPISANY ✓" else "SL: BRAK POTWIERDZENIA",
+                        error = result !is ExecutionResult.Submitted && result !is ExecutionResult.Filled)
+                    result
+                } finally {
+                    if (protectionStatus.value.active) protectionStatus.value = OperationStatus(id, instrument, "SL: BRAK POTWIERDZENIA", error = true)
+                    protectionMutex.unlock()
+                }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (t: Throwable) {
@@ -909,7 +1051,7 @@ class AutoExecutionService : AccessibilityService() {
         if (root == null) return "brak dostępu do okna"
         if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) return "XTB nie jest na ekranie"
         val title = ScreenScanner.findById(root, "ElementTitleHorizontalText").firstOrNull()
-            ?.text?.toString()?.trim()?.substringBefore(' ')
+            ?.text?.toString()?.trim()?.split(Regex("\\s+"))?.firstOrNull()
         if (title != instrument) return "na ekranie jest ${title ?: "?"}, a pozycja dotyczy $instrument"
         if (ScreenScanner.findById(root, "ModifyPositionButton").isEmpty()) {
             return "otwórz w XTB ekran pozycji $instrument (Take Profit / Stop Loss / Zamknij pozycję)"
@@ -918,6 +1060,11 @@ class AutoExecutionService : AccessibilityService() {
     }
 
     private suspend fun doSetProtection(instrument: String, sl: Double?, tp: Double?): ExecutionResult {
+        val before = appRoot()?.let { readPositionRows(it) }?.singleOrNull()
+            ?: return ExecutionResult.Rejected("brak jednoznacznego odczytu pozycji przed zmianą SL/TP")
+        if (before.signature != profitAnchors[instrument]) return ExecutionResult.Rejected("pozycja niepotwierdzona przez bota")
+        if (sl != null && before.sl != null && before.side != null && (sl - before.sl) * before.side.sign < -0.005)
+            return ExecutionResult.Rejected("nie cofam SL względem poziomu w XTB")
         openPositionScreen(instrument)?.let { return ExecutionResult.Rejected(it) }
         tp?.let { price -> setPriceIn("TakeProfitInput", "TakeProfitToggle", price)?.let { return ExecutionResult.Rejected("TP: $it") } }
         sl?.let { price -> setPriceIn("StopLossInput", "StopLossToggle", price)?.let { return ExecutionResult.Rejected("SL: $it") } }
@@ -925,13 +1072,27 @@ class AutoExecutionService : AccessibilityService() {
             ?: return ExecutionResult.Rejected("brak przycisku Modyfikuj pozycję")
         if (!click(modify)) return ExecutionResult.Rejected("nie udało się dotknąć Modyfikuj pozycję")
         delay(1_200)
-        return ExecutionResult.Submitted(
-            "Ustawiono w XTB" + (sl?.let { " SL %.2f".format(it) } ?: "") + (tp?.let { " TP %.2f".format(it) } ?: "") +
-                " – sprawdź na wykresie"
-        )
+        // Wpis w formularzu nie jest dowodem zapisu u brokera.
+        repeat(4) {
+            val row = appRoot()?.let { readPositionRows(it) }?.singleOrNull { it.signature == before.signature }
+            if (row != null && (sl == null || row.sl?.let { abs(it - sl) <= 0.011 } == true) &&
+                (tp == null || row.tp?.let { abs(it - tp) <= 0.011 } == true)) {
+                return ExecutionResult.Submitted("SL/TP potwierdzone przy pozycji XTB")
+            }
+            if (it == 0) backStayInXtb()
+            delay(500)
+        }
+        return ExecutionResult.Rejected("zmiana wysłana, ale brak potwierdzenia SL/TP przy pozycji XTB")
     }
 
     private suspend fun doClosePosition(instrument: String): ExecutionResult {
+        // Re-read the ticket and exact bot-owned row before opening the close sheet.
+        if (appRoot()?.let { ScreenScanner.findById(it, "ModifyPositionButton").isNotEmpty() } == true) backStayInXtb()
+        revealById("PositionRow0") ?: return ExecutionResult.Rejected("brak wiersza pozycji do potwierdzenia")
+        val rootBefore = appRoot() ?: return ExecutionResult.Rejected("brak okna XTB")
+        val rowBefore = readPositionRows(rootBefore).singleOrNull()
+        if (xtbTitle(rootBefore) != instrument || rowBefore == null || rowBefore.signature != profitAnchors[instrument])
+            return ExecutionResult.Rejected("nie potwierdzono tożsamości pozycji bota – nie zamykam ręcznej pozycji")
         openPositionScreen(instrument)?.let { return ExecutionResult.Rejected(it) }
         val close = appRoot()?.let { ScreenScanner.findById(it, "CloseVolumeButton").firstOrNull() }
             ?: return ExecutionResult.Rejected("brak przycisku Zamknij pozycję")
@@ -957,8 +1118,15 @@ class AutoExecutionService : AccessibilityService() {
             while (appRoot()?.let { ScreenScanner.findById(it, "CloseButton").isNotEmpty() } != false) delay(200)
             true
         } ?: false
-        return if (gone) ExecutionResult.Submitted("Zamknięto pozycję $instrument w XTB")
-        else ExecutionResult.Failed(IllegalStateException("arkusz zamknięcia nadal otwarty – sprawdź XTB"))
+        if (gone && probeInternal(instrument) == false) {
+            delay(500)
+            if (probeInternal(instrument) == false) {
+                profitAnchors.remove(instrument)
+                brokerReading.value = null
+                return ExecutionResult.Submitted("Zamknięcie $instrument potwierdzone w XTB")
+            }
+        }
+        return ExecutionResult.Failed(IllegalStateException("brak potwierdzenia zamknięcia – sprawdź XTB"))
     }
 
     private fun valueInside(root: AccessibilityNodeInfo, containerId: String): String? {
@@ -1123,6 +1291,11 @@ class AutoExecutionService : AccessibilityService() {
     private var staleSince = 0L
     private var notVisibleSince = 0L
     private var lastFrontAttempt = 0L
+    private var frontAttempts = 0
+
+    /** Samonaprawa widoku: AUTO albo włączona autonomia nawigacji, i nie w pauzie użytkownika. */
+    private fun autonomyOn(): Boolean =
+        (selfHealEnabled || navAutonomy) && System.currentTimeMillis() > navPausedUntil
 
     /** Przewija bilet z powrotem na górę (tytuł instrumentu + przyciski Sell/Buy widoczne) – inaczej bot „ślepnie”. */
     private suspend fun restoreTicketTop() {
@@ -1180,7 +1353,7 @@ class AutoExecutionService : AccessibilityService() {
 
     /** W trybie AUTO: zamyka okna, na których bot utknął, i przywraca bilet na górę. Nie działa w trakcie akcji bota. */
     private suspend fun selfHeal() {
-        if (!selfHealEnabled || _actionActive.value) { staleSince = 0L; return }
+        if (!autonomyOn() || _actionActive.value) { staleSince = 0L; return }
         if (!uiMutex.tryLock()) return
         try {
             val root = appRoot() ?: return
@@ -1227,7 +1400,7 @@ class AutoExecutionService : AccessibilityService() {
         when (xtbError.onScan(error, SystemClock.uptimeMillis())) {
             XtbErrorRecovery.Action.NONE -> Unit
             XtbErrorRecovery.Action.TAP_REFRESH -> {
-                if (!selfHealEnabled) { remoteNote("⚠️ XTB: ekran błędu – naciśnij „Odśwież” (samonaprawa działa tylko w AUTO)"); return }
+                if (!autonomyOn()) { remoteNote("⚠️ XTB: ekran błędu – naciśnij „Odśwież” (samonaprawa wyłączona albo w pauzie)"); return }
                 val btn = nodes.firstOrNull { (_, t) -> XtbErrorRecovery.REFRESH_TEXTS.any { t.equals(it, ignoreCase = true) } }?.first
                 if (btn == null) { remoteNote("⚠️ XTB: ekran błędu bez przycisku „Odśwież” – spróbuję restartu XTB"); return }
                 if (!uiMutex.tryLock()) return
@@ -1235,7 +1408,7 @@ class AutoExecutionService : AccessibilityService() {
                 remoteNote(if (ok) "🔄 XTB: ekran błędu – naciskam „Odśwież”" else "⚠️ XTB: nie udało się nacisnąć „Odśwież”", force = true)
             }
             XtbErrorRecovery.Action.RESTART_APP -> {
-                if (!selfHealEnabled) { alert("XTB pokazuje błąd – uruchom XTB ponownie"); return }
+                if (!autonomyOn()) { alert("XTB pokazuje błąd – uruchom XTB ponownie"); return }
                 restartXtb()
                 alert("XTB się zawiesiło („Coś poszło nie tak”) – otwieram XTB od nowa (${xtbError.restartCount}×). Sprawdź otwarte pozycje!")
             }
@@ -1267,7 +1440,7 @@ class AutoExecutionService : AccessibilityService() {
      */
     private suspend fun findWantedInstrument() {
         val target = wantedInstrument ?: return
-        if (!selfHealEnabled || _actionActive.value || xtbErrorVisible) { offTargetSince = 0L; return }
+        if (!autonomyOn() || _actionActive.value || xtbErrorVisible) { offTargetSince = 0L; return }
         val root = appRoot() ?: return
         if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) { offTargetSince = 0L; return }
         val now = SystemClock.uptimeMillis()
@@ -1275,8 +1448,12 @@ class AutoExecutionService : AccessibilityService() {
         val onTicket = q != null && q.isFresh() && q.instrument != null && q.bid != null && q.ask != null
         if (onTicket && (!wantedUrgent || q?.instrument.equals(target, ignoreCase = true))) { offTargetSince = 0L; navFails = 0; return }
         // Bilet tego instrumentu jest otwarty, tylko przewinięty w dół (np. do listy pozycji) – nie wychodzimy z niego.
-        if (xtbTitle(root).equals(target, ignoreCase = true) && hasTicketHeader(root, target)) {
+        if (isTargetTicket(root, target)) {
             offTargetSince = 0L
+            navFails = 0
+            // Bilet u góry jest poprawnym celem również bez notowań (zamknięty rynek).
+            // Nie przewijamy ani nie opuszczamy go tylko dlatego, że Buy/Sell są wyłączone.
+            if (ticketOrderControlsVisible(root)) return
             if (now - lastScrollUp > 10_000L && uiMutex.tryLock()) {
                 lastScrollUp = now
                 try { scrollTicketUp(root) } finally { uiMutex.unlock() }
@@ -1290,10 +1467,23 @@ class AutoExecutionService : AccessibilityService() {
         if (now - offTargetSince < wait || now - lastNavAttempt < navRetryMs(navFails)) return
         lastNavAttempt = now
         if (!uiMutex.tryLock()) return
-        val ok = try { navigateTo(target) } finally { uiMutex.unlock() }
+        navStatus = "szukam biletu $target (próba ${navFails + 1})"
+        var viaAi = false
+        val ok = try {
+            navigateTo(target) || run {
+                // Zwykłe szukanie zawiodło – nawigator wizyjny (zrzut ekranu + AI), z limitem na godzinę.
+                val ai = aiNavigator
+                if (ai != null && aiNavAllowed()) {
+                    aiNavTimes.addLast(System.currentTimeMillis())
+                    viaAi = runCatching { ai(target) }.getOrDefault(false)
+                    viaAi
+                } else false
+            }
+        } finally { uiMutex.unlock() }
+        navStatus = if (ok) "bilet $target otwarty${if (viaAi) " (nawigator AI)" else ""}" else "nie znalazłem $target (próba ${navFails + 1})"
         if (ok) {
             navFails = 0; offTargetSince = 0L
-            remoteNote("🧭 XTB: sam otworzyłem bilet $target", force = true)
+            remoteNote("🧭 XTB: sam otworzyłem bilet $target${if (viaAi) " – pomógł nawigator AI 👁️" else ""}", force = true)
             if (wantedUrgent) com.example.algohud.bot.Ntfy.send("🧭 XTB: wróciłem na bilet $target", "pozycja znów pod nadzorem bota",
                 com.example.algohud.bot.Ntfy.NORMAL, "compass")
         } else {
@@ -1314,9 +1504,19 @@ class AutoExecutionService : AccessibilityService() {
      * („Otwarte pozycje”, „Stop Loss”, „Opis instrumentu”). Lista wyników i lista Rynki ich nie mają.
      */
     private fun hasTicketHeader(root: AccessibilityNodeInfo, target: String): Boolean =
-        hasTradeButtons(root) || TICKET_MARKERS.any { m ->
+        hasTradeButtons(root) || ticketOrderControlsVisible(root) || TICKET_MARKERS.any { m ->
             root.findAccessibilityNodeInfosByText(m).any { it.isVisibleToUser && !it.isEditable }
         }
+
+    private fun ticketOrderControlsVisible(root: AccessibilityNodeInfo): Boolean =
+        XtbTargetRecognition.hasOrderControls(
+            XtbTargetRecognition.orderControlIds.filter { id ->
+                ScreenScanner.findById(root, id).any { it.isVisibleToUser }
+            },
+            XtbTargetRecognition.orderControlLabels.filter { label ->
+                root.findAccessibilityNodeInfosByText(label).any { it.isVisibleToUser && !it.isEditable }
+            }
+        )
 
     private suspend fun scrollTicketUp(root: AccessibilityNodeInfo) {
         val sc = findScrollable(root)
@@ -1382,13 +1582,22 @@ class AutoExecutionService : AccessibilityService() {
         }?.first
     }
 
+    private fun isTargetTicket(root: AccessibilityNodeInfo, target: String): Boolean {
+        val title = ScreenScanner.findById(root, "ElementTitleHorizontalText")
+            .firstOrNull { it.isVisibleToUser }?.let { (it.text ?: it.contentDescription)?.toString() }
+            ?: nodeWithText(root, target, maxY = 0.25f)?.let { (it.text ?: it.contentDescription)?.toString() }
+        return XtbTargetRecognition.matches(root.packageName?.toString(), title, target, hasTicketHeader(root, target))
+    }
+
+    private fun targetOpen(target: String): Boolean = appRoot()?.let { isTargetTicket(it, target) } == true
+
     private suspend fun onTarget(target: String): Boolean {
-        repeat(6) {
+        // Najpierw sprawdzenie, potem czekanie. Ceny/przyciski mogą doładować się później niż nagłówek.
+        repeat(20) {
+            if (targetOpen(target)) return true
             delay(400)
-            val r = appRoot()
-            if (r != null && xtbTitle(r).equals(target, ignoreCase = true) && hasTradeButtons(r)) return true
         }
-        return false
+        return targetOpen(target)
     }
 
     /** Przyciski „Sell …” / „Buy …” biletu (nie „Sellas Life Sciences” z listy – po słowie musi być koniec albo odstęp). */
@@ -1432,10 +1641,12 @@ class AutoExecutionService : AccessibilityService() {
         repeat(NAV_SCROLLS) {
             if (!inXtb()) return false
             val r = appRoot() ?: return false
+            if (isTargetTicket(r, target)) return true
             val row = instrumentRow(r, target)
             if (row != null) {
                 click(row)
                 if (onTarget(target)) return true
+                if (targetOpen(target)) return true
                 backStayInXtb()
                 return false
             }
@@ -1451,6 +1662,16 @@ class AutoExecutionService : AccessibilityService() {
     private suspend fun navigateTo(target: String): Boolean {
         Log.i(TAG, "Szukam $target w XTB")
         if (!inXtb()) return false // nigdy nie klikamy po pulpicie ani innych aplikacjach
+        if (targetOpen(target)) return true
+        appRoot()?.let { root ->
+            if (root.findAccessibilityNodeInfosByText("Ostatnio wyszukiwane").any { it.isVisibleToUser }) {
+                recentTile(root, target)?.let { tile ->
+                    click(tile)
+                    if (onTarget(target)) return true
+                }
+            }
+        }
+        if (targetOpen(target)) return true
         // 1) Rynki → CFD (lista obserwowanych) → przewijanie do wiersza instrumentu
         appRoot()?.let { r -> nodeWithText(r, "Rynki", minY = 0.8f)?.let { click(it); delay(1_200) } }
         appRoot()?.let { r -> nodeWithText(r, "CFD", maxY = 0.35f)?.let { click(it); delay(1_000) } }
@@ -1460,6 +1681,7 @@ class AutoExecutionService : AccessibilityService() {
         if (clickRowWithScroll(target)) return true
         lastNavDump = screenDump()
         if (!inXtb()) return false
+        if (targetOpen(target)) return true
         // 2) Wyszukiwarka: lupa („Wyszukaj”) dotknięta palcem → pole → nazwa → wiersz wyniku (nie pole tekstowe!)
         run {
             val r0 = appRoot() ?: return false
@@ -1472,7 +1694,9 @@ class AutoExecutionService : AccessibilityService() {
                 recentTile(r, target)?.let { tile ->
                     click(tile)
                     if (onTarget(target)) return true
-                    tapNode(tile) // gdy ACTION_CLICK nie zadziałał – dotknięcie palcem
+                    // Nie używamy węzła z poprzedniego ekranu po przejściu na instrument.
+                    if (targetOpen(target)) return true
+                    appRoot()?.let { recentTile(it, target) }?.let { fresh -> tapNode(fresh) }
                     if (onTarget(target)) return true
                 }
                 // bez rozpoznanego tekstu: pierwszy kafelek pod nagłówkiem „Ostatnio wyszukiwane”
@@ -1480,10 +1704,12 @@ class AutoExecutionService : AccessibilityService() {
                     val hb = Rect().also(head::getBoundsInScreen)
                     tap(screenW() * 0.21f, hb.bottom + screenH() * 0.055f)
                     if (onTarget(target)) return true
+                    if (targetOpen(target)) return true
                     backStayInXtb()
                     if (lupa != null) appRoot()?.findAccessibilityNodeInfosByText("Wyszukaj")?.firstOrNull { it.isVisibleToUser }?.let { tapNode(it); delay(1_500) }
                 }
             }
+            if (targetOpen(target)) return true
             var field = appRoot()?.let { findEditable(it) }
             if (field == null && inXtb() && appRoot()?.findAccessibilityNodeInfosByText("Ostatnio wyszukiwane").isNullOrEmpty()) {
                 tap(screenW() / 2, screenH() * 0.19f); delay(900); field = appRoot()?.let { findEditable(it) }
@@ -1506,6 +1732,7 @@ class AutoExecutionService : AccessibilityService() {
                     if (clickRowWithScroll(target)) return true
                 }
             }
+            if (targetOpen(target)) return true
             lastNavDump = lastNavDump + " || " + screenDump()
             backStayInXtb()
         }
@@ -1513,6 +1740,22 @@ class AutoExecutionService : AccessibilityService() {
     }
 
     /** Wiersze otwartych pozycji widoczne w drzewie bieżącego ekranu XTB (bez klikania) – do wykrycia pozycji spoza księgi. */
+    private val profitAnchors = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** Wyłącznie świeży odczyt pozycji, której otwarcie potwierdził bot. */
+    fun profitSnapshot(instrument: String, side: Side, quantity: Double): Pair<ScreenQuote, PositionRowInfo>? =
+        positionSnapshot(instrument, side, quantity)?.takeIf { it.first.accountCurrency == "PLN" }
+
+    fun positionSnapshot(instrument: String, side: Side, quantity: Double): Pair<ScreenQuote, PositionRowInfo>? {
+        val root = appRoot()?.takeIf { it.packageName?.toString() == ScreenScanner.XTB_PACKAGE } ?: return null
+        val q = ScreenScanner.scanXtb(root, ScreenScanner.XTB_PACKAGE, "XTB", System.currentTimeMillis()) ?: return null
+        if (q.instrument != instrument) return null
+        val row = readPositionRows(root).singleOrNull() ?: return null
+        if (row.signature != profitAnchors[instrument] || row.side != side ||
+            row.volume?.let { abs(abs(it) - quantity) > 1e-8 } != false) return null
+        return q to row
+    }
+
     fun visiblePositionRows(): List<PositionRowInfo> =
         appRoot()?.takeIf { it.packageName?.toString() == ScreenScanner.XTB_PACKAGE }?.let { runCatching { readPositionRows(it) }.getOrNull() }.orEmpty()
 
@@ -1566,19 +1809,104 @@ class AutoExecutionService : AccessibilityService() {
         }.onFailure { Log.w(TAG, "Alarm nieudany", it) }
     }
 
-    /** W trybie AUTO: jeśli XTB zniknęło z ekranu na ponad 20 s, przywraca je na pierwszy plan. */
+    /**
+     * XTB zniknęło z ekranu (pulpit, inna aplikacja) na ponad 20 s → przywraca je na pierwszy plan.
+     * Działa we wszystkich trybach przy włączonej autonomii. Nie wyciąga z ustawień, instalatora, Algo HUD
+     * i okien systemowych (np. zgoda AnyDesk). Ekran wygaszony = nic nie robi.
+     */
     private fun keepXtbFront() {
-        if (!selfHealEnabled || !getSharedPreferences("ui", MODE_PRIVATE).getBoolean("keep_xtb_front", true)) return
+        if (!autonomyOn() || !getSharedPreferences("ui", MODE_PRIVATE).getBoolean("keep_xtb_front", true)) return
         val since = notVisibleSince
         val now = SystemClock.uptimeMillis()
-        if (since == 0L || now - since < 20_000 || now - lastFrontAttempt < 30_000) return
+        if (since == 0L) { frontAttempts = 0; return }
+        val fg = foregroundPackage
+        if (fg != null && NO_YANK_PREFIXES.any { fg == it || fg.startsWith("$it.") }) {
+            navStatus = "XTB w tle – czekam, bo na wierzchu: $fg"
+            return
+        }
+        if (fg != null && fg.startsWith("com.anydesk") && now - since < 120_000) return // okno AnyDesk – daj 2 min
+        if (now - since < 20_000 || now - lastFrontAttempt < 30_000) return
         if (getSystemService(android.os.PowerManager::class.java)?.isInteractive != true) return
         lastFrontAttempt = now
-        val intent = packageManager.getLaunchIntentForPackage(ScreenScanner.XTB_PACKAGE) ?: return
-        intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-        runCatching { startActivity(intent) }
-        Log.i(TAG, "XTB niewidoczne od ${(now - since) / 1000} s – przywracam na pierwszy plan")
+        frontAttempts++
+        val intent = packageManager.getLaunchIntentForPackage(ScreenScanner.XTB_PACKAGE) ?: run { navStatus = "XTB nie jest zainstalowane?"; return }
+        intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+        runCatching { startActivity(intent) }.onFailure { Log.w(TAG, "Przywracanie XTB nieudane", it) }
+        navStatus = "przywracam XTB na wierzch (${frontAttempts}×, na wierzchu było: ${fg ?: "?"})"
+        Log.i(TAG, "XTB niewidoczne od ${(now - since) / 1000} s – przywracam na pierwszy plan ($frontAttempts×)")
+        // Android może zablokować start z tła – po 3 nieudanych próbach jeden alarm (powtórka co 10 min w alert()).
+        if (frontAttempts == 3 || frontAttempts % 20 == 0) alert("Nie mogę przywrócić XTB na ekran (${fg ?: "?"} na wierzchu) – otwórz XTB ręcznie")
     }
+
+    // ───────────── Prymitywy nawigacji dla nawigatora AI (wołane TYLKO pod uiMutex z findWantedInstrument) ─────────────
+
+    private val aiNavTimes = ArrayDeque<Long>()
+    private fun aiNavAllowed(): Boolean {
+        val now = System.currentTimeMillis()
+        while (aiNavTimes.isNotEmpty() && now - aiNavTimes.first() > 3_600_000L) aiNavTimes.removeFirst()
+        return aiNavTimes.size < AI_NAV_MAX_PER_HOUR
+    }
+
+    /** Słowa przycisków, w które nawigator AI NIGDY nie może trafić (zlecenia, zamknięcia, modyfikacje). */
+    private val navForbidden = listOf("Sell", "Buy", "Sprzedaj", "Kup", "Potwierdź", "Zamknij", "Close", "Modyfikuj", "Modify",
+        "Usuń", "Delete", "Wyloguj", "Log out", "Wpłać", "Wypłać", "Deposit", "Withdraw")
+
+    /** Wymiary ekranu jak na zrzucie (cały wyświetlacz, z paskami). */
+    private fun realScreen(): Pair<Float, Float> =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            getSystemService(android.view.WindowManager::class.java).currentWindowMetrics.bounds.let { it.width().toFloat() to it.height().toFloat() }
+        } else screenW() to screenH()
+
+    /**
+     * Dotknięcie w punkcie (0..1, 0..1 względem całego ekranu). Zwraca null = dotknięto, inaczej powód odmowy.
+     * Odmawia poza XTB i gdy w punkcie jest przycisk z [navForbidden].
+     */
+    suspend fun navTapNormalized(nx: Float, ny: Float): String? {
+        if (navAbort()) return "kill-switch"
+        if (nx !in 0.02f..0.98f || ny !in 0.03f..0.97f) return "punkt poza bezpiecznym obszarem"
+        val root = appRoot() ?: return "brak okna"
+        if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) return "XTB nie jest na wierzchu"
+        if (findOrderConfirm(root) != null) return "otwarte potwierdzenie zlecenia – nie dotykam"
+        val (w, h) = realScreen()
+        val x = nx * w; val y = ny * h
+        val hit = textNodes(root, 400).firstOrNull { (n, t) ->
+            val r = Rect().also(n::getBoundsInScreen)
+            r.contains(x.toInt(), y.toInt()) && navForbidden.any { f -> t.trim().startsWith(f, ignoreCase = true) }
+        }
+        if (hit != null) return "w tym miejscu jest „${hit.second.take(20)}” – zakazane dla nawigatora"
+        return if (tap(x, y)) null else "gest odrzucony"
+    }
+
+    /**
+     * Chowa HUD i tarczę na czas [block] (zrzut ekranu dla AI – żeby HUD nie zasłaniał XTB).
+     * Gdy trwa jakakolwiek akcja w XTB (zlecenie, nawigacja), NIE rusza HUD-a – zrzut idzie z HUD-em,
+     * bo przełączanie widoczności w trakcie gestu mogłoby przechwycić dotyk. [lockHeld] = wołający już trzyma uiMutex.
+     */
+    suspend fun <T> withHudHidden(lockHeld: Boolean = false, block: suspend () -> T): T {
+        val owned = !lockHeld && uiMutex.tryLock()
+        val canHide = (owned || lockHeld) && !_actionActive.value && !_gestureActive.value
+        try {
+            if (!canHide) return block()
+            _gestureActive.value = true
+            try { delay(150); return block() } finally { _gestureActive.value = false }
+        } finally { if (owned) uiMutex.unlock() }
+    }
+
+    suspend fun navBack() { if (!navAbort()) backStayInXtb() }
+
+    suspend fun navScroll(down: Boolean) {
+        if (navAbort()) return
+        val r = appRoot() ?: return
+        val sc = findScrollable(r)
+        val ok = sc?.performAction(if (down) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) == true
+        if (!ok) { if (down) drag(screenW() / 2, screenH() * 0.72f, screenH() * 0.38f) else drag(screenW() / 2, screenH() * 0.38f, screenH() * 0.72f) }
+        delay(600)
+    }
+
+    suspend fun navIsOnTarget(target: String): Boolean = onTarget(target)
+
+    /** Krótki opis tekstów widocznych w XTB (dla nawigatora, gdy zrzut ekranu jest zablokowany). */
+    fun navScreenText(): String = screenDump()
 
     private suspend fun awaitById(id: String, timeoutMs: Long): AccessibilityNodeInfo? = withTimeoutOrNull(timeoutMs) {
         var found: AccessibilityNodeInfo? = null
@@ -1598,7 +1926,7 @@ class AutoExecutionService : AccessibilityService() {
 
     private fun xtbTitle(root: AccessibilityNodeInfo?): String? =
         root?.let { ScreenScanner.findById(it, "ElementTitleHorizontalText").firstOrNull() }
-            ?.text?.toString()?.trim()?.substringBefore(' ')
+            ?.text?.toString()?.trim()?.split(Regex("\\s+"))?.firstOrNull()
 
     /** Z ekranu instrumentu wchodzi w (jedyną) otwartą pozycję. null = jesteśmy na ekranie pozycji. */
     private suspend fun openPositionScreen(instrument: String): String? {
@@ -1646,7 +1974,7 @@ class AutoExecutionService : AccessibilityService() {
         val sidePx = q?.let { if (order.side == Side.BUY) it.ask else it.bid }
             ?: return ExecutionResult.Rejected("brak ceny Buy/Sell na ekranie XTB")
         // Ceny bota mogą pochodzić z feedu w tle (PAXG) – przesuwamy SL/TP o różnicę do ceny XTB.
-        val shift = sidePx - order.referencePrice
+        val shift = (order.brokerReferencePrice ?: sidePx) - order.referencePrice
         val sl = order.stopPrice + shift
         val tp = order.takeProfit?.plus(shift)
 
@@ -1710,8 +2038,13 @@ class AutoExecutionService : AccessibilityService() {
                 return ExecutionResult.Rejected("cena ruszyła o %.2f w stronę SL – setup nieaktualny".format(abs(pxNow - sidePx)))
             }
         }
+        if (entryBlocked?.invoke() == true) return ExecutionResult.Rejected("STOP WEJŚĆ – przerwano przed wysłaniem")
         val btn = revealById(if (order.side == Side.BUY) "TradingBuyButton" else "TradingSellButton")
             ?: return ExecutionResult.Rejected("nie znaleziono przycisku ${order.side}")
+        scanNow()
+        if (entryBlocked?.invoke() == true) return ExecutionResult.Rejected("STOP WEJŚĆ aktywny")
+        val checkedQuote = screenQuote.value
+        entryCheck?.invoke(order, checkedQuote)?.let { return ExecutionResult.Rejected(it) }
         if (!click(btn)) return ExecutionResult.Rejected("kliknięcie ${order.side} nie powiodło się")
         _uiEvents.tryEmit("⏱ ${order.symbol}: od decyzji do kliknięcia %.1f s".format((SystemClock.uptimeMillis() - t0) / 1000.0))
 
@@ -1725,10 +2058,19 @@ class AutoExecutionService : AccessibilityService() {
             n
         }
         if (confirm != null) {
+            if (entryBlocked?.invoke() == true) {
+                backStayInXtb()
+                return ExecutionResult.Rejected("STOP WEJŚĆ – anulowano potwierdzenie")
+            }
             // Zabezpieczenie: na ekranie potwierdzenia musi być nasz wolumen.
             val screenText = appRoot()?.let { ScreenScanner.collect(it).joinToString(" ") { t -> t.text } }.orEmpty()
             if (!screenText.contains(formatQty(order.quantity))) {
                 return ExecutionResult.Failed(IllegalStateException("ekran potwierdzenia XTB pokazuje inny wolumen – NIE potwierdzam, sprawdź ręcznie"))
+            }
+            val confirmQuote = screenQuote.value?.takeIf { it.instrument == order.symbol } ?: checkedQuote
+            entryCheck?.invoke(order, confirmQuote)?.let { why ->
+                backStayInXtb()
+                return ExecutionResult.Rejected(why)
             }
             if (!click(confirm)) {
                 return ExecutionResult.Failed(IllegalStateException("nie udało się dotknąć 'Potwierdź zlecenie' – stan NIEZNANY, sprawdź XTB"))
@@ -1746,6 +2088,7 @@ class AutoExecutionService : AccessibilityService() {
         val desc = "${order.side} ${formatQty(order.quantity)} ${order.symbol}, SL %.2f".format(sl) + (tp?.let { ", TP %.2f".format(it) } ?: "")
         return when (val check = awaitOpenedPosition(order, sl, tp, rowsBefore)) {
             is OpenCheck.Confirmed -> {
+                profitAnchors[order.symbol] = check.row.signature
                 if (formOp != null) {
                     formCoordinator.onConfirmed(
                         formOp,

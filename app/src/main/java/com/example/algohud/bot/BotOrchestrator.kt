@@ -15,6 +15,10 @@ import com.example.algohud.execution.AutoExecutionService
 import com.example.algohud.execution.ExecutionEngine
 import com.example.algohud.risk.RiskManager
 import com.example.algohud.risk.TradeJournal
+import com.example.algohud.council.AgentCouncil
+import com.example.algohud.council.CouncilContext
+import com.example.algohud.council.CouncilDecision
+import com.example.algohud.council.CouncilMode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
@@ -140,7 +144,9 @@ class BotOrchestrator(
     /** (kapitał, źródło) – np. (631.27, "XTB:PLN"); null = brak danych. */
     private val equityProvider: suspend () -> Pair<Double, String>?,
     private val manualStopPct: Double = 0.005,
-    private val barMs: Long = 5 * 60_000L
+    private val barMs: Long = 5 * 60_000L,
+    /** Rada 4 agentów AI – bramka przed NOWYM wejściem (null = wyłączona). */
+    private val council: AgentCouncil? = null
 ) {
     private val _hud = MutableStateFlow(HudState())
     val hud: StateFlow<HudState> = _hud.asStateFlow()
@@ -335,7 +341,9 @@ class BotOrchestrator(
 
     private suspend fun enterAggressive(
         inst: String, dir: Int, px: Double, rawStop: Double, why: String, ts: Long,
-        tp: Double? = null, tier: Int = Tier.AGGRESSIVE, tpR: Double = 2.0
+        tp: Double? = null, tier: Int = Tier.AGGRESSIVE, tpR: Double = 2.0,
+        /** Po FAKTYCZNYM wysłaniu zlecenia (przy radzie w trybie GATE – dopiero po werdykcie, w tle). */
+        after: ((ExecutionResult) -> Unit)? = null
     ): ExecutionResult? {
         // Bot może złożyć zlecenie tylko na instrumencie otwartym w XTB – pozostałe liczy w tle bez prób wejścia.
         val onScreen = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() }?.instrument
@@ -362,7 +370,7 @@ class BotOrchestrator(
         }
         val order = buildOrder(inst, side, entry, stop, takeProfit, why, pointValue(inst), tier) ?: return null
         decisionCard(inst, order, Signal(side, stop, takeProfit, why, tier), ev = Double.NaN)
-        return engine.submit(order)
+        return submitEntry(inst, order, after)
     }
 
     // ───────────── ŚWIECE + PREDYKCJA AI: model online, wejście przed zamknięciem świecy, trailing za impulsem ─────────────
@@ -414,7 +422,11 @@ class BotOrchestrator(
     }
 
     /** Plan bota po ludzku: co robi teraz, na co czeka, kiedy zamknie. */
+    @Volatile var detailsRequested: Boolean = false
+    private var lastPlanRenderAt = 0L
     private suspend fun updatePlan(inst: String, now: Long) {
+        if (!detailsRequested && now - lastPlanRenderAt < 5000) return
+        lastPlanRenderAt = now
         val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
         val sh = q?.let { basis(inst, it) } ?: 0.0
         fun f(v: Double) = "%.2f".format(v + sh)
@@ -429,7 +441,7 @@ class BotOrchestrator(
             val sl = "SL ${f(pos.stopPrice)}" + if (pos.stopPrice != pos.initialStop) " (przesunięty)" else ""
             val exit = if (BROKER_EXITS_ONLY) {
                 "Wyjście: TP ${pos.takeProfit?.let { f(it) } ?: "—"} albo $sl w XTB" +
-                    (if (TREND_EXIT) " albo potwierdzone odwrócenie trendu (zamykam sam)" else "") +
+                    (if (TREND_EXIT && !pos.entryReason.startsWith("ZAKRES") && !EntryFilters.isConsolidation(aggregators["$inst@${Learner.M5}"]?.closed().orEmpty())) " albo potwierdzone odwrócenie trendu (zamykam sam)" else "") +
                     ". +1R → SL na BE, od +1,5R SL 1R za ceną; duży wzrost od +%.0fR → TP dalej i SL ciasno za ceną (w otwartej pozycji XTB).".format(BIG_MOVE_MIN_R) +
                     (if (TREND_EXIT) "\n• 🔄 Odwrócenie: " + (reversalNote[inst] ?: "czekam na zamknięte świece 1m") else "") +
                     "\n" + compassLine(inst)
@@ -464,6 +476,12 @@ class BotOrchestrator(
             ).joinToString("\n")
         }
         if (_plan[inst] != text) { _plan[inst] = text; _hud.update { it.copy(plan = text) } }
+        val observationPrice = lastPx[inst]
+        if (council != null && observationPrice != null && !risk.killSwitch.value && !council.busy) {
+            val m1 = aggregators["$inst@${Learner.M1}"]?.closed().orEmpty()
+            val m5 = aggregators["$inst@${Learner.M5}"]?.closed().orEmpty()
+            scope.launch { council.observeCandles(inst, m1, m5, observationPrice.first, observationPrice.second, now) }
+        }
         val compact = compactView(inst, now, sh)
         _hud.update { if (it.compact == compact) it else it.copy(compact = compact) }
         statusReport(inst, now, compact)
@@ -581,8 +599,9 @@ class BotOrchestrator(
         val stop = px - dir * AI_STOP_ATR * p.atr
         val reason = "$AI_TAG ${if (p.early) "wcześnie " else ""}${if (dir > 0) "wzrostowa" else "spadkowa"} %.0f%%, korpus ~%.2f".format(p.prob * 100, p.expBody)
         aiEnteredBar[inst] = curBar
-        val r = enterAggressive(inst, dir, px, stop, reason, ts, tpR = AI_SAFETY_TP_R)
-        if (r is ExecutionResult.Filled || r is ExecutionResult.Submitted) aiTrades[inst] = AiTrade(expBody = p.expBody)
+        enterAggressive(inst, dir, px, stop, reason, ts, tpR = AI_SAFETY_TP_R) { r ->
+            if (r is ExecutionResult.Filled || r is ExecutionResult.Submitted) aiTrades[inst] = AiTrade(expBody = p.expBody)
+        }
     }
 
     // ── zarządzanie pozycją AI: TP wirtualny, przesuwanie TP za impulsem, ciasny trailing, wyjście przy wyhamowaniu ──
@@ -600,6 +619,7 @@ class BotOrchestrator(
         var lockStep: Int = 0,
         /** Najlepszy zysk netto w zł liczony jak „Zysk netto” w XTB (po cenie zamknięcia z ekranu). */
         var bestNetPln: Double = 0.0,
+        var profitStopXtb: Double? = null,
         /** TP, który według bota jest teraz ustawiony w XTB (NaN = nieznany). */
         var brokerTp: Double = Double.NaN,
         /** Świeca 1m, w której ostatnio odsunięto TP (maks. raz na świecę). */
@@ -636,7 +656,7 @@ class BotOrchestrator(
                 } else (px - pos.entryPrice) * dir * perPrice - spreadOf(inst) * perPrice
                 t.bestNetPln = maxOf(t.bestNetPln, netPln)
                 // Schodki: co SL_STEP_PLN zysku netto SL wyżej (+8 zł → wejście + spread, +16 → +8 zł, +24 → +16…).
-                Sizing.lockStop(pos.entryPrice, dir, t.bestNetPln, perPrice, maxOf(spreadOf(inst), 0.05), SL_STEP_PLN)?.let { lock ->
+                if (pos.paper) Sizing.lockStop(pos.entryPrice, dir, t.bestNetPln, perPrice, maxOf(spreadOf(inst), 0.05), SL_STEP_PLN)?.let { lock ->
                     val steps = kotlin.math.floor(t.bestNetPln / SL_STEP_PLN + 1e-9).toInt()
                     if (risk.tightenStop(inst, lock) && steps > t.lockStep) {
                         t.lockStep = steps
@@ -646,7 +666,7 @@ class BotOrchestrator(
                     }
                 }
                 val rPln = r * perPrice
-                if (bestPln >= maxOf(BE_AT_PLN, rPln)) {
+                if (pos.paper && bestPln >= maxOf(BE_AT_PLN, rPln)) {
                     // BE dopiero po +1R (wcześniej to tylko oddawanie pozycji szumowi), od +1,5R SL 1R za najlepszą ceną.
                     val be = pos.entryPrice + dir * maxOf(spreadOf(inst), 0.05)
                     val trail = best - dir * r
@@ -660,11 +680,14 @@ class BotOrchestrator(
             // 1) Odwrócenie trendu: potwierdzona tendencja przeciwna (≥ 2 z 3 sygnałów na 2 świecach) → bot zamyka sam.
             val m5c = aggregators["$inst@${Learner.M5}"]?.closed().orEmpty()
             val guardOff = when {
-                pos.entryReason.startsWith("ZAKRES") -> "wyłączone dla pozycji z ZAKRESU – chroni SL nad/pod zakresem"
-                EntryFilters.isConsolidation(m5c) -> "wyłączone w konsolidacji – chroni SL"
+                pos.entryReason.startsWith("ZAKRES") -> "automatyczne wyjście przy zwrocie wyłączone dla ZAKRESU"
+                EntryFilters.isConsolidation(m5c) -> "automatyczne wyjście przy zwrocie wyłączone w konsolidacji"
                 else -> null
             }
-            if (guardOff != null) reversalNote[inst] = guardOff
+            if (guardOff != null || !TREND_EXIT) {
+                reversalGuards.remove(inst)
+                reversalNote[inst] = guardOff ?: "automatyczne wyjście przy zwrocie wyłączone"
+            }
             if (TREND_EXIT && guardOff == null) {
                 val v = reversalGuards.getOrPut(inst) { ReversalGuard() }
                     .evaluate("${pos.openedAt}:${pos.entryPrice}", pos.side, pos.openedAt, best, closed, compass(inst))
@@ -688,6 +711,21 @@ class BotOrchestrator(
                 }
             }
             if (t.trailing) risk.tightenStop(inst, best - dir * maxOf(BIG_MOVE_TRAIL_ATR * atr, 2 * spreadOf(inst)))
+            if (!pos.paper) {
+                AutoExecutionService.instance?.profitSnapshot(inst, pos.side, pos.quantity)?.let { (quote, row) ->
+                    val entry = row.entryText?.let { com.example.algohud.execution.PositionRowParser.number(it) }
+                    val net = row.netPnl
+                    val bid = quote.bid; val ask = quote.ask
+                    if (entry != null && net != null && bid != null && ask != null) {
+                        val target = ProfitTrail.target(entry, dir, net, perPrice, ask - bid,
+                            if (dir > 0) bid else ask, row.sl)
+                        if (target != null && (t.profitStopXtb == null || (target - t.profitStopXtb!!) * dir > 0)) {
+                            t.profitStopXtb = target
+                            msg("🔒 $inst: XTB netto %+.2f zł – zlecam SL %.2f (spread + zysk)".format(net, target))
+                        }
+                    }
+                }
+            }
             brokerSync(inst, pos, t, ts, perPrice)
             return
         }
@@ -772,8 +810,8 @@ class BotOrchestrator(
             val be = p.entryPrice + dir * maxOf(spreadOf(inst), 0.05)
             val step = maxOf(2 * spreadOf(inst), if (perPrice > 0) BROKER_STEP_PLN / perPrice else 0.3)
             // SL: tylko po stronie zysku (startowy SL 15–20 zł zostaje w XTB), maks. co BROKER_SYNC_EVERY_MS.
-            val slDue = (stopNow - be) * dir >= 0 && ts - t.brokerAt >= BROKER_SYNC_EVERY_MS &&
-                (t.brokerSl.isNaN() || abs(stopNow - t.brokerSl) >= step)
+            val profitDue = t.profitStopXtb != null && ts - t.brokerAt >= BROKER_SYNC_EVERY_MS
+            val slDue = profitDue
             // TP: od razu po odsunięciu (bez czekania 20 s) – inaczej XTB zamknie na starym TP w środku wzrostu.
             val tpDue = tpNow != null && (t.brokerTp.isNaN() || abs(tpNow - t.brokerTp) >= step)
             if (!slDue && !tpDue) return@launch
@@ -781,14 +819,28 @@ class BotOrchestrator(
             t.brokerBusy = true; t.brokerAt = ts
             try {
                 val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
-                val sh = q?.let { basis(inst, it) } ?: 0.0
+                if (q == null) return@launch
+                val sh = basis(inst, q)
+                val snapshot = AutoExecutionService.instance?.profitSnapshot(inst, p.side, p.quantity)
+                val requestedSl = if (profitDue && snapshot != null) {
+                    val row = snapshot.second
+                    val entry = row.entryText?.let { com.example.algohud.execution.PositionRowParser.number(it) }
+                    val bid = snapshot.first.bid; val ask = snapshot.first.ask
+                    if (entry == null || row.netPnl == null || bid == null || ask == null) null
+                    else ProfitTrail.target(entry, dir, row.netPnl, perPrice, ask - bid, if (dir > 0) bid else ask, row.sl)
+                } else null
+                if (slDue && requestedSl == null) { t.profitStopXtb = null; return@launch }
                 val res = AutoExecutionService.instance?.setProtection(
-                    inst, if (slDue) stopNow + sh else null, if (tpDue) tpNow!! + sh else null
+                    inst, requestedSl, if (tpDue) tpNow!! + sh else null
                 )
                 if (res is ExecutionResult.Submitted || res is ExecutionResult.Filled) {
-                    if (slDue) t.brokerSl = stopNow
+                    if (slDue) {
+                        t.brokerSl = requestedSl!! - sh
+                        risk.tightenStop(inst, t.brokerSl)
+                        if (profitDue) t.profitStopXtb = null
+                    }
                     if (tpDue) t.brokerTp = tpNow!!
-                    msg("🛡 $inst: w otwartej pozycji XTB" + (if (slDue) " SL → %.2f".format(stopNow + sh) else "") +
+                    msg("🛡 $inst: w otwartej pozycji XTB" + (if (slDue) " SL → %.2f".format(requestedSl) else "") +
                         (if (tpDue) " TP → %.2f".format(tpNow!! + sh) else ""))
                 } else if (res != null) {
                     msg("⚠️ $inst: nie zmieniłem SL/TP w pozycji XTB (${(res as? ExecutionResult.Rejected)?.reason ?: res}) – ponowię")
@@ -825,6 +877,7 @@ class BotOrchestrator(
     }
 
     private fun updatePredictionHud(inst: String) = runCatching {
+        if (!detailsRequested) return@runCatching
         val pr = predictors[inst] ?: return@runCatching
         val (hit, graded) = pr.hitStats()
         val acc = if (graded > 0) "%d/%d (%.0f%%)".format(hit, graded, hit * 100.0 / graded) else "brak ocen"
@@ -1093,7 +1146,11 @@ class BotOrchestrator(
         scope.launch {
             while (isActive) {
                 delay(1_000)
-                guarded("zegar świec") { lock.withLock { candleClock(System.currentTimeMillis()) } }
+                guarded("zegar świec") { lock.withLock {
+                    val now = System.currentTimeMillis()
+                    candleClock(now)
+                    _hud.update { it.copy(candles = candleSnapshot(hudLearningInstrument, now).summary()) }
+                } }
             }
         }
         scope.launch {
@@ -1263,8 +1320,11 @@ class BotOrchestrator(
     // ───────────── Rdzeń: wyjścia, świece, sygnały ─────────────
 
     private suspend fun processPrice(inst: String, px: Double, tsRaw: Long) {
-        // Znacznik z przyszłości (zły zegar źródła) zablokowałby świece – przycinamy do teraz.
-        val ts = minOf(tsRaw, System.currentTimeMillis() + 2_000)
+        // Nie odmładzaj nieaktualnych notowań; odrzuć błędny czas/cenę i cofające się ticki.
+        val now = System.currentTimeMillis()
+        if (!px.isFinite() || px <= 0 || tsRaw <= 0 || tsRaw > now + 2_000 || now - tsRaw > 20_000) return
+        val ts = tsRaw
+        if (lastPx[inst]?.second?.let { ts < it } == true) return
         lastPx[inst] = px to ts
         risk.onMark(inst, px)?.let { exit ->
             val real = engine.mode.value != ExecutionMode.DRY_RUN && risk.position(inst)?.paper == false
@@ -1282,9 +1342,12 @@ class BotOrchestrator(
         }
         aiManage(inst, px, ts)
         countTick(inst, ts)
-        for (tf in Learner.TIMEFRAMES) {
+        // Aktualizuj oba interwały przed oceną sygnału: rada musi widzieć ten sam tick na M1 i M5.
+        val newlyClosed = Learner.TIMEFRAMES.mapNotNull { tf ->
+            agg(inst, tf).onTick(px, ts)?.let { tf to it }
+        }
+        for ((tf, closed) in newlyClosed) {
             val a = agg(inst, tf)
-            val closed = a.onTick(px, ts) ?: continue
             if (tf == Learner.M1) onM1Closed(inst, a.closed())
             // Instrumenty bez historii (lub bez cen w tle): zapisujemy świece – nauka rośnie z każdym dniem i przetrwa restart.
             if (!hasBackground(inst) || inst in noHistory) runCatching { barStore.append(inst, tf, closed) }
@@ -1331,7 +1394,7 @@ class BotOrchestrator(
         val order = buildOrder(inst, sig.side, entry, sig.stopPrice, sig.takeProfit, "STRAT ${sig.reason}", pointValue(inst), tier)
             ?: return
         decisionCard(inst, order, sig.copy(tier = tier), ev)
-        engine.submit(order)
+        submitEntry(inst, order)
     }
 
     /** Decyzja w formacie: kondycja • kierunek • poziom agresji i wielkość • wejście/SL/TP (w cenach XTB). */
@@ -1479,8 +1542,9 @@ class BotOrchestrator(
         if (risk.cooldownLeftMs() > 0) { usOpenInfo[inst] = "przerwa po stracie ${risk.cooldownLeftMs() / 1000} s$rangeText"; return }
         msg("🇺🇸 $inst: ${s.reason}")
         val dir = s.side.sign
-        val r = enterAggressive(inst, dir, px, s.stop, s.reason, now, tier = Tier.MODERATE)
-        if (r is ExecutionResult.Filled || r is ExecutionResult.Submitted) res.status.openMs?.let { orb.markTaken(it) }
+        enterAggressive(inst, dir, px, s.stop, s.reason, now, tier = Tier.MODERATE) { r ->
+            if (r is ExecutionResult.Filled || r is ExecutionResult.Submitted) res.status.openMs?.let { orb.markTaken(it) }
+        }
     }
 
     private val blindSince = HashMap<String, Long>()
@@ -1652,40 +1716,16 @@ class BotOrchestrator(
 
     /** Uproszczony HUD: tylko pozycja, „co dalej”, ostatnie transakcje, alarm i kanał ntfy. */
     private suspend fun compactView(inst: String, now: Long, sh: Double): String {
-        val px = lastPx[inst]?.first
-        val lines = ArrayList<String>()
-        val day = journal.all().filter { !it.paper && now - it.closedAt < 24 * 3_600_000 && java.time.Instant.ofEpochMilli(it.closedAt).atZone(UsSession.PL).toLocalDate() == java.time.Instant.ofEpochMilli(now).atZone(UsSession.PL).toLocalDate() }
-        lines += "$inst ${px?.let { "%.2f".format(it + sh) } ?: "—"} • ${engine.mode.value.name} • dziś %+.2f zł (%d tr.)".format(day.sumOf { it.pnl }, day.size)
         val pos = risk.position(inst)
         if (pos != null) {
-            val dir = pos.side.sign
-            val pnl = px?.let { (it - pos.entryPrice) * dir * pos.quantity * pos.pointValue }
-            lines += "${if (pos.side == Side.BUY) "🟢" else "🔴"} W POZYCJI ${sideName(pos.side)} %s • świeca %s @ %.2f".format(
-                BigDecimal.valueOf(pos.quantity).toPlainString(), hhmm(pos.openedAt), pos.entryPrice + sh)
-            lines += "   SL %.2f • TP %s • teraz %s • %s".format(pos.stopPrice + sh, pos.takeProfit?.let { "%.2f".format(it + sh) } ?: "—",
-                pnl?.let { "%+.2f zł".format(it) } ?: "—", stratName(pos.entryReason))
-            reversalNote[inst]?.let { lines += "   🔄 $it" }
-        } else {
-            val armed = armedNote[inst]?.takeIf { now - it.first < 30_000 }?.second
-            val skipped = skipNote[inst]?.takeIf { now - it.first < 90_000 }?.second
-            val block = dataNote[inst] ?: sessionBlock(inst, now) ?: smc.newsBlackout(now)
-            lines += when {
-                block != null -> "⏸ CZEKAM • ❌ nie wejdę: $block"
-                armed != null -> "⏳ SZYKUJĘ SIĘ: $armed"
-                skipped != null -> "⏸ CZEKAM • ❌ nie wszedłem: $skipped"
-                else -> "⏸ CZEKAM • brak setupu – obserwuję"
-            }
+            val state = if (aiTrades[inst]?.closing == true) "WYCHODZĘ" else "WEJŚCIE ${hhmm(pos.openedAt)} • W POZYCJI"
+            val row = if (pos.paper) null else AutoExecutionService.brokerReading.value?.takeIf { it.quote.instrument == inst && now - it.quote.timestamp in 0..3000 && it.row.side == pos.side }?.row
+            val protection = if (pos.paper) "PAPIER • SL %.2f".format(pos.stopPrice)
+                else com.example.algohud.execution.ProtectionDisplay.line(row)
+            return "$state ${sideName(pos.side)} $inst\n$protection"
         }
-        journal.all().filter { it.symbol == inst }.takeLast(3).reversed().forEach { t ->
-            lines += "• %s %s %.2f→%.2f %+.2f zł%s".format(hhmm(t.closedAt), sideName(t.side), t.entry + sh, t.exit + sh, t.pnl, if (t.paper) " (papier)" else "")
-        }
-        AutoExecutionService.lastAlert?.takeIf { now - it.first < 15 * 60_000 }?.let { lines += "🚨 ${hhmm(it.first)} ${it.second}" }
-        Ntfy.topic?.let { t ->
-            val st = Ntfy.lastError?.let { " • ⚠️ wysyłka nieudana: ${it.take(60)}" }
-                ?: if (Ntfy.lastOkAt > 0) " • ostatnio wysłano ${hhmm(Ntfy.lastOkAt)} ✓" else " • jeszcze nic nie wysłano"
-            lines += "🔔 ntfy: $t$st"
-        }
-        return lines.joinToString("\n")
+        val last = journal.all().lastOrNull { it.symbol == inst && now - it.closedAt in 0..120_000 }
+        return if (last != null) "WYJŚCIE ${hhmm(last.closedAt)} • ${sideName(last.side)} $inst" else "CZEKAM NA WEJŚCIE • $inst"
     }
 
     private fun compassLine(inst: String): String =
@@ -1735,10 +1775,10 @@ class BotOrchestrator(
         val order = buildOrder(inst, s.side, px, s.stop, s.target, s.reason, pointValue(inst), Tier.AGGRESSIVE, structural = true) ?: run {
             msg("🏦 $inst: ${s.reason} – ${smcNote[inst] ?: "odrzucone"}"); countBlock("🏦 ${smcNote[inst] ?: "odrzucone"}"); return
         }
-        smcSessionCount[sessKey] = n + 1
         msg("🏦 $inst: ${s.reason} – WCHODZĘ")
         decisionCard(inst, order, Signal(s.side, order.stopPrice, order.takeProfit ?: s.target, s.reason, Tier.AGGRESSIVE), ev = Double.NaN)
-        engine.submit(order)
+        // Limit wejść na sesję liczony dopiero po faktycznym wysłaniu (weto rady nie zużywa limitu).
+        submitEntry(inst, order) { smcSessionCount[sessKey] = (smcSessionCount[sessKey] ?: 0) + 1 }
     }
 
     private fun smcPlan(inst: String, sh: Double): String {
@@ -1890,8 +1930,140 @@ class BotOrchestrator(
     }
 
     private val clockFmt = java.time.format.DateTimeFormatter.ofPattern("HH:mm")
-    private fun msg(text: String) = _hud.update {
-        it.copy(lastMessage = java.time.LocalTime.now(MarketHours.ZONE).format(clockFmt) + " " + text)
+    private fun msg(text: String) {
+        val line = java.time.LocalTime.now(MarketHours.ZONE).format(clockFmt) + " " + text
+        synchronized(recentMsgs) { recentMsgs.addLast(line); while (recentMsgs.size > 12) recentMsgs.removeFirst() }
+        _hud.update { it.copy(lastMessage = line) }
+    }
+
+    /** Ostatnie komunikaty bota – część „świadomości” rady AI. */
+    private val recentMsgs = ArrayDeque<String>()
+
+    /** Ostatnia cena bota dla instrumentu (feed/XTB) – do kontroli poślizgu po debacie rady. */
+    fun lastPrice(inst: String): Double? = lastPx[inst]?.first
+
+    /** Komunikat rady AI (z wątku debaty) – do HUD. */
+    fun councilLog(text: String) = msg(text)
+
+    // ───────────── Rada AI: bramka przed NOWYM wejściem ─────────────
+
+    private val councilPending = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val councilVetoUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * Jedyna droga NOWEGO wejścia. Zamknięcia, odwrócenia i reduceOnly idą od razu do silnika (bez AI).
+     *  • GATE – debata w tle: pętla cen, wyjścia, schodki SL i kill-switch działają dalej; po werdykcie ponowna
+     *    kontrola (pozycja? kill-switch?) i dopiero wtedy engine.submit. Weto = przerwa [COUNCIL_VETO_PAUSE_MS] dla tego kierunku.
+     *  • ADVISORY – wejście od razu jak dotąd, debata równolegle tylko do logu i ntfy.
+     * @return wynik, gdy zlecenie poszło od razu; null, gdy czeka na radę albo pominięte. [after] – po faktycznym submit.
+     */
+    private suspend fun submitEntry(inst: String, request: OrderRequest, after: ((ExecutionResult) -> Unit)? = null): ExecutionResult? {
+        val order = engine.prepareEntry(request)
+        val c = council
+        val isEntry = !order.reduceOnly && risk.position(inst) == null
+        val mode = c?.mode ?: CouncilMode.OFF
+        if (c == null || !isEntry || mode == CouncilMode.OFF || (mode == CouncilMode.ADVISORY && !c.hasKey())) return engine.submit(order).also { after?.invoke(it) }
+        val now = System.currentTimeMillis()
+        val vkey = "$inst:${order.side}"
+        if (mode == CouncilMode.ADVISORY) {
+            val ctx = councilContext(inst, order)
+            if (!c.busy) scope.launch { runCatching { c.review(ctx) } }
+            return engine.submit(order).also { after?.invoke(it) }
+        }
+        councilVetoUntil[vkey]?.let { until ->
+            if (now < until) { skip(inst, "rada AI zawetowała ${sideName(order.side)} – przerwa do ${hhmm(until)}"); return null }
+        }
+        if (councilPending.putIfAbsent(inst, now) != null) { skip(inst, "rada AI już debatuje nad wejściem"); return null }
+        val ctx = councilContext(inst, order)
+        msg("🧠 $inst: ${sideName(order.side)} – czekam na werdykt rady AI (do ${AgentCouncil.TOTAL_TIMEOUT_MS / 1000} s)")
+        scope.launch {
+            try {
+                val d = c.review(ctx)
+                lock.withLock {
+                    when (d) {
+                        is CouncilDecision.Approve -> when {
+                            risk.killSwitch.value -> msg("🧠 $inst: rada ZA, ale kill-switch aktywny – nie wchodzę")
+                            risk.position(inst) != null -> msg("🧠 $inst: rada ZA, ale w międzyczasie otwarto pozycję – pomijam")
+                            else -> engine.submit(d.order).also { after?.invoke(it) }
+                        }
+                        is CouncilDecision.Veto -> {
+                            councilVetoUntil[vkey] = System.currentTimeMillis() + COUNCIL_VETO_PAUSE_MS
+                            skip(inst, "rada AI: ${d.reason}")
+                            countBlock("🧠 " + d.reason.replace(Regex("[0-9]+([.,][0-9]+)?"), "#").take(60))
+                        }
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                msg("🧠 $inst: błąd rady AI – ${e.message?.take(60)} – nie wchodzę")
+            } finally {
+                councilPending.remove(inst)
+            }
+        }
+        return null
+    }
+
+    private fun us(v: Double?) = v?.let { String.format(java.util.Locale.US, "%.2f", it) } ?: "—"
+
+    /** Wywołuj pod lock, aby M1, M5 i znacznik ticka pochodziły z jednego odczytu. */
+    private fun candleSnapshot(inst: String, now: Long): CandleWatch.Snapshot = CandleWatch.snapshot(
+        aggregators["$inst@${Learner.M1}"]?.closed().orEmpty(),
+        aggregators["$inst@${Learner.M5}"]?.closed().orEmpty(),
+        aggregators["$inst@${Learner.M1}"]?.current(),
+        aggregators["$inst@${Learner.M5}"]?.current(), now, lastPx[inst]?.second
+    )
+
+    private suspend fun councilContext(inst: String, order: OrderRequest): CouncilContext {
+        val now = System.currentTimeMillis()
+        val q = AutoExecutionService.screenQuote.value?.takeIf { it.isFresh() && it.instrument == inst }
+        val rows = if (q != null) runCatching { AutoExecutionService.instance?.visiblePositionRows()?.size }.getOrNull() ?: 0 else 0
+        return CouncilContext(
+            instrument = inst, order = order, strategy = stratName(order.reason),
+            priceNow = lastPx[inst]?.first ?: order.referencePrice, spread = spreadOf(inst),
+            m1 = aggregators["$inst@${Learner.M1}"]?.closed().orEmpty(),
+            m5 = aggregators["$inst@${Learner.M5}"]?.closed().orEmpty(),
+            newsSentiment = news.sentimentFor(aliasesFor(inst)).first,
+            freeFunds = q?.availableFunds ?: AutoExecutionService.lastAccountFunds,
+            dailyPnl = _hud.value.dailyPnl,
+            botNotes = listOfNotNull(compassLine(inst), usOpenLine(inst, now), traderNote[inst], smcNote[inst]),
+            xtbShift = q?.let { basis(inst, it) } ?: 0.0,
+            awareness = awareness(inst),
+            untrackedXtbRows = rows,
+            createdAt = now,
+            candleReport = candleSnapshot(inst, now).report()
+        )
+    }
+
+    /**
+     * „Omni-awareness”: wszystko, co bot wie o sobie, XTB i telefonie – w kilku linijkach dla agentów AI.
+     * Tylko odczyt (bez kliknięć), więc bezpieczne do wołania z pętli cen.
+     */
+    suspend fun awareness(inst: String): String = buildString {
+        val now = System.currentTimeMillis()
+        val svc = AutoExecutionService.instance
+        val q = AutoExecutionService.screenQuote.value
+        val h = _hud.value
+        appendLine("Tryb wykonania: ${engine.mode.value} • kill-switch: ${if (risk.killSwitch.value) "AKTYWNY (${risk.killReason})" else "nie"} • " +
+            "wynik dnia ${us(h.dailyPnl)} zł • feed cen: ${if (h.feedConnected) "online" else "OFFLINE"}")
+        appendLine("Usługa ułatwień dostępu: ${if (svc != null) "aktywna" else "WYŁĄCZONA"} • odczyt XTB: ${AutoExecutionService.diag}")
+        appendLine("Na wierzchu: ${AutoExecutionService.foregroundPackage ?: "XTB"} • ekran błędu XTB: ${if (svc?.xtbErrorVisible == true) "TAK" else "nie"} • " +
+            "samonaprawa widoku: ${AutoExecutionService.navStatus}")
+        q?.let {
+            appendLine("Ostatni odczyt XTB: ${it.instrument ?: "(nie bilet)"} Sell ${us(it.bid)} Buy ${us(it.ask)} • ${(now - it.timestamp) / 1000} s temu • " +
+                "wolne środki ${us(it.availableFunds ?: AutoExecutionService.lastAccountFunds)} ${it.accountCurrency ?: AutoExecutionService.lastAccountCurrency ?: ""}")
+        }
+        val pos = risk.openSymbols().mapNotNull { risk.position(it) }
+        appendLine("Pozycje w księdze bota: " + if (pos.isEmpty()) "brak" else pos.joinToString("; ") { p ->
+            "${p.symbol} ${sideName(p.side)} ${p.quantity} @ ${us(p.entryPrice)} SL ${us(p.stopPrice)} TP ${us(p.takeProfit)}" +
+                (if (p.paper) " (papier)" else "") + " [${stratName(p.entryReason)}]"
+        })
+        runCatching { svc?.visiblePositionRows() }.getOrNull()?.takeIf { it.isNotEmpty() }?.let { rows ->
+            appendLine("Wiersze pozycji widoczne teraz w XTB: " + rows.joinToString("; ") { r -> "${r.side ?: "?"} ${r.volume ?: "?"} ${r.entryText ?: ""} SL ${us(r.sl)} TP ${us(r.tp)}" })
+        }
+        appendLine("Bramka danych: ${dataBlock(inst) ?: "OK"} • przerwa po stracie: ${risk.cooldownLeftMs() / 1000} s • ntfy: ${Ntfy.lastError ?: "OK"}")
+        AutoExecutionService.lastAlert?.takeIf { now - it.first < 30 * 60_000L }?.let { appendLine("Ostatni alarm (${(now - it.first) / 60_000} min temu): ${it.second}") }
+        append("Ostatnie zdarzenia bota: " + synchronized(recentMsgs) { recentMsgs.toList() }.takeLast(6).joinToString(" | "))
     }
 
     private fun f2(v: Double?) = v?.let { "%.2f".format(it) } ?: "—"
@@ -1918,7 +2090,10 @@ class BotOrchestrator(
             )
         } ?: "brak"
         val pnl = "Wynik dnia – XTB: %+.2f • papier: %+.2f".format(risk.dailyPnl.value, risk.dailyPnlPaper.value)
-        return listOf(line1, readinessLine(inst, q), line2, "Środki: $funds • wartość lota: $pv", "Pozycja bota: $pos", pnl,
+        val sourceDiag = if (inst in binanceFallback) "📡 Binance ${FEEDS[inst]}: ${news.liveDiagnostic(FEEDS[inst].orEmpty())}"
+            else if (inst in PYTH_FEEDS) "📡 Pyth: ${pyth.liveDiagnostic(inst)}"
+            else "📡 ${FEEDS[inst]?.let { news.liveDiagnostic(it) } ?: "XTB ekran"}"
+        return listOf(line1, readinessLine(inst, q), sourceDiag, line2, "Środki: $funds • wartość lota: $pv", "Pozycja bota: $pos", pnl,
             "(pozycje otwarte ręcznie w XTB nie są w księdze bota) • wersja ${com.example.algohud.BuildConfig.GIT_SHA}").joinToString("\n")
     }
 
@@ -2045,6 +2220,7 @@ class BotOrchestrator(
         const val EARLY_LOSS_EXITS = false
         /** Pozycję zamyka WYŁĄCZNIE Stop Loss (przesuwany za zyskiem); bez TP, bez wyjść bota, bez zamykania na koniec sesji. */
         const val BROKER_EXITS_ONLY = true       // wyjścia: TP/SL w XTB (+ odwrócenie trendu, gdy TREND_EXIT)
+        const val COUNCIL_VETO_PAUSE_MS = 3 * 60_000L // po wecie rady: 3 min bez ponownej debaty w tym kierunku
         const val STATUS_EVERY_MS = 1_800_000L    // cichy raport stanu (ntfy) co 30 min – w limicie ntfy.sh
         const val ARM_NOTIFY_GAP_MS = 900_000L    // „za chwilę mogę wejść” / „odpuściłem silny ruch” – maks. raz na 15 min
         const val MISSED_MOVE_ATR = 1.5           // „silny ruch” = świeca 1m ≥ 1,5×ATR

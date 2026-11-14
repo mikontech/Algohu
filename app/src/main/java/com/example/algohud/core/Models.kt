@@ -49,6 +49,10 @@ data class OrderRequest(
     val tier: Int = 1,
     /** Stały wolumen (np. 0.006) – bez skalowania wg % ryzyka i limitu dźwigni poziomu agresji. */
     val fixedSize: Boolean = false,
+    val directionPrepared: Boolean = false,
+    val expectedPositionAt: Long? = null,
+    val signalAt: Long = System.currentTimeMillis(),
+    val brokerReferencePrice: Double? = null,
     val clientOrderId: String = "hud" + UUID.randomUUID().toString().replace("-", "").take(16)
 )
 
@@ -106,7 +110,7 @@ data class ScreenQuote(
             return if (v > 0 && m > 0) c / v / m else null
         }
 
-    fun isFresh(now: Long = System.currentTimeMillis(), maxAgeMs: Long = 8_000) = now - timestamp <= maxAgeMs
+    fun isFresh(now: Long = System.currentTimeMillis(), maxAgeMs: Long = 8_000) = now - timestamp in 0..maxAgeMs
 }
 
 data class HudState(
@@ -125,6 +129,8 @@ data class HudState(
     /** Czytelny, wielolinijkowy stan bota (prawdziwe wartości z XTB i księgi bota). */
     val status: String = "",
     val learning: String = "",
+    /** Bieżący monitoring M1/M5, aktualizowany lokalnie co sekundę. */
+    val candles: String = "",
     /** Jedna linia: czy dane są wiarygodne i jak świeże (XTB / feed). */
     val dataStatus: String = "",
     /** Plan bota: LONG/SHORT/czekam, na co czeka, kiedy zamknie. */

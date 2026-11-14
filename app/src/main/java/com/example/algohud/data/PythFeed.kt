@@ -48,6 +48,9 @@ class PythFeed(
     val status: StateFlow<Map<String, String>> = _status.asStateFlow()
 
     private val resolved = HashMap<String, Resolved>()
+    private val liveDiag = java.util.concurrent.ConcurrentHashMap<String, String>()
+    fun liveDiagnostic(instrument: String): String = liveDiag[instrument] ?: status.value[instrument] ?: "szukam źródła"
+
 
     fun resolvedFor(instrument: String): Resolved? = synchronized(resolved) { resolved[instrument] }
 
@@ -95,14 +98,20 @@ class PythFeed(
                         val price = p.getJSONObject("price")
                         val publishMs = price.getLong("publish_time") * 1000
                         // Rynek zamknięty / brak nowych cen – nie produkujemy sztucznych, płaskich świec.
-                        if (now - publishMs > 120_000 || lastPublish[item.instrument] == publishMs) continue
-                        lastPublish[item.instrument] = publishMs
+                        if (publishMs > now + 2_000 || now - publishMs > 20_000) {
+                            liveDiag[item.instrument] = "notowanie nieświeże / zły czas (${(now - publishMs) / 1000}s)"; continue
+                        }
+                        if (publishMs <= (lastPublish[item.instrument] ?: 0L)) continue
                         val value = price.getString("price").toDouble() * 10.0.pow(price.getInt("expo"))
+                        if (!value.isFinite() || value <= 0) { liveDiag[item.instrument] = "błędna cena"; continue }
+                        lastPublish[item.instrument] = publishMs
+                        liveDiag[item.instrument] = "odebrano cenę"
                         _ticks.emit(Tick(item.instrument, value, publishMs))
                     }
                 } catch (ce: CancellationException) {
                     throw ce
                 } catch (t: Throwable) {
+                    items.forEach { liveDiag[it.instrument] = "odczyt: ${t.message?.take(100)}" }
                     Log.w(TAG, "poll: ${t.message}")
                 }
             }

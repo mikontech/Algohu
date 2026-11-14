@@ -188,10 +188,54 @@ class MarketNewsEngine(
     }
     private val recent = ArrayDeque<NewsItem>()
     private val jobs = mutableListOf<Job>()
+    private val livePrices = LivePriceGuard()
+    private val tickMutex = Mutex()
+    private val liveDiag = java.util.concurrent.ConcurrentHashMap<String, String>()
+    fun liveDiagnostic(symbol: String): String = liveDiag[symbol] ?: "czekam na transakcje"
+    private val priceHttp = http.newBuilder().callTimeout(8, TimeUnit.SECONDS).retryOnConnectionFailure(false).build()
+
+    private suspend fun publishTrade(trade: LivePriceGuard.Trade, source: String) = tickMutex.withLock {
+        if (livePrices.accept(trade, System.currentTimeMillis())) {
+            liveDiag[trade.tick.symbol] = "$source: odebrano transakcję"
+            _ticks.emit(trade.tick)
+        }
+    }
+
+    /** Zapas gdy WebSocket jest zablokowany lub milczy; ta sama giełda, symbol i czas transakcji. */
+    private suspend fun runRestPrices() {
+        var retryAt = 0L
+        while (currentCoroutineContext().isActive) {
+            delay(5_000)
+            if (System.currentTimeMillis() < retryAt) continue
+            for (symbol in config.feedSymbols) {
+                val now = System.currentTimeMillis()
+                if (livePrices.lastAt(symbol)?.let { now - it < 10_000 } == true) continue
+                try {
+                    val raw = withContext(Dispatchers.IO) {
+                        val url = "https://data-api.binance.vision/api/v3/trades?symbol=$symbol&limit=100"
+                        priceHttp.newCall(Request.Builder().url(url).build()).execute().use { r ->
+                            if (r.code == 429 || r.code == 418) {
+                                retryAt = System.currentTimeMillis() + maxOf(60L, r.header("Retry-After")?.toLongOrNull() ?: 60L) * 1000
+                            }
+                            if (!r.isSuccessful) error("HTTP ${r.code}")
+                            r.body?.string() ?: error("pusta odpowiedź")
+                        }
+                    }
+                    val trades = LivePriceGuard.rest(symbol, raw)
+                    for (trade in trades) publishTrade(trade, "Binance HTTPS")
+                    if (livePrices.lastAt(symbol)?.let { System.currentTimeMillis() - it <= 20_000 } != true)
+                        liveDiag[symbol] = "HTTPS odpowiada, brak transakcji z ostatnich 20 s"
+                } catch (e: CancellationException) { throw e }
+                catch (e: Exception) { liveDiag[symbol] = "HTTPS: ${e.message?.take(100)}" }
+                if (System.currentTimeMillis() < retryAt) break
+            }
+        }
+    }
 
     fun start() {
         if (jobs.isNotEmpty()) return
         jobs += scope.launch { runTickLoop() }
+        jobs += scope.launch { runRestPrices() }
         jobs += scope.launch { runRssLoop() }
         jobs += scope.launch { runCalendarLoop() }
         jobs += scope.launch { while (isActive) { recomputeSentiment(); delay(15_000) } }
@@ -211,13 +255,15 @@ class MarketNewsEngine(
 
     private suspend fun runTickLoop() {
         var attempt = 0
+        var endpoint = 0
+        val hosts = listOf("wss://data-stream.binance.vision:443", "wss://stream.binance.com:443", "wss://stream.binance.com:9443")
         while (currentCoroutineContext().isActive) {
             try {
-                val url = "wss://stream.binance.com:9443/stream?streams=" +
+                val url = hosts[endpoint++ % hosts.size] + "/stream?streams=" +
                     config.feedSymbols.joinToString("/") { it.lowercase() + "@trade" }
-                tickStream(url).collect { tick ->
+                tickStream(url).collect { trade ->
                     attempt = 0
-                    _ticks.emit(tick)
+                    publishTrade(trade, "Binance WebSocket")
                 }
             } catch (ce: CancellationException) {
                 throw ce
@@ -229,21 +275,15 @@ class MarketNewsEngine(
         }
     }
 
-    private fun tickStream(url: String): Flow<Tick> = callbackFlow {
+    private fun tickStream(url: String): Flow<LivePriceGuard.Trade> = callbackFlow {
         val ws = wsClient.newWebSocket(Request.Builder().url(url).build(), object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) { _connected.value = true }
-            override fun onMessage(webSocket: WebSocket, text: String) { parseTick(text)?.let { trySend(it) } }
+            override fun onMessage(webSocket: WebSocket, text: String) { LivePriceGuard.websocket(text)?.let { trySend(it) } }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { close(t) }
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { close() }
         })
         awaitClose { ws.close(1000, "bye") }
     }.buffer(256, BufferOverflow.DROP_OLDEST)
-
-    private fun parseTick(text: String): Tick? = runCatching {
-        val root = JSONObject(text)
-        val o = root.optJSONObject("data") ?: root // strumień łączony: {"stream":…, "data":{…}}
-        Tick(o.getString("s"), o.getString("p").toDouble(), o.optLong("T", System.currentTimeMillis()))
-    }.getOrNull()
 
     /** Długa historia: kolejne partie po 1000 świec wstecz (Binance pozwala na endTime). */
     suspend fun historyPaged(symbol: String, interval: String, totalBars: Int): List<Bar> = withContext(Dispatchers.IO) {
