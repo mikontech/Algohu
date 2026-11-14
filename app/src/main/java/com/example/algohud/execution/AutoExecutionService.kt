@@ -73,6 +73,7 @@ class ExecutionEngine(
     private val positionProbe: suspend (String) -> Boolean? = { null }
 ) {
     private var pendingAt = 0L
+    private val pendingLock = Any()
     private val _mode = MutableStateFlow(initialMode)
     val mode: StateFlow<ExecutionMode> = _mode.asStateFlow()
 
@@ -130,10 +131,12 @@ class ExecutionEngine(
     suspend fun submit(request: OrderRequest, bypassConfirmation: Boolean = false): ExecutionResult {
         val order = prepareEntry(request)
         if (_mode.value == ExecutionMode.CONFIRM && !bypassConfirmation && !order.reduceOnly) {
-            if (_pending.value != null) return ExecutionResult.Rejected("Jest już propozycja do potwierdzenia")
-            if (risk.entriesPaused.value) return ExecutionResult.Rejected("STOP WEJŚĆ aktywny")
-            _pending.value = order
-            pendingAt = System.currentTimeMillis()
+            synchronized(pendingLock) {
+                if (_pending.value != null) return ExecutionResult.Rejected("Jest już propozycja do potwierdzenia")
+                if (risk.entriesPaused.value) return ExecutionResult.Rejected("STOP WEJŚĆ aktywny")
+                _pending.value = order
+                pendingAt = System.currentTimeMillis()
+            }
             return ExecutionResult.Rejected("Oczekuje na potwierdzenie")
         }
         val requestedMode = _mode.value
@@ -178,16 +181,19 @@ class ExecutionEngine(
     }
 
     suspend fun confirmPending() {
-        val o = _pending.value ?: return
-        _pending.value = null
-        if (System.currentTimeMillis() - pendingAt > 60_000) {
+        val (o, at) = synchronized(pendingLock) {
+            val pending = _pending.value ?: return
+            _pending.value = null
+            pending to pendingAt
+        }
+        if (System.currentTimeMillis() - at > 60_000) {
             log("⌛ Propozycja wygasła (starsza niż 60 s) – cena mogła się zmienić")
             return
         }
         submit(o, bypassConfirmation = true)
     }
 
-    fun rejectPending() { _pending.value = null }
+    fun rejectPending() { synchronized(pendingLock) { _pending.value = null } }
 
     /** KILL: blokada nowych wejść, anulowanie zleceń oczekujących, zamknięcie pozycji. */
     suspend fun flattenAll(reason: String) = flattenMutex.withLock {
@@ -482,7 +488,7 @@ class AutoExecutionService : AccessibilityService() {
         data class BrokerReading(val quote: ScreenQuote, val row: PositionRowInfo)
         val brokerReading = MutableStateFlow<BrokerReading?>(null)
         @Volatile var entryBlocked: (() -> Boolean)? = null
-        @Volatile var entryCheck: ((OrderRequest) -> String?)? = null
+        @Volatile var entryCheck: ((OrderRequest, ScreenQuote?) -> String?)? = null
         @Volatile var hudObstacles: List<Rect> = emptyList()
         @Volatile var navStatus: String = "—"
         /** Pakiet aplikacji, która jest teraz na wierzchu (gdy nie XTB) – do świadomości agentów. */
@@ -763,6 +769,7 @@ class AutoExecutionService : AccessibilityService() {
     }
 
     /** Odczyt okna brokera. Wywoływany przy zdarzeniach XTB ORAZ co sekundę (nie polegamy tylko na zdarzeniach). */
+    private var lastObstacleScan = 0L
     private fun scanNow(): Boolean {
         val now = SystemClock.uptimeMillis()
         if (now - lastScan < 300) return true // throttling – drzewo widoków jest drogie
@@ -803,6 +810,9 @@ class AutoExecutionService : AccessibilityService() {
         }
         if (quote != null) {
             _screenQuote.value = quote
+            if (now - lastObstacleScan >= 1000) {
+            lastObstacleScan = now
+            val controlIds = setOf("TradingBuyButton", "TradingSellButton", "ModifyPositionButton", "CloseVolumeButton", "StepperTextField")
             val obstacles = mutableListOf<Rect>()
             val nodes = ArrayDeque<AccessibilityNodeInfo>().apply { add(root) }
             var count = 0
@@ -810,7 +820,7 @@ class AutoExecutionService : AccessibilityService() {
                 val n = nodes.removeFirst()
                 val id = n.viewIdResourceName?.substringAfterLast('/').orEmpty()
                 val isChart = id.contains("chart", true) || n.className?.toString()?.contains("chart", true) == true
-                val isControl = id in setOf("TradingBuyButton", "TradingSellButton", "ModifyPositionButton", "CloseVolumeButton", "StepperTextField")
+                val isControl = id in controlIds
                 if (n.isVisibleToUser && (isChart || isControl)) {
                     val rect = Rect().also { n.getBoundsInScreen(it) }
                     if (isChart) rect.left = rect.left + rect.width() * 2 / 3
@@ -819,6 +829,7 @@ class AutoExecutionService : AccessibilityService() {
                 for (i in 0 until n.childCount) n.getChild(i)?.let { nodes.add(it) }
             }
             hudObstacles = obstacles
+            }
             brokerReading.value = if (quote.instrument != null) runCatching {
                 readPositionRows(root).singleOrNull()?.takeIf { it.signature == profitAnchors[quote.instrument] }
                     ?.let { BrokerReading(quote, it) }
@@ -993,7 +1004,7 @@ class AutoExecutionService : AccessibilityService() {
             try {
                 if (!protectionMutex.tryLock()) return@withContext ExecutionResult.Rejected("Zapis SL/TP już trwa")
                 val id = java.util.UUID.randomUUID().toString()
-                protectionStatus.value = OperationStatus(id, instrument, "SL: ZAPISUJĘ…", active = true)
+                protectionStatus.value = OperationStatus(id, instrument, if (sl != null) "SL: ZAPISUJĘ…" else "TP: ZAPISUJĘ…", active = true)
                 try {
                     val result = withAction { doSetProtection(instrument, sl, tp) }
                     protectionStatus.value = OperationStatus(id, instrument,
@@ -1995,7 +2006,8 @@ class AutoExecutionService : AccessibilityService() {
             ?: return ExecutionResult.Rejected("nie znaleziono przycisku ${order.side}")
         scanNow()
         if (entryBlocked?.invoke() == true) return ExecutionResult.Rejected("STOP WEJŚĆ aktywny")
-        entryCheck?.invoke(order)?.let { return ExecutionResult.Rejected(it) }
+        val checkedQuote = screenQuote.value
+        entryCheck?.invoke(order, checkedQuote)?.let { return ExecutionResult.Rejected(it) }
         if (!click(btn)) return ExecutionResult.Rejected("kliknięcie ${order.side} nie powiodło się")
         _uiEvents.tryEmit("⏱ ${order.symbol}: od decyzji do kliknięcia %.1f s".format((SystemClock.uptimeMillis() - t0) / 1000.0))
 
@@ -2018,7 +2030,8 @@ class AutoExecutionService : AccessibilityService() {
             if (!screenText.contains(formatQty(order.quantity))) {
                 return ExecutionResult.Failed(IllegalStateException("ekran potwierdzenia XTB pokazuje inny wolumen – NIE potwierdzam, sprawdź ręcznie"))
             }
-            entryCheck?.invoke(order)?.let { why ->
+            val confirmQuote = screenQuote.value?.takeIf { it.instrument == order.symbol } ?: checkedQuote
+            entryCheck?.invoke(order, confirmQuote)?.let { why ->
                 backStayInXtb()
                 return ExecutionResult.Rejected(why)
             }
