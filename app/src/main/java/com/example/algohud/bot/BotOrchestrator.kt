@@ -1624,7 +1624,9 @@ class BotOrchestrator(
     }
 
     private suspend fun arm(inst: String, text: String) {
-        armedNote[inst] = System.currentTimeMillis() to text
+        val now = System.currentTimeMillis()
+        if (!MarketHours.status(inst, now).open) return // rynek zamknięty – żadnych „za chwilę mogę wejść”
+        armedNote[inst] = now to text
         if (risk.position(inst) == null && inst == hudLearningInstrument) {
             Ntfy.send("⏳ $inst: za chwilę mogę wejść", text, Ntfy.QUIET, "hourglass", key = "arm:$inst", minGapMs = ARM_NOTIFY_GAP_MS)
         }
@@ -1636,6 +1638,7 @@ class BotOrchestrator(
     /** Odpuszczona duża świeca (≥ 1,5×ATR) – jedyny przypadek „nie wejdę”, który idzie na telefon (maks. raz na 5 min). */
     private fun missedStrongMove(inst: String, side: Side, why: String) {
         if (inst != hudLearningInstrument) return
+        if (!MarketHours.status(inst, System.currentTimeMillis()).open) return
         val a = aggregators["$inst@${Learner.M1}"] ?: return
         val cur = a.current() ?: return
         val atr = Indicators.atr(a.closed().takeLast(60))?.takeIf { it > 0 } ?: return
