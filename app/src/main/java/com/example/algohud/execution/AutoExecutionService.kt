@@ -1441,6 +1441,13 @@ class AutoExecutionService : AccessibilityService() {
     private suspend fun findWantedInstrument() {
         val target = wantedInstrument ?: return
         if (!autonomyOn() || _actionActive.value || xtbErrorVisible) { offTargetSince = 0L; return }
+        // Rynek zamknięty (weekend, przerwa dzienna) i bot nie ma pozycji: nie szukamy biletu i nie wysyłamy alarmów.
+        // XTB pokazuje wtedy „Rynek przed otwarciem” bez cen, więc nawigacja i tak by „nie trafiała” co godzinę.
+        if (!wantedUrgent && !com.example.algohud.bot.MarketHours.status(target, System.currentTimeMillis()).open) {
+            offTargetSince = 0L; navFails = 0
+            navStatus = "rynek $target zamknięty – nie szukam biletu"
+            return
+        }
         val root = appRoot() ?: return
         if (root.packageName?.toString() != ScreenScanner.XTB_PACKAGE) { offTargetSince = 0L; return }
         val now = SystemClock.uptimeMillis()
