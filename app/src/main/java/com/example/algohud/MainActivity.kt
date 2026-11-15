@@ -1,5 +1,11 @@
 package com.example.algohud
 
+import com.example.algohud.council.AiSettings
+import com.example.algohud.council.AiProvider
+import com.example.algohud.council.AiRoute
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
+import androidx.core.widget.doAfterTextChanged
 import android.Manifest
 import android.content.Intent
 import android.net.Uri
@@ -22,6 +28,26 @@ import com.example.algohud.overlay.OverlayService
 class MainActivity : ComponentActivity() {
 
     private val notifPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { refresh() }
+    private val exportResearch = registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        if (uri != null) lifecycleScope.launch {
+            val ok = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                runCatching {
+                    val snapshots = synchronized(com.example.algohud.research.ResearchRecorder.fileLock) {
+                        java.io.File(filesDir, "research").listFiles().orEmpty()
+                            .filter { it.name.endsWith(".jsonl") }.map { it.name to it.readBytes() }
+                    }
+                    require(snapshots.isNotEmpty()) { "Brak zapisanych danych" }
+                    val output = contentResolver.openOutputStream(uri) ?: error("Brak dostępu do pliku")
+                    java.util.zip.ZipOutputStream(output).use { zip ->
+                        for ((name, bytes) in snapshots) {
+                            zip.putNextEntry(java.util.zip.ZipEntry(name)); zip.write(bytes); zip.closeEntry()
+                        }
+                    }
+                }.isSuccess
+            }
+            Toast.makeText(this@MainActivity, if (ok) "Zapisano dziennik badań" else "Brak danych lub błąd zapisu", Toast.LENGTH_LONG).show()
+        }
+    }
     private lateinit var status: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -40,6 +66,7 @@ class MainActivity : ComponentActivity() {
             textSize = 24f
             setPadding(0, 0, 0, pad)
         }.also { layout.addView(it) }
+        button("Eksportuj sygnały i testy PAPER (ZIP)") { exportResearch.launch("AlgoHUD-research.zip") }
         status = TextView(this).apply { setPadding(0, 0, 0, pad) }.also { layout.addView(it) }
         button("1. Zezwól na wyświetlanie nad aplikacjami") {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
@@ -71,6 +98,33 @@ class MainActivity : ComponentActivity() {
         }.also { layout.addView(it) }
 
         TextView(this).apply { text = "\nBezpieczeństwo"; textSize = 18f }.also { layout.addView(it) }
+        button("WZNÓW WEJŚCIA (ochrona pozycji pozostaje aktywna)") {
+            getSharedPreferences("risk_state", MODE_PRIVATE).edit().putBoolean("entries_paused", false).apply()
+            OverlayService.command(this, "RESUME_ENTRIES")
+        }
+        val spreadLimit = android.widget.EditText(this).apply {
+            hint = "Maks. koszt spreadu / ryzyko (%)"
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText(getSharedPreferences("ui", MODE_PRIVATE).getString("spread_limit_pct", "25"))
+        }.also { layout.addView(it) }
+        val lossLimit = android.widget.EditText(this).apply {
+            hint = "Limit straty dnia w walucie konta (puste = dotychczasowy limit %)"
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText(getSharedPreferences("risk_state", MODE_PRIVATE).getString("session_loss_limit", ""))
+        }.also { layout.addView(it) }
+        button("Zapisz limity ryzyka") {
+            val spread = spreadLimit.text.toString().replace(',', '.').toDoubleOrNull()
+            val lossText = lossLimit.text.toString().trim().replace(',', '.')
+            val loss = lossText.toDoubleOrNull()
+            if (spread == null || !spread.isFinite() || spread !in 1.0..100.0 ||
+                (lossText.isNotEmpty() && (loss == null || !loss.isFinite() || loss <= 0))) {
+                Toast.makeText(this, "Spread 1–100%; limit straty dodatni lub pusty", Toast.LENGTH_LONG).show()
+            } else {
+                getSharedPreferences("ui", MODE_PRIVATE).edit().putString("spread_limit_pct", spread.toString()).apply()
+                getSharedPreferences("risk_state", MODE_PRIVATE).edit().putString("session_loss_limit", lossText).apply()
+                Toast.makeText(this, "Zapisano limity", Toast.LENGTH_SHORT).show()
+            }
+        }
         button("Reset KILL (nie działa po dziennym limicie)") { OverlayService.command(this, OverlayService.ACTION_RESET_KILL) }
         button("🛡 Tarcza dotyku: WŁĄCZ (w AUTO ekran ignoruje dotyk)") { OverlayService.command(this, OverlayService.ACTION_SHIELD, "on") }
         button("Tarcza dotyku: wyłącz") { OverlayService.command(this, OverlayService.ACTION_SHIELD, "off") }
@@ -83,6 +137,29 @@ class MainActivity : ComponentActivity() {
             getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("keep_xtb_front", false).apply()
             Toast.makeText(this, "Wyłączone", Toast.LENGTH_SHORT).show()
         }
+
+        val reverseSwitch = android.widget.Switch(this).apply {
+            text = "Odwracaj nowe wejścia: LONG ↔ SHORT"
+            isChecked = getSharedPreferences("ui", MODE_PRIVATE).getBoolean("reverse_entries", true)
+            setOnCheckedChangeListener { _, enabled ->
+                getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("reverse_entries", enabled).apply()
+                Toast.makeText(this@MainActivity, "Nowe wejścia: " + if (enabled) "odwrócone" else "normalne", Toast.LENGTH_LONG).show()
+            }
+        }
+        layout.addView(reverseSwitch)
+        TextView(this).apply { text = "Agenci AI odłączeni. Bot działa lokalnie." }.also { layout.addView(it) }
+        button("Samonaprawa widoku we WSZYSTKICH trybach (też DRY_RUN): WŁĄCZ") {
+            getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("nav_autonomy", true).apply()
+            AutoExecutionService.navAutonomy = true; refresh()
+        }
+        button("Samonaprawa widoku: tylko w AUTO") {
+            getSharedPreferences("ui", MODE_PRIVATE).edit().putBoolean("nav_autonomy", false).apply()
+            AutoExecutionService.navAutonomy = false; refresh()
+        }
+        button("⏸ Wstrzymaj samonaprawę na 30 min (używam telefonu)") {
+            AutoExecutionService.navPausedUntil = System.currentTimeMillis() + 30 * 60_000L; refresh()
+        }
+        button("▶ Wznów samonaprawę") { AutoExecutionService.navPausedUntil = 0L; refresh() }
 
         TextView(this).apply { text = "\nZdalny dostęp (AnyDesk)"; textSize = 18f }.also { layout.addView(it) }
         fun ui() = getSharedPreferences("ui", MODE_PRIVATE)
@@ -162,7 +239,11 @@ class MainActivity : ComponentActivity() {
         status.text = buildString {
             appendLine("Nakładka: " + if (Settings.canDrawOverlays(this@MainActivity)) "✅" else "❌")
             appendLine("Ułatwienia dostępu: " + if (AutoExecutionService.instance != null) "✅" else "❌ (potrzebne tylko w Wariancie B)")
-            append("Domyślny tryb: DRY_RUN (paper trading)")
+            appendLine("Domyślny tryb: DRY_RUN (paper trading)")
+            appendLine("Agenci AI: odłączeni")
+            val paused = AutoExecutionService.navPausedUntil > System.currentTimeMillis()
+            append("Samonaprawa widoku: " + (if (getSharedPreferences("ui", MODE_PRIVATE).getBoolean("nav_autonomy", true)) "wszystkie tryby" else "tylko AUTO") +
+                (if (paused) " (⏸ pauza)" else "") + " • zrzuty ekranu: " + (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) "✅ Android 11+" else "❌ za stary Android"))
         }
     }
 }

@@ -75,4 +75,38 @@ class ReversalGuardTest {
         val v = g.evaluate("B", Side.BUY, bars.last().start - 1, bars.last().close, bars, TrendScore.compute(bars, emptyList()))
         assertFalse(v!!.exit)
     }
+    @Test fun skippedEvaluationCannotReuseConfirmation() {
+        val g = ReversalGuard()
+        val bars = series(List(12) { -1.2 })
+        val opened = t0 + 78 * 60_000L
+        for (n in 82..90) {
+            val sample = bars.take(n)
+            g.evaluate("p", Side.BUY, opened, 2024.4, sample, TrendScore.compute(sample, emptyList()))
+        }
+        val v = g.evaluate("p", Side.BUY, opened, 2024.4, bars, TrendScore.compute(bars, emptyList()))!!
+        assertFalse(v.exit)
+        assertTrue(v.streak <= 1)
+    }
+
+    @Test fun missingCandleBlocksReversal() {
+        val g = ReversalGuard()
+        val bars = series(List(12) { -1.2 }).filterIndexed { i, _ -> i != 86 }
+        val v = g.evaluate("p", Side.BUY, t0, 2024.4, bars, TrendScore.compute(bars, emptyList()))!!
+        assertFalse(v.exit)
+        assertTrue(v.reason.contains("niepełne"))
+    }
+
+    @Test fun oldCandleCannotRepeatExit() {
+        val g = ReversalGuard()
+        val bars = series(List(12) { -1.2 })
+        for (n in 82..bars.size) {
+            val sample = bars.take(n)
+            g.evaluate("p", Side.BUY, t0, 2024.4, sample, TrendScore.compute(sample, emptyList()))
+        }
+        val old = bars.dropLast(1)
+        val v = g.evaluate("p", Side.BUY, t0, 2024.4, old, TrendScore.compute(old, emptyList()))!!
+        assertFalse(v.exit)
+        assertTrue(v.streak == 0)
+    }
+
 }
